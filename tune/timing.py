@@ -83,6 +83,23 @@ class TimingResult:
         return d
 
 
+def pool(results: list["TimingResult"], rse_target: float = 0.01) -> "TimingResult":
+    """Merge measurements of the same kernel taken on different input allocations into one result.
+
+    Physical placement of the operands shifts memory-bound kernels by several percent
+    (docs/methodology.md, "allocation noise"); pooling the raw samples over fresh allocations averages it out.
+    """
+    if len(results) == 1:
+        return results[0]
+    samples = [s for r in results for s in (r.samples_us or [])]
+    stats = summarize(samples, rse_target=rse_target)
+    stats["converged"] = all(r.converged for r in results)
+    first, last = results[0], results[-1]
+    return TimingResult(**stats, cache_mode=first.cache_mode, batch=first.batch, use_graph=first.use_graph,
+                        wall_s=sum(r.wall_s for r in results), telemetry_before=first.telemetry_before,
+                        telemetry_after=last.telemetry_after, samples_us=samples)
+
+
 def summarize(samples_us, *, rse_target: float = 0.01) -> dict:
     s = np.asarray(samples_us, dtype=np.float64)
     n = len(s)

@@ -18,16 +18,16 @@ from pathlib import Path
 
 import torch
 
-from tune.correctness import make_inputs
+from tune.correctness import make_inputs, placed_inputs
 from tune.env import capture_env, gpu_telemetry, write_env
 from tune.records import RecordWriter
 from tune.runner import DTYPES, LAYOUT, candidates_for
-from tune.timing import TimingConfig, benchmark
+from tune.timing import TimingConfig, benchmark, pool
 
 
 def run_noise(shapes: list[dict], out_dir: Path, *, backends=("torch", "triton:bm128_bn128_bk32_w4_s4_g8_sk1"),
               repeats: int = 100, rounds: int = 3, cache_modes=("cold", "hot"), dtype: str = "fp16",
-              session_id: str | None = None, seed: int = 0, log=print) -> Path:
+              session_id: str | None = None, seed: int = 0, n_allocs: int = 1, log=print) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     if not (out_dir / "env.json").exists():
         write_env(out_dir)
@@ -43,30 +43,38 @@ def run_noise(shapes: list[dict], out_dir: Path, *, backends=("torch", "triton:b
             rng.shuffle(order)
             for i, s in enumerate(order):
                 M, N, K = s["M"], s["N"], s["K"]
-                a, b = make_inputs(M, N, K, tdtype)
-                for spec in backends:
-                    for c in candidates_for(spec, M, N, K):
+                cands = [c for spec in backends for c in candidates_for(spec, M, N, K)]
+                timed = {(c.config_key, cm): [] for c in cands for cm in cache_modes}
+                for alloc in range(n_allocs):
+                    # Fresh placement each round as well, so rounds sample different physical layouts.
+                    a, b, pad = placed_inputs(M, N, K, tdtype, placement=rnd * n_allocs + alloc)
+                    for c in cands:
                         fn = c.backend.make_runner(a, b)
                         for cm in cache_modes:
                             cfg = TimingConfig(cache_mode=cm, min_reps=repeats, max_reps=repeats, target_rse=0.0,
                                                max_time_s=60.0)
-                            r = benchmark(fn, cfg)
-                            tel = r.telemetry_after
-                            w.write({"hw_id": env["hw_id"], "driver": env["driver"], "torch": env["versions"]["torch"],
-                                     "triton": env["versions"]["triton"], "cuda": env["versions"]["torch_cuda"],
-                                     "M": M, "N": N, "K": K, "dtype": dtype, "layout": LAYOUT,
-                                     "kernel_family": c.family, "config_key": c.config_key, "config": c.config,
-                                     "valid": True, "cache_mode": cm, "batch": 1, "use_graph": False,
-                                     "time_median_us": r.median_us, "time_p10_us": r.p10_us, "time_p90_us": r.p90_us,
-                                     "time_min_us": r.min_us, "time_max_us": r.max_us, "time_iqr_us": r.iqr_us,
-                                     "rse": r.rse, "n_samples": r.n_samples, "converged": r.converged,
-                                     "tflops": 2 * M * N * K / (r.median_us * 1e-6) / 1e12,
-                                     "clock_mhz": tel.get("clock_mhz"), "temp_c": tel.get("temp_c"),
-                                     "power_w": tel.get("power_w"), "throttle_reasons": tel.get("throttle_reasons"),
-                                     "timestamp": time.time(), "session_id": session_id, "round": rnd,
-                                     "suite": "noise", "suite_origin": s.get("suite_origin")},
-                                    samples_us=r.samples_us)
-                del a, b
+                            timed[(c.config_key, cm)].append(benchmark(fn, cfg))
+                    del a, b, pad
+                for c in cands:
+                    for cm in cache_modes:
+                        parts = timed[(c.config_key, cm)]
+                        r = pool(parts)
+                        tel = r.telemetry_after
+                        w.write({"hw_id": env["hw_id"], "driver": env["driver"], "torch": env["versions"]["torch"],
+                                 "triton": env["versions"]["triton"], "cuda": env["versions"]["torch_cuda"],
+                                 "M": M, "N": N, "K": K, "dtype": dtype, "layout": LAYOUT,
+                                 "kernel_family": c.family, "config_key": c.config_key, "config": c.config,
+                                 "valid": True, "cache_mode": cm, "batch": 1, "use_graph": False,
+                                 "time_median_us": r.median_us, "time_p10_us": r.p10_us, "time_p90_us": r.p90_us,
+                                 "time_min_us": r.min_us, "time_max_us": r.max_us, "time_iqr_us": r.iqr_us,
+                                 "rse": r.rse, "n_samples": r.n_samples, "converged": r.converged,
+                                 "n_allocs": n_allocs, "alloc_medians_us": [x.median_us for x in parts],
+                                 "tflops": 2 * M * N * K / (r.median_us * 1e-6) / 1e12,
+                                 "clock_mhz": tel.get("clock_mhz"), "temp_c": tel.get("temp_c"),
+                                 "power_w": tel.get("power_w"), "throttle_reasons": tel.get("throttle_reasons"),
+                                 "timestamp": time.time(), "session_id": session_id, "round": rnd,
+                                 "suite": "noise", "suite_origin": s.get("suite_origin")},
+                                samples_us=r.samples_us)
                 torch.cuda.empty_cache()
                 log(f"[noise r{rnd} {i + 1}/{len(order)}] {M}x{N}x{K} | {time.perf_counter() - t0:.0f}s")
     return path

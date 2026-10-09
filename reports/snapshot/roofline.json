@@ -1,0 +1,37 @@
+{
+ "spec": {
+  "fp16_f32acc_flop_per_clk_per_sm": 512,
+  "spec_boost_mhz": 1710,
+  "max_sm_mhz": 2100,
+  "fp16_f32acc_tflops_at_boost": 59.53536,
+  "fp16_f32acc_tflops_at_max_clock": 73.1136,
+  "dram_gbps_spec": 760.08
+ },
+ "bandwidth": {
+  "copy_bytes": 1073741824,
+  "copy_median_us": 3132.416009902954,
+  "dram_gbps_measured": 685.5678304576574,
+  "dram_gbps_measured_best": 687.3231894860872
+ },
+ "compute": {
+  "fp16_f32acc_tflops_measured": 62.920705378042584,
+  "per_size": {
+   "4096": {
+    "median_us": 2362.368106842041,
+    "tflops": 58.1784663761505,
+    "clock_mhz": 1755
+   },
+   "6144": {
+    "median_us": 7669.9042320251465,
+    "tflops": 60.477478458101196,
+    "clock_mhz": 1755
+   },
+   "8192": {
+    "median_us": 17474.559783935547,
+    "tflops": 62.920705378042584,
+    "clock_mhz": 1875
+   }
+  }
+ },
+ "timestamp": 1791518265.7803638
+}

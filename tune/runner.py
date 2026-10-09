@@ -15,10 +15,10 @@ from typing import Callable, Iterable
 
 import torch
 
-from tune.correctness import make_inputs, reference, validate
+from tune.correctness import placed_inputs, reference, validate
 from tune.env import capture_env, write_env
 from tune.records import RecordWriter, alignment_flags, completed_keys, measurement_key
-from tune.timing import TimingConfig, benchmark
+from tune.timing import TimingConfig, benchmark, pool
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 LAYOUT = "NN"
@@ -71,6 +71,7 @@ def load_suite(name: str, version: str = "v1") -> list[dict]:
 def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtype: str = "fp16",
         cache_modes=("cold",), timing_overrides: dict | None = None, budget_s: float | None = None,
         session_id: str | None = None, prune_shapes: bool = False, skip_out_of_range: bool = True,
+        n_allocs: int = 1,
         out_name: str = "results.jsonl", log: Callable[[str], None] = print) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     env = capture_env()
@@ -117,7 +118,7 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
                 continue
 
             try:
-                a, b = make_inputs(M, N, K, tdtype, seed=0)
+                a, b, pad = placed_inputs(M, N, K, tdtype, seed=0)
                 ref = reference(a, b)
             except torch.OutOfMemoryError:
                 for c, cm, row in todo:
@@ -125,40 +126,54 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
                 torch.cuda.empty_cache()
                 continue
 
+            # Validate every candidate once, then time the valid ones on n_allocs input placements.
             validity: dict[str, tuple] = {}
-            for c, cm, row in todo:
-                key = measurement_key(row)
-                inflight.write_text(json.dumps({"key": list(key), "row": row}, default=str))
+            timed: dict[int, list] = {}
+            rows: dict[int, dict] = {}
+            for j, (c, cm, row) in enumerate(todo):
                 if c.config_key not in validity:
+                    inflight.write_text(json.dumps({"key": list(measurement_key(row)), "row": row}, default=str))
                     chk = validate(c.backend, M, N, K, tdtype, ref=ref, inputs=(a, b))
                     validity[c.config_key] = (chk.valid, chk.failure_reason, chk.max_abs_err)
+                    inflight.unlink()
                 valid, reason, err = validity[c.config_key]
-                row = {**row, "valid": valid, "failure_reason": reason, "max_abs_err": err}
-                if not valid:
+                rows[j] = {**row, "valid": valid, "failure_reason": reason, "max_abs_err": err, "n_allocs": n_allocs}
+                if valid:
+                    timed[j] = []
+            del ref
+            for alloc in range(n_allocs):
+                if alloc:
+                    del a, b, pad
+                    a, b, pad = placed_inputs(M, N, K, tdtype, seed=0, placement=alloc)
+                for j in list(timed):
+                    c, cm, _ = todo[j]
+                    inflight.write_text(json.dumps({"key": list(measurement_key(rows[j])), "row": rows[j]}, default=str))
+                    try:
+                        cfg = TimingConfig(cache_mode=cm, **(timing_overrides or {}))
+                        timed[j].append(benchmark(c.backend.make_runner(a, b), cfg))
+                    except torch.OutOfMemoryError:
+                        rows[j].update(valid=False, failure_reason="oom_timing")
+                        del timed[j]
+                        torch.cuda.empty_cache()
+                    inflight.unlink()
+
+            for j, row in rows.items():
+                if j not in timed:
                     w.write({**row, "timestamp": time.time()})
-                    inflight.unlink()
                     continue
-                try:
-                    fn = c.backend.make_runner(a, b)
-                    cfg = TimingConfig(cache_mode=cm, **(timing_overrides or {}))
-                    r = benchmark(fn, cfg)
-                except torch.OutOfMemoryError:
-                    w.write({**row, "valid": False, "failure_reason": "oom_timing", "timestamp": time.time()})
-                    inflight.unlink()
-                    torch.cuda.empty_cache()
-                    continue
+                r = pool(timed[j])
                 tel = last_tel = r.telemetry_after
                 w.write({**row, "time_median_us": r.median_us, "time_p10_us": r.p10_us, "time_p90_us": r.p90_us,
                          "time_min_us": r.min_us, "time_max_us": r.max_us, "time_iqr_us": r.iqr_us,
                          "rse": r.rse, "n_samples": r.n_samples, "converged": r.converged,
+                         "alloc_medians_us": [x.median_us for x in timed[j]],
                          "tflops": 2 * M * N * K / (r.median_us * 1e-6) / 1e12,
                          "clock_mhz": tel.get("clock_mhz"), "temp_c": tel.get("temp_c"),
                          "power_w": tel.get("power_w"), "throttle_reasons": tel.get("throttle_reasons"),
                          "clock_mhz_before": r.telemetry_before.get("clock_mhz"),
                          "timestamp": time.time()}, samples_us=r.samples_us)
-                inflight.unlink()
 
-            del a, b, ref
+            del a, b, pad
             torch.cuda.empty_cache()
             elapsed = time.perf_counter() - t0
             eta = elapsed / (i + 1) * (len(shapes) - i - 1)

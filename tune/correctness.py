@@ -40,6 +40,22 @@ def make_inputs(M: int, N: int, K: int, dtype=torch.float16, seed: int = 0, devi
     return a, b
 
 
+def placed_inputs(M: int, N: int, K: int, dtype=torch.float16, seed: int = 0, placement: int = 0,
+                  device: str = "cuda"):
+    """Same values as make_inputs, but at a different physical placement for each `placement` index.
+
+    A seeded 1-64 MiB pad is allocated first so the caching allocator hands out different blocks.
+    Returns (a, b, pad); keep `pad` alive while a and b are in use.
+    """
+    pad = None
+    if placement:
+        import random
+        mib = random.Random(seed * 7919 + placement).randint(1, 64)
+        pad = torch.empty(mib * 2**20, dtype=torch.uint8, device=device)
+    a, b = make_inputs(M, N, K, dtype, seed, device)
+    return a, b, pad
+
+
 def reference(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     with _strict_fp32():
         return a.float() @ b.float()

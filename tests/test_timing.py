@@ -69,3 +69,22 @@ def test_graph_amortized_per_launch():
     assert g.batch == 50
     # Per-launch graph time excludes per-sample event overhead, so it can't be meaningfully larger.
     assert g.median_us <= single.median_us * 1.1
+
+
+def test_pool_merges_samples():
+    from tune.timing import TimingResult, pool
+    def mk(samples):
+        from tune.timing import summarize
+        return TimingResult(**summarize(samples), cache_mode="cold", batch=1, use_graph=False, wall_s=1.0,
+                            samples_us=samples)
+    r = pool([mk([1.0, 1.0, 1.0]), mk([3.0, 3.0, 3.0]), mk([2.0, 2.0, 2.0])])
+    assert r.n_samples == 9 and r.median_us == 2.0 and r.wall_s == 3.0
+
+
+@requires_cuda
+def test_placed_inputs_same_values_different_address():
+    from tune.correctness import placed_inputs
+    a0, b0, p0 = placed_inputs(256, 128, 512, placement=0)
+    a1, b1, p1 = placed_inputs(256, 128, 512, placement=1)
+    assert torch.equal(a0, a1) and torch.equal(b0, b1)
+    assert a0.data_ptr() != a1.data_ptr() and p0 is None and p1 is not None

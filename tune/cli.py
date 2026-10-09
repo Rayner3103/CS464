@@ -94,7 +94,7 @@ def cmd_benchmark(args):
     path = run(_shapes(args.suite), args.backends.split(","), args.out, dtype=args.dtype,
                cache_modes=tuple(args.cache_modes.split(",")), timing_overrides=timing,
                budget_s=_parse_budget(args.budget), session_id=args.session, prune_shapes=args.prune_shapes,
-               out_name=args.out_name)
+               out_name=args.out_name, n_allocs=args.n_allocs)
     print(f"results -> {path}")
 
 
@@ -102,7 +102,8 @@ def cmd_noise(args):
     from tune.noise import run_noise
     shapes = json.loads(Path(args.shapes).read_text())["shapes"]
     path = run_noise(shapes, args.out, backends=tuple(args.backends.split(",")), repeats=args.repeats,
-                     rounds=args.rounds, cache_modes=tuple(args.cache_modes.split(",")), session_id=args.session)
+                     rounds=args.rounds, cache_modes=tuple(args.cache_modes.split(",")), session_id=args.session,
+                     n_allocs=args.n_allocs)
     print(f"noise -> {path}")
 
 
@@ -145,6 +146,7 @@ def main(argv=None):
         p.add_argument("--max-time-s", type=float, default=None)
         p.add_argument("--target-rse", type=float, default=None)
         p.add_argument("--out-name", default="results.jsonl")
+        p.add_argument("--n-allocs", type=int, default=3, help="input placements pooled per measurement")
     p = add("noise", cmd_noise)
     p.add_argument("--shapes", default="suites/v1/noise.json")
     p.add_argument("--backends", default="torch,triton:bm128_bn128_bk32_w4_s4_g8_sk1")
@@ -152,6 +154,7 @@ def main(argv=None):
     p.add_argument("--rounds", type=int, default=3)
     p.add_argument("--cache-modes", default="cold,hot")
     p.add_argument("--session", default=None)
+    p.add_argument("--n-allocs", type=int, default=3)
     p = add("drift", cmd_drift)
     p.add_argument("--minutes", type=float, default=10.0)
     p.add_argument("--n", type=int, default=8192)

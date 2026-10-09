@@ -1,0 +1,37 @@
+{
+ "suite": "edge",
+ "dtype": "fp16",
+ "total": 1183,
+ "failures": [],
+ "per_config": {
+  "triton_nn_v1/bm128_bn256_bk32_w8_s3_g8_sk1": [
+   169,
+   0
+  ],
+  "triton_nn_v1/bm128_bn128_bk32_w4_s4_g8_sk1": [
+   169,
+   0
+  ],
+  "triton_nn_v1/bm64_bn64_bk32_w4_s4_g8_sk1": [
+   169,
+   0
+  ],
+  "triton_nn_v1/bm16_bn64_bk128_w4_s4_g1_sk1": [
+   169,
+   0
+  ],
+  "triton_nn_v1/bm64_bn64_bk64_w4_s3_g1_sk8": [
+   169,
+   0
+  ],
+  "triton_tutorial_default/default": [
+   169,
+   0
+  ],
+  "torch_matmul/default": [
+   169,
+   0
+  ]
+ },
+ "timestamp": 1791518244.6325843
+}
