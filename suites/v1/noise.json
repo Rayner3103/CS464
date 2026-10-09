@@ -1,0 +1,278 @@
+{
+ "suite": "noise",
+ "version": "v1",
+ "seed": 464,
+ "max_dim": 16384,
+ "built_for_sm_count": null,
+ "n": 30,
+ "shapes": [
+  {
+   "M": 64,
+   "N": 64,
+   "K": 64,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S1"
+  },
+  {
+   "M": 1000,
+   "N": 1000,
+   "K": 1000,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S1"
+  },
+  {
+   "M": 2000,
+   "N": 2000,
+   "K": 2000,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S1"
+  },
+  {
+   "M": 4095,
+   "N": 4095,
+   "K": 4095,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S1"
+  },
+  {
+   "M": 8191,
+   "N": 8191,
+   "K": 8191,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S1"
+  },
+  {
+   "M": 16384,
+   "N": 16384,
+   "K": 16384,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S1"
+  },
+  {
+   "M": 1,
+   "N": 1024,
+   "K": 4096,
+   "suite": "noise",
+   "layer": "llama3_8b.attn_kv",
+   "out_of_range": false,
+   "split": "aux",
+   "suite_origin": "S2"
+  },
+  {
+   "M": 1,
+   "N": 5120,
+   "K": 13824,
+   "suite": "noise",
+   "layer": "llama2_13b.mlp_down",
+   "out_of_range": false,
+   "split": "aux",
+   "suite_origin": "S2"
+  },
+  {
+   "M": 4,
+   "N": 4096,
+   "K": 14336,
+   "suite": "noise",
+   "layer": "llama3_8b.mlp_down",
+   "out_of_range": false,
+   "split": "aux",
+   "suite_origin": "S2"
+  },
+  {
+   "M": 16,
+   "N": 11008,
+   "K": 4096,
+   "suite": "noise",
+   "layer": "llama2_7b.mlp_gate_up",
+   "out_of_range": false,
+   "split": "aux",
+   "suite_origin": "S2"
+  },
+  {
+   "M": 32,
+   "N": 8192,
+   "K": 8192,
+   "suite": "noise",
+   "layer": "llama2_70b.attn_o",
+   "out_of_range": false,
+   "split": "aux",
+   "suite_origin": "S2"
+  },
+  {
+   "M": 512,
+   "N": 4096,
+   "K": 4096,
+   "suite": "noise",
+   "layer": "llama2_7b.attn_o",
+   "out_of_range": false,
+   "split": "aux",
+   "suite_origin": "S2"
+  },
+  {
+   "M": 2048,
+   "N": 11008,
+   "K": 4096,
+   "suite": "noise",
+   "layer": "llama2_7b.mlp_gate_up",
+   "out_of_range": false,
+   "split": "aux",
+   "suite_origin": "S2"
+  },
+  {
+   "M": 8192,
+   "N": 5120,
+   "K": 13824,
+   "suite": "noise",
+   "layer": "llama2_13b.mlp_down",
+   "out_of_range": false,
+   "split": "aux",
+   "suite_origin": "S2"
+  },
+  {
+   "M": 1,
+   "N": 1024,
+   "K": 1024,
+   "suite": "noise",
+   "orientation": "small_M",
+   "split": "aux",
+   "suite_origin": "S3"
+  },
+  {
+   "M": 4096,
+   "N": 4,
+   "K": 4096,
+   "suite": "noise",
+   "orientation": "small_N",
+   "split": "aux",
+   "suite_origin": "S3"
+  },
+  {
+   "M": 8,
+   "N": 8192,
+   "K": 8192,
+   "suite": "noise",
+   "orientation": "small_M",
+   "split": "aux",
+   "suite_origin": "S3"
+  },
+  {
+   "M": 8192,
+   "N": 64,
+   "K": 8192,
+   "suite": "noise",
+   "orientation": "small_N",
+   "split": "aux",
+   "suite_origin": "S3"
+  },
+  {
+   "M": 16,
+   "N": 16,
+   "K": 4096,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S4"
+  },
+  {
+   "M": 16,
+   "N": 256,
+   "K": 16384,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S4"
+  },
+  {
+   "M": 256,
+   "N": 256,
+   "K": 16384,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S4"
+  },
+  {
+   "M": 7,
+   "N": 7,
+   "K": 2039,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S5"
+  },
+  {
+   "M": 100,
+   "N": 4093,
+   "K": 509,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S5"
+  },
+  {
+   "M": 4093,
+   "N": 4093,
+   "K": 8191,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S5"
+  },
+  {
+   "M": 448,
+   "N": 1088,
+   "K": 1024,
+   "suite": "noise",
+   "tile": 64,
+   "waves_target": 1,
+   "tiles": 119,
+   "wave_slots": 136,
+   "split": "aux",
+   "suite_origin": "S6"
+  },
+  {
+   "M": 2176,
+   "N": 2176,
+   "K": 4096,
+   "suite": "noise",
+   "tile": 128,
+   "waves_target": 4,
+   "tiles": 289,
+   "wave_slots": 68,
+   "split": "aux",
+   "suite_origin": "S6"
+  },
+  {
+   "M": 14,
+   "N": 2,
+   "K": 1,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S7"
+  },
+  {
+   "M": 56,
+   "N": 29,
+   "K": 175,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S7"
+  },
+  {
+   "M": 7,
+   "N": 1441,
+   "K": 3940,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S7"
+  },
+  {
+   "M": 8216,
+   "N": 8353,
+   "K": 14441,
+   "suite": "noise",
+   "split": "aux",
+   "suite_origin": "S7"
+  }
+ ]
+}

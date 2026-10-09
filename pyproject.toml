@@ -1,0 +1,14 @@
+[project]
+name = "cs464-tune"
+version = "0.1.0"
+description = "Install-time benchmarking harness for learned GEMM kernel selection"
+requires-python = ">=3.10"
+
+[project.scripts]
+tune = "tune.cli:main"
+
+[tool.setuptools]
+packages = ["tune", "kernels", "baselines"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,9 @@
+# Versions this baseline study was run with (see data/<hw_id>/env.json for the full record).
+torch==2.13.0          # +cu130 wheel
+triton==3.7.1
+numpy==2.5.2
+pandas==2.3.3
+pyarrow==25.0.1
+matplotlib==3.11.1
+nvidia-ml-py==13.615.71
+pytest==9.1.1

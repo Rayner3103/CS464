@@ -1,0 +1,220 @@
+{
+ "suite": "S4",
+ "version": "v1",
+ "seed": 464,
+ "max_dim": 16384,
+ "built_for_sm_count": null,
+ "n": 30,
+ "shapes": [
+  {
+   "M": 16,
+   "N": 16,
+   "K": 4096,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 16,
+   "N": 16,
+   "K": 8192,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 16,
+   "N": 16,
+   "K": 16384,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 16,
+   "N": 64,
+   "K": 4096,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 16,
+   "N": 64,
+   "K": 8192,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 16,
+   "N": 64,
+   "K": 16384,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 16,
+   "N": 128,
+   "K": 4096,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 16,
+   "N": 128,
+   "K": 8192,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 16,
+   "N": 128,
+   "K": 16384,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 16,
+   "N": 256,
+   "K": 4096,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 16,
+   "N": 256,
+   "K": 8192,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 16,
+   "N": 256,
+   "K": 16384,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 64,
+   "N": 64,
+   "K": 4096,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 64,
+   "N": 64,
+   "K": 8192,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 64,
+   "N": 64,
+   "K": 16384,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 64,
+   "N": 128,
+   "K": 4096,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 64,
+   "N": 128,
+   "K": 8192,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 64,
+   "N": 128,
+   "K": 16384,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 64,
+   "N": 256,
+   "K": 4096,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 64,
+   "N": 256,
+   "K": 8192,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 64,
+   "N": 256,
+   "K": 16384,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 128,
+   "N": 128,
+   "K": 4096,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 128,
+   "N": 128,
+   "K": 8192,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 128,
+   "N": 128,
+   "K": 16384,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 128,
+   "N": 256,
+   "K": 4096,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 128,
+   "N": 256,
+   "K": 8192,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 128,
+   "N": 256,
+   "K": 16384,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 256,
+   "N": 256,
+   "K": 4096,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 256,
+   "N": 256,
+   "K": 8192,
+   "suite": "S4",
+   "split": "tune"
+  },
+  {
+   "M": 256,
+   "N": 256,
+   "K": 16384,
+   "suite": "S4",
+   "split": "tune"
+  }
+ ]
+}
