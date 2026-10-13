@@ -60,3 +60,18 @@ def test_session_env_and_provenance(tmp_path, monkeypatch):
     assert lock["declared"] == "none" and lock["state"] == "unlocked" and lock["probe"] in ("likely_locked", "likely_unlocked")
     p = provenance(env)
     assert p["clock_lock_state"] == "unlocked" and p["env_file"] == "env/sess-x.json" and len(p["harness_commit"]) == 12
+
+
+def test_noise_rows_carry_provenance(tmp_path, monkeypatch):
+    import pytest
+    import torch
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA GPU")
+    from tune.noise import run_noise
+    from tune.records import read_records
+    monkeypatch.setenv("TUNE_CLOCK_LOCK", "none")
+    path = run_noise([{"M": 64, "N": 64, "K": 64}], tmp_path, backends=("torch",), repeats=3, rounds=1,
+                     cache_modes=("hot",), session_id="s-prov", log=lambda *_: None)
+    row = read_records(path)[0]
+    assert row["clock_lock_state"] == "unlocked" and row["env_file"] == "env/s-prov.json"
+    assert row["harness_commit"]

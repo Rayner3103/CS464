@@ -100,6 +100,10 @@ def noise_analysis(data: Path, figs: Path) -> tuple[str, dict]:
     for sess, d in df.groupby("session_id"):
         lock = d["clock_lock_state"].dropna().iloc[0] if "clock_lock_state" in d and d["clock_lock_state"].notna().any() else "unrecorded"
         mhz = d["clock_lock_mhz"].dropna().iloc[0] if "clock_lock_mhz" in d and d["clock_lock_mhz"].notna().any() else None
+        env_path = data / "env" / f"{sess}.json"
+        if lock == "unrecorded" and env_path.exists():  # rows predating per-row provenance: use the session env
+            cl = json.loads(env_path.read_text()).get("clock_lock", {})
+            lock, mhz = cl.get("state", "unrecorded"), cl.get("lock_mhz")
         n_rounds = d["round"].nunique()
         complete = d.groupby(["shape", "kernel", "cache_mode"])["round"].nunique().eq(n_rounds).all() and len(d) == d[["shape", "kernel", "cache_mode"]].drop_duplicates().shape[0] * n_rounds
         ctx[sess] = {"date": _dt.datetime.fromtimestamp(d["timestamp"].min()).strftime("%m-%d %H:%M"),

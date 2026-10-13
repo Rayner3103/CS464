@@ -73,7 +73,7 @@ def run_noise(shapes: list[dict], out_dir: Path, *, backends=("torch", "triton:b
                                  "clock_mhz": tel.get("clock_mhz"), "temp_c": tel.get("temp_c"),
                                  "power_w": tel.get("power_w"), "throttle_reasons": tel.get("throttle_reasons"),
                                  "timestamp": time.time(), "session_id": session_id, "round": rnd,
-                                 "suite": "noise", "suite_origin": s.get("suite_origin")},
+                                 "suite": "noise", "suite_origin": s.get("suite_origin"), **prov},
                                 samples_us=r.samples_us)
                 torch.cuda.empty_cache()
                 log(f"[noise r{rnd} {i + 1}/{len(order)}] {M}x{N}x{K} | {time.perf_counter() - t0:.0f}s")
