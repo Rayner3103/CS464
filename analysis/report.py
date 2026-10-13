@@ -7,6 +7,7 @@ reports/week1.md.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import glob
 import json
 from pathlib import Path
@@ -93,11 +94,28 @@ def noise_analysis(data: Path, figs: Path) -> tuple[str, dict]:
 
     out = {}
     md = []
+    # Session context: rows from before provenance fields existed have no recorded lock state, so the
+    # observed clock range is shown alongside; complete = every (shape, kernel, mode) has all rounds.
+    ctx = {}
+    for sess, d in df.groupby("session_id"):
+        lock = d["clock_lock_state"].dropna().iloc[0] if "clock_lock_state" in d and d["clock_lock_state"].notna().any() else "unrecorded"
+        mhz = d["clock_lock_mhz"].dropna().iloc[0] if "clock_lock_mhz" in d and d["clock_lock_mhz"].notna().any() else None
+        n_rounds = d["round"].nunique()
+        complete = d.groupby(["shape", "kernel", "cache_mode"])["round"].nunique().eq(n_rounds).all() and len(d) == d[["shape", "kernel", "cache_mode"]].drop_duplicates().shape[0] * n_rounds
+        ctx[sess] = {"date": _dt.datetime.fromtimestamp(d["timestamp"].min()).strftime("%m-%d %H:%M"),
+                     "driver": d["driver"].iloc[0], "clock": f"{lock}" + (f"@{mhz}" if mhz else ""),
+                     "clk_obs": f"{int(d['clock_mhz'].min())}-{int(d['clock_mhz'].max())}",
+                     "rounds": n_rounds, "complete": "yes" if complete and n_rounds >= 3 else "NO"}
+    md.append("### Sessions\n")
+    md.append(_fmt_table(pd.DataFrame([{"session": k, **v} for k, v in ctx.items()])))
+    md.append("\nOnly compare sessions with the same driver and clock state; ignore sessions with complete = NO "
+              "(fewer rounds understate the range).\n")
     summ = []
     for (sess, cm), s in stats.groupby(["session_id", "cache_mode"]):
         big = s[s["median_us"] >= 50]
         small = s[s["median_us"] < 50]
-        d = {"session": sess, "cache_mode": cm, "n_allocs": int(s["n_allocs"].iloc[0]),
+        d = {"session": sess, "cache_mode": cm, "clock": ctx[sess]["clock"], "complete": ctx[sess]["complete"],
+             "n_allocs": int(s["n_allocs"].iloc[0]),
              "range_p50": s["across_round_range_rel"].median(),
              "range_p95": s["across_round_range_rel"].quantile(0.95),
              "range_max": s["across_round_range_rel"].max(),

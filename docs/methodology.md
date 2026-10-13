@@ -71,12 +71,13 @@ Hot mode stays the right model for genuinely back-to-back reuse, such as the sam
 
 | Item | Status on the RTX 3080 box |
 |---|---|
-| Clock locking (`nvidia-smi -lgc`) | **Not applied.** It needs root, and the harness never runs as root. The SM clock, memory clock, temperature, power and NVML throttle-reason bitmask are recorded before and after every measurement instead. Under sustained load the card runs **power-capped** (throttle reason 0x4 on about 90% of rows), with the SM clock between 1590 and 1965 MHz. Steady state is very stable: 1800 MHz ±15 and 0.01% time drift over 10 min. |
+| Clock locking (`nvidia-smi -lgc`) | Set by the user with root; the harness never runs as root. NVML has no getter for locked clocks, so every session **probes** the state. An idle GPU still at a high clock, or a clock capped well below max under a light spin load with no power or thermal limit, means `likely_locked`. Declare the lock with `python -m tune --clock-lock 1755 ...` (or `TUNE_CLOCK_LOCK=1755`). The declaration is recorded, and a warning is printed if it disagrees with the probe. Unlocked, the card runs **power-capped** under sustained load (throttle reason 0x4), with the SM clock between 1590 and 1965 MHz. **Only compare sessions with the same lock state and driver.** |
 | Idle GPU | Compute processes are checked through NVML and logged in `env.json`. **This GPU also drives the desktop display** (`display_active=1`). Compositor work is a background noise source and is measured as part of the noise floor. |
 | Persistence mode | Off (recorded). |
 | ECC | Not supported on GeForce (recorded as N/A). |
 | Power limit | 340 W default (recorded). |
-| Fingerprint | `hw_id = <gpu>_sm<cc>_<n>sms_<mem>gb`, plus driver, CUDA, torch, triton and harness git commit in `env.json`. |
+| Fingerprint | `hw_id = <gpu>_sm<cc>_<n>sms_<mem>gb`. |
+| Provenance | Every session writes `data/<hw>/env/<session_id>.json` (driver, versions, git commit and dirty flag, clock-lock probe, argv), and `env.json` is refreshed to the latest session. Every result row also carries `session_id`, `driver`, `harness_commit`, `harness_dirty`, `clock_lock_state`, `clock_lock_mhz` and `env_file`. Rows written before 2026-10-14 lack the last five fields. |
 
 ## Correctness gate
 

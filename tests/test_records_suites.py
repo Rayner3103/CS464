@@ -44,3 +44,19 @@ def test_suites_deterministic_and_split():
 
 def test_s6_depends_on_sm_count():
     assert build(68)["S6"] != build(108)["S6"]
+
+
+def test_session_env_and_provenance(tmp_path, monkeypatch):
+    import pytest
+    import torch
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA GPU")
+    from tune.env import provenance, write_env
+    monkeypatch.setenv("TUNE_CLOCK_LOCK", "none")
+    env = write_env(tmp_path, session_id="sess-x", kind="test")
+    assert (tmp_path / "env" / "sess-x.json").exists() and (tmp_path / "env.json").exists()
+    assert json.loads((tmp_path / "env.json").read_text())["session_id"] == "sess-x"
+    lock = env["clock_lock"]
+    assert lock["declared"] == "none" and lock["state"] == "unlocked" and lock["probe"] in ("likely_locked", "likely_unlocked")
+    p = provenance(env)
+    assert p["clock_lock_state"] == "unlocked" and p["env_file"] == "env/sess-x.json" and len(p["harness_commit"]) == 12

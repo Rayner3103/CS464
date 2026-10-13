@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -38,7 +39,8 @@ def _shapes(suites: str) -> list[dict]:
 
 def cmd_env(args):
     env = write_env(args.out)
-    print(json.dumps({k: env[k] for k in ("hw_id", "driver", "versions", "clocks", "display_active")}, indent=1))
+    print(json.dumps({k: env[k] for k in ("hw_id", "driver", "versions", "clock_lock", "display_active",
+                                          "harness_git")}, indent=1))
     print(f"wrote {args.out / 'env.json'}")
 
 
@@ -47,6 +49,8 @@ def cmd_check(args):
     from tune.correctness import validate
     from tune.runner import DTYPES, candidates_for
 
+    from tune.env import provenance
+    env = write_env(args.out, kind="check")
     shapes = _shapes(args.suite)
     fails, total = [], 0
     per_cfg: dict[str, list[int]] = {}
@@ -67,7 +71,8 @@ def cmd_check(args):
     args.out.mkdir(parents=True, exist_ok=True)
     out = args.out / f"check-{args.suite}.json"
     out.write_text(json.dumps({"suite": args.suite, "dtype": args.dtype, "total": total, "failures": fails,
-                               "per_config": per_cfg, "timestamp": time.time()}, indent=1, default=str))
+                               "per_config": per_cfg, "timestamp": time.time(),
+                               "session_id": env["session_id"], **provenance(env)}, indent=1, default=str))
     print(f"wrote {out}")
     for f in fails[:20]:
         print("  FAIL", f)
@@ -76,10 +81,10 @@ def cmd_check(args):
 
 def cmd_roofline(args):
     from baselines.roofline import measure_bandwidth_gbps, measure_peak_tflops
-    from tune.env import spec_peaks
+    from tune.env import provenance, spec_peaks
+    env = write_env(args.out, kind="roofline")
     res = {"spec": spec_peaks(), "bandwidth": measure_bandwidth_gbps(), "compute": measure_peak_tflops(),
-           "timestamp": time.time()}
-    args.out.mkdir(parents=True, exist_ok=True)
+           "timestamp": time.time(), "session_id": env["session_id"], **provenance(env)}
     (args.out / "roofline.json").write_text(json.dumps(res, indent=1))
     print(json.dumps(res, indent=1))
 
@@ -120,6 +125,9 @@ def cmd_analyze(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="tune", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-pin", action="store_true", help="do not pin the process to one CPU core")
+    ap.add_argument("--clock-lock", default=None,
+                    help="declare the SM clock lock in effect, e.g. 1755 (after nvidia-smi -lgc 1755,1755) or 'none'. "
+                         "Recorded in env.json and on every row; default: env var TUNE_CLOCK_LOCK, else probed")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add(name, fn, **kw):
@@ -164,6 +172,8 @@ def main(argv=None):
     p.add_argument("--report", type=Path, default=Path("reports"))
 
     args = ap.parse_args(argv)
+    if args.clock_lock is not None:
+        os.environ["TUNE_CLOCK_LOCK"] = args.clock_lock
     if args.cmd == "analyze":
         args.data = args.data or default_data_dir()
     else:

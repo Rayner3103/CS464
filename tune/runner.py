@@ -16,7 +16,7 @@ from typing import Callable, Iterable
 import torch
 
 from tune.correctness import placed_inputs, reference, validate
-from tune.env import capture_env, write_env
+from tune.env import provenance, write_env
 from tune.records import RecordWriter, alignment_flags, completed_keys, measurement_key
 from tune.timing import TimingConfig, benchmark, pool
 
@@ -74,10 +74,8 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
         n_allocs: int = 1,
         out_name: str = "results.jsonl", log: Callable[[str], None] = print) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    env = capture_env()
-    if not (out_dir / "env.json").exists():
-        write_env(out_dir)
     session_id = session_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    env = write_env(out_dir, session_id=session_id, kind="benchmark")
     results = out_dir / out_name
     inflight = out_dir / "inflight.json"
     done = completed_keys(results)
@@ -86,7 +84,7 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
 
     base_row = {"hw_id": env["hw_id"], "driver": env["driver"], "cuda": env["versions"]["torch_cuda"],
                 "torch": env["versions"]["torch"], "triton": env["versions"]["triton"],
-                "dtype": dtype, "layout": LAYOUT, "session_id": session_id}
+                "dtype": dtype, "layout": LAYOUT, "session_id": session_id, **provenance(env)}
 
     t0 = time.perf_counter()
     last_tel: dict = {}

@@ -19,7 +19,7 @@ from pathlib import Path
 import torch
 
 from tune.correctness import make_inputs, placed_inputs
-from tune.env import capture_env, gpu_telemetry, write_env
+from tune.env import gpu_telemetry, provenance, write_env
 from tune.records import RecordWriter
 from tune.runner import DTYPES, LAYOUT, candidates_for
 from tune.timing import TimingConfig, benchmark, pool
@@ -28,11 +28,11 @@ from tune.timing import TimingConfig, benchmark, pool
 def run_noise(shapes: list[dict], out_dir: Path, *, backends=("torch", "triton:bm128_bn128_bk32_w4_s4_g8_sk1"),
               repeats: int = 100, rounds: int = 3, cache_modes=("cold", "hot"), dtype: str = "fp16",
               session_id: str | None = None, seed: int = 0, n_allocs: int = 1, log=print) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if not (out_dir / "env.json").exists():
-        write_env(out_dir)
-    env = capture_env()
     session_id = session_id or "noise-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+    env = write_env(out_dir, session_id=session_id, kind="noise",
+                    extra={"noise_params": {"repeats": repeats, "rounds": rounds, "n_allocs": n_allocs,
+                                            "backends": list(backends), "cache_modes": list(cache_modes)}})
+    prov = provenance(env)
     rng = random.Random(seed)
     path = out_dir / "noise.jsonl"
     tdtype = DTYPES[dtype]
@@ -81,12 +81,11 @@ def run_noise(shapes: list[dict], out_dir: Path, *, backends=("torch", "triton:b
 
 
 def run_drift(out_dir: Path, minutes: float = 10.0, n: int = 8192, interval_s: float = 1.0, log=print) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if not (out_dir / "env.json").exists():
-        write_env(out_dir)
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    write_env(out_dir, session_id=f"drift-{stamp}", kind="drift")
     a, b = make_inputs(n, n, n)
     c = torch.empty((n, n), device="cuda", dtype=a.dtype)
-    path = out_dir / f"drift-{time.strftime('%Y%m%d-%H%M%S')}.csv"
+    path = out_dir / f"drift-{stamp}.csv"
     t_end = time.perf_counter() + minutes * 60
     t0 = time.perf_counter()
     with open(path, "w", newline="") as f:
