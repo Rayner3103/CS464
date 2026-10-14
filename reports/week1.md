@@ -4,6 +4,75 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-14: G1 closed under standard conditions; baselines re-run locked
+
+> The sections below this one are the original 2026-10-09 results, measured **unlocked on driver 595.91.07**. For any
+> new comparison, use the locked numbers in this section. Full tables: [`week1_results_lock1755.md`](week1_results_lock1755.md).
+
+**Standard conditions from now on:** SM clock locked at 1755 MHz (`sudo nvidia-smi -lgc 1755,1755`, then
+`python -m tune --clock-lock 1755 ...`), driver 595.99.02, 3 allocations per measurement, cold L2 primary. Every session now
+writes `data/<hw>/env/<session_id>.json`, and every row carries its commit, clock-lock state and driver.
+
+### G1: passes for kernels ≥ 50 µs
+
+There were three complete locked sessions, the last one 2 minutes after a reboot and about 15 h after the first:
+
+| | p50 | p95 | max |
+|---|---|---|---|
+| range of medians across the 3 sessions, cold | 0.24% | **1.75%** | 2.5% |
+| range of medians across the 3 sessions, hot | 0.09% | **1.78%** | 3.0% |
+| range of the kernel-vs-kernel ratio across the 3 sessions | 0.38% | **1.94%** | 2.2% |
+
+Within each session, the p95 range across rounds is 1.3–1.9%. The median shift between any two sessions is ≤ 0.05%.
+**The tie margin is now 2%** for kernels ≥ 50 µs (`docs/methodology.md`). Kernels under 50 µs are still about 6% p95 in cold
+per-launch mode; rank them with graph-amortized timing. The lock is a ceiling only: under heavy load the power cap still pulls the clock
+to about 1455–1590 MHz on some rows, and it does so the same way every session.
+
+### B0 under the lock
+
+60.0 TFLOP/s (59.7 on the clean-commit re-run) vs 62.9 unlocked, and 687 GB/s (unchanged). The unlocked file is kept as
+`data/<hw>/roofline-20261009-unlocked.json`.
+
+### S1 + S2 re-run under the lock (`results_lock1755.jsonl`, 1960 rows, all valid)
+
+| (cold L2) | unlocked, 10-09 | **locked, 10-14** |
+|---|---|---|
+| ours vs B1, median [p10, p90] | 1.006 [0.92, 1.27] | **1.008 [0.92, 1.34]** |
+| ours vs B5, median | 2.12 | **2.21** |
+| oracle vs B6, median [p90] | 1.08 [2.13] | **1.04 [2.20]** |
+| decode (M ≤ 16): ours vs B1 / oracle vs B6, median | 1.03 / 1.53 | **1.05 / 1.58** |
+| shapes: win > 5% / within 2% / loss > 5% vs B1 | 42 / – / 26 | **44 / 45 / 28** |
+| shapes beating B5 by > 5% (losing by > 5%) | 107 (0) | **111 (0)** |
+
+**The conclusions hold.** Comparing unlocked to locked per shape, no shape flipped between win and loss. 23 of 143 moved between
+neighbouring classes (tie ↔ win, tie ↔ loss), almost all of them already near the 5% boundary. Clocking down 5% slowed B1 by a median 3.1% and our
+oracle by 1.5%.
+
+The largest wins and losses are unchanged:
+- Wins: 512×5120×5120 at 1.51×, 512×5120×13824 at 1.48×, M = 64 on the 13824/14336 layers at about 1.44×, decode M = 8 at 1.40×.
+- Losses: 1000³ at 0.66×, 3000³ at 0.70×, M = 128 on large N/K at 0.84–0.86×.
+
+**One unexplained cuBLAS change:** 32×13824×5120 went from parity to 1.36× because **B1** slowed from 229 µs to 316 µs (+38%,
+the same on all 3 allocations). Our kernels moved less than 2%. A 5% lower clock cannot explain that on a memory-bound shape, so cuBLAS most likely
+picked a different algorithm under the new driver or clock. torch and its bundled cuBLAS are unchanged. B1 rows don't record which cuBLAS
+kernel ran, so this can't be confirmed from the data. That is one more reason to build B3, and to log the chosen cuBLAS kernel per row.
+
+### Gate status (supersedes the table below)
+
+| Gate | Status |
+|---|---|
+| G1 measurement validity | **Pass** for kernels ≥ 50 µs under standard conditions (p95 < 2% across 3 sessions and a reboot). Not covered: kernels under 50 µs |
+| G2 family ≥ 90% of B3 | Not testable yet (no B3). Against B1: median 100.8% |
+| G3 selection value | Positive early signal. Oracle/B6 median 1.04, p90 2.20; decode median 1.58 |
+| G4 differentiation | Candidates: decode, the 5120/13824 family, M = 64. All need re-checking against B3 |
+| G5 tractability | Not started |
+
+### Next steps (in order)
+1. **B3 (cuBLASLt exhaustive) and B2 (heuristic top-1)**, plus logging the chosen cuBLAS kernel name on B1 rows.
+2. Kernel fix for unaligned strides (1000³, 3000³), then re-check S1 and S5.
+3. M3/M4: full pruned config sweep on a coarse subset of all suites under standard conditions, then the portfolio study (M5).
+4. Re-run `python -m tune --clock-lock 1755 noise --rounds 3 --repeats 50 --n-allocs 3` after any driver update.
+
 ## TL;DR
 
 1. **The harness works and is validated.** It has env capture, adaptive CUDA-event timing (cold/hot L2, backlogged launches,
