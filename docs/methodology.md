@@ -47,7 +47,32 @@ Pooling the samples over 3 placements cuts the noise floor roughly in half. All 
 | across-round range of medians, p50 / p95 (cold) | 0.67% / 5.4% | 0.29% / 2.6% |
 | paired kernel-ratio range, p50 / p95 (cold) | 2.1% / 6.2% | 0.33% / 3.5% |
 
-**Tie margin for analysis: ε = 3%.** Kernels within 3% of each other count as tied. Wins under 5% are reported but never relied on. Revisit once across-session data exists.
+**Tie margin for analysis (revised 2026-10-14): ε = 2% for kernels ≥ 50 µs** measured under the standard conditions below.
+Kernels within 2% of each other count as tied. Kernels under 50 µs keep ε = 5% in per-launch mode; rank them with
+graph-amortized timing instead. Wins under 5% are reported but not relied on for go/no-go decisions.
+
+## Noise floor under standard conditions (gate G1)
+
+**Standard conditions:** SM clock locked at 1755 MHz (`sudo nvidia-smi -lgc 1755,1755`, run with `--clock-lock 1755`),
+driver 595.99.02, 3 allocations pooled per measurement, cold L2 primary. There were three complete sessions, one of them right after a
+reboot:
+
+| session | when | p95 range across rounds (≥ 50 µs), cold / hot |
+|---|---|---|
+| `noise-20261013-232542-642a` | 10-13 23:25 (lock inferred from observed max clock) | 1.3% / 1.2% |
+| `noise-20261014-001639-lock1755` | 10-14 00:16 | 1.8% / 1.8% |
+| `noise-20261014-141218-6985` | 10-14 14:12, 2 min after a reboot | 1.4% / 1.9% |
+
+Across the three sessions, for the same (shape, kernel, mode) at ≥ 50 µs, the range of medians is p50 0.24%, **p95 1.75%**, max 2.5% (cold),
+and **p95 1.78%** (hot). For the ratio between the two kernels, which is what decides selection, it is **p95 1.94%**. The median shift between any
+two sessions is ≤ 0.05%. **G1 passes for kernels ≥ 50 µs.**
+
+Caveats:
+- Kernels under 50 µs remain at about 6% p95 in cold per-launch mode, so G1 does not cover them.
+- The lock is a ceiling, not a floor. Under sustained heavy load the card still hits the power cap (throttle 0x4) on 14–19% of rows
+  and dips to about 1590 MHz. It happens the same way in every session, so it does not hurt reproducibility.
+- These numbers hold only under the standard conditions. A driver update, a different lock, or unlocked clocks means re-running the noise study
+  before comparing results.
 
 ## µs-scale kernels
 
@@ -93,4 +118,4 @@ The code is in `tune/correctness.py`.
 ## Known limitations of this phase
 - Per-candidate subprocess isolation and hang timeouts (plan 7.2) are not implemented yet. Crash recovery works through restart-and-resume instead.
 - Clocks are recorded, not locked. Clock-normalized analysis is possible later from the per-row `clock_mhz`.
-- Both noise sessions ran on the same day with different methods. The across-session component needs `python -m tune noise --rounds 3 --repeats 50 --n-allocs 3` re-run on other days, ideally including one cold boot.
+- The across-session noise data covers about 15 hours and one reboot, all on one driver. Re-run `python -m tune --clock-lock 1755 noise --rounds 3 --repeats 50 --n-allocs 3` after any driver update.

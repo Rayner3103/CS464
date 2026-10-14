@@ -213,8 +213,15 @@ def drift_analysis(data: Path, figs: Path) -> tuple[str, dict]:
 
 
 # --------------------------------------------------------------------------------------------- baselines
-def baseline_analysis(data: Path, figs: Path) -> tuple[str, dict]:
-    rows = [r for r in read_records(data / "results.jsonl")]
+def _tag(results_name: str) -> str:
+    """'' for the default results.jsonl, else e.g. '_lock1755' for results_lock1755.jsonl (used in output names)."""
+    stem = Path(results_name).stem
+    return "" if stem == "results" else "_" + stem.removeprefix("results_")
+
+
+def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl") -> tuple[str, dict]:
+    tag = _tag(results_name)
+    rows = [r for r in read_records(data / results_name)]
     if not rows:
         return "_no benchmark data_\n", {}
     df = pd.DataFrame(rows)
@@ -225,6 +232,15 @@ def baseline_analysis(data: Path, figs: Path) -> tuple[str, dict]:
     roof = json.loads((data / "roofline.json").read_text()) if (data / "roofline.json").exists() else None
 
     md, out = [], {"n_invalid": len(invalid)}
+    sess = pd.DataFrame(rows).groupby("session_id").agg(
+        rows=("M", "size"), driver=("driver", "first"),
+        clock=("clock_lock_state", lambda x: x.dropna().iloc[0] if x.notna().any() else "unrecorded"),
+        clk_obs=("clock_mhz", lambda x: f"{x.min():.0f}-{x.max():.0f}"),
+        n_allocs=("n_allocs", lambda x: x.dropna().iloc[0] if x.notna().any() else 1)).reset_index() \
+        if "clock_lock_state" in pd.DataFrame(rows) else None
+    md.append(f"Source: `{results_name}`\n")
+    if sess is not None:
+        md.append(_fmt_table(sess) + "\n")
     if len(invalid):
         md.append(f"**{len(invalid)} invalid measurements** (excluded): "
                   f"{invalid['failure_reason'].value_counts().to_dict()}\n")
@@ -249,7 +265,7 @@ def baseline_analysis(data: Path, figs: Path) -> tuple[str, dict]:
         flops = 2 * piv.index.get_level_values("M") * piv.index.get_level_values("N") * piv.index.get_level_values("K")
         piv["B1_tflops"] = flops / piv["B1 torch.matmul"] / 1e6
         piv["oracle_tflops"] = flops / piv["oracle(ours)"] / 1e6
-        piv.reset_index().to_csv(figs.parent / f"baseline_table_{cm}.csv", index=False)
+        piv.reset_index().to_csv(figs.parent / f"baseline_table_{cm}{tag}.csv", index=False)
 
         o = out.setdefault(cm, {})
         o["b6_config"] = b6.replace("ours:", "")
@@ -278,8 +294,8 @@ def baseline_analysis(data: Path, figs: Path) -> tuple[str, dict]:
                                      "B1_tflops", "oracle_tflops", "ours/B1", "ours/B5"]], "{:.2f}"))
 
         if roof is not None and cm == "cold":
-            _roofline_plot(piv, roof, figs / "roofline.png")
-        _speedup_plot(piv, cm, figs / f"speedup_{cm}.png")
+            _roofline_plot(piv, roof, figs / f"roofline{tag}.png")
+        _speedup_plot(piv, cm, figs / f"speedup_{cm}{tag}.png")
     return "\n".join(md) + "\n", out
 
 
@@ -336,7 +352,8 @@ def _speedup_plot(piv: pd.DataFrame, cm: str, path: Path):
     plt.close(fig)
 
 
-def build_reports(data: Path, report: Path):
+def build_reports(data: Path, report: Path, results_name: str = "results.jsonl"):
+    tag = _tag(results_name)
     figs = report / "figures"
     figs.mkdir(parents=True, exist_ok=True)
     env = json.loads((data / "env.json").read_text())
@@ -354,9 +371,9 @@ def build_reports(data: Path, report: Path):
             "{:.1f}") + "\n")
     summary = {"roofline": roof}
     for name, fn in [("noise", noise_analysis), ("drift", drift_analysis), ("baselines", baseline_analysis)]:
-        md, s = fn(data, figs)
+        md, s = fn(data, figs, results_name) if fn is baseline_analysis else fn(data, figs)
         parts.append(f"## {name}\n\n{md}")
         summary[name] = s
-    (report / "week1_results.md").write_text("\n".join(parts))
-    (report / "week1_summary.json").write_text(json.dumps(summary, indent=1, default=float))
-    print(f"wrote {report / 'week1_results.md'} and figures in {figs}")
+    (report / f"week1_results{tag}.md").write_text("\n".join(parts))
+    (report / f"week1_summary{tag}.json").write_text(json.dumps(summary, indent=1, default=float))
+    print(f"wrote {report / f'week1_results{tag}.md'} and figures in {figs}")

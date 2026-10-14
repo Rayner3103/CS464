@@ -119,7 +119,7 @@ def cmd_drift(args):
 
 def cmd_analyze(args):
     from analysis.report import build_reports
-    build_reports(args.data, args.report)
+    build_reports(args.data, args.report, args.results)
 
 
 def main(argv=None):
@@ -170,6 +170,8 @@ def main(argv=None):
     p.set_defaults(fn=cmd_analyze)
     p.add_argument("--data", type=Path, default=None)
     p.add_argument("--report", type=Path, default=Path("reports"))
+    p.add_argument("--results", default="results.jsonl",
+                   help="benchmark file under --data, e.g. results_lock1755.jsonl (outputs get a _lock1755 suffix)")
 
     args = ap.parse_args(argv)
     if args.clock_lock is not None:
