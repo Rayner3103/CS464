@@ -38,7 +38,10 @@ class Candidate:
 
 def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False,
                    dtype: torch.dtype = torch.float16) -> list[Candidate]:
-    """Backend spec strings: torch | triton_tutorial | triton:handpicked | triton:<config_key> | cublaslt[:N].
+    """Backend spec strings: torch | triton_tutorial | triton:handpicked | triton:sweep[:k] | triton:<config_key> |
+    cublaslt[:N] | cublaslt_deep[:budget_s].
+
+    triton:sweep[:k] expands to the k fastest configs (default 8) of the stage-1 screen for this shape.
 
     cublaslt[:N] expands to cuBLASLt's top-N heuristic candidates for this shape (default 16; it often returns fewer).
     Rank 0 is B2; the per-shape best over all of them is B3.
@@ -66,8 +69,19 @@ def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False
         return [Candidate(b.family, "default", b.cfg, b)]
     if spec.startswith("triton:"):
         which = spec.split(":", 1)[1]
+        extra: dict[str, dict] = {}
         if which == "handpicked":
             cfgs = list(HANDPICKED.values())
+        elif which == "sweep" or which.startswith("sweep:"):
+            # The k fastest configs from the stage-1 screen (tune/sweep.py) for this shape.
+            from tune.sweep import top_configs
+            k = int(which.split(":", 1)[1]) if ":" in which else 8
+            sweep_dir = os.environ.get("TUNE_SWEEP_DIR")
+            if not sweep_dir:
+                raise RuntimeError("triton:sweep needs the stage-1 screen directory (TUNE_SWEEP_DIR)")
+            tops = top_configs(Path(sweep_dir), M, N, K, k)
+            cfgs = [t["cfg"] for t in tops]
+            extra = {t["cfg"].key(): {"screen_us": t["screen_us"], "screen_rank": t["screen_rank"]} for t in tops}
         else:
             cfgs = [c for c in HANDPICKED.values() if c.key() == which]
             if not cfgs:
@@ -78,7 +92,8 @@ def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False
             hard = [r for r in v if r in ("split_k_workspace_too_large",)]
             if hard or (prune_shapes and v):
                 continue
-            out.append(Candidate(TritonMatmul.family, c.key(), c.to_dict(), TritonMatmul(c)))
+            out.append(Candidate(TritonMatmul.family, c.key(), {**c.to_dict(), **extra.get(c.key(), {})},
+                                 TritonMatmul(c)))
         return out
     raise ValueError(f"unknown backend spec {spec!r}")
 
@@ -97,6 +112,7 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
     session_id = session_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     env = write_env(out_dir, session_id=session_id, kind="benchmark")
     os.environ["TUNE_LT_SEARCH_DIR"] = str(out_dir / "lt_search")  # deep cuBLASLt search cache lives with the run
+    os.environ.setdefault("TUNE_SWEEP_DIR", str(out_dir / "sweep_screen"))  # stage-1 Triton screen results
     results = out_dir / out_name
     inflight = out_dir / "inflight.json"
     done = completed_keys(results)
@@ -123,7 +139,11 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
                 log(f"[runner] budget of {budget_s:.0f}s exhausted after {i}/{len(shapes)} shapes")
                 break
             M, N, K = s["M"], s["N"], s["K"]
-            cands = [c for spec in backend_specs for c in candidates_for(spec, M, N, K, prune_shapes, tdtype)]
+            cands, seen = [], set()
+            for c in (c for spec in backend_specs for c in candidates_for(spec, M, N, K, prune_shapes, tdtype)):
+                if (c.family, c.config_key) not in seen:  # e.g. a hand-picked config that is also in the sweep top-k
+                    seen.add((c.family, c.config_key))
+                    cands.append(c)
             todo = []
             for c in cands:
                 for cm in cache_modes:

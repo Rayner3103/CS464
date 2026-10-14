@@ -4,6 +4,7 @@
   check      correctness gate for backends over a suite (default: edge)
   roofline   B0: measure peak TFLOP/s and DRAM bandwidth -> data/<hw_id>/roofline.json
   benchmark  validate + time backends over suites -> data/<hw_id>/<out>.jsonl  (resumable)
+  sweep      stage-1 screen of the full pruned Triton config space on a coarse shape subset -> data/<hw_id>/sweep_screen/
   baseline   alias of benchmark with --backends defaulting to the vendor/reference baselines
   noise      noise-floor study -> data/<hw_id>/noise.jsonl
   drift      thermal drift run -> data/<hw_id>/drift-*.csv
@@ -31,7 +32,9 @@ def _parse_budget(s: str | None) -> float | None:
     return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
 
 
-def _shapes(suites: str) -> list[dict]:
+def _shapes(suites: str, shapes_file: str | None = None) -> list[dict]:
+    if shapes_file:
+        return json.loads(Path(shapes_file).read_text())["shapes"]
     from tune.runner import load_suite
     names = ["S1", "S2", "S3", "S4", "S5", "S6", "S7"] if suites == "all" else suites.split(",")
     return [s for n in names for s in load_suite(n)]
@@ -96,11 +99,25 @@ def cmd_benchmark(args):
         timing["max_time_s"] = args.max_time_s
     if args.target_rse is not None:
         timing["target_rse"] = args.target_rse
-    path = run(_shapes(args.suite), args.backends.split(","), args.out, dtype=args.dtype,
+    path = run(_shapes(args.suite, args.shapes_file), args.backends.split(","), args.out, dtype=args.dtype,
                cache_modes=tuple(args.cache_modes.split(",")), timing_overrides=timing,
                budget_s=_parse_budget(args.budget), session_id=args.session, prune_shapes=args.prune_shapes,
                out_name=args.out_name, n_allocs=args.n_allocs)
     print(f"results -> {path}")
+
+
+def cmd_sweep(args):
+    from tune.sweep import coarse_subset, run_sweep
+    shapes = coarse_subset(_shapes(args.suite), args.per_suite, args.max_gflop)
+    sweep_dir = args.out / "sweep_screen"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+    subset = sweep_dir / "subset.json"
+    subset.write_text(json.dumps({"suite": args.suite, "per_suite": args.per_suite, "max_gflop": args.max_gflop,
+                                  "n": len(shapes), "shapes": shapes}, indent=1))
+    print(f"{len(shapes)} shapes -> {subset}")
+    if args.list_only:
+        return
+    print(f"screen -> {run_sweep(shapes, args.out, workers=args.workers, session_id=args.session)}")
 
 
 def cmd_noise(args):
@@ -155,6 +172,15 @@ def main(argv=None):
         p.add_argument("--target-rse", type=float, default=None)
         p.add_argument("--out-name", default="results.jsonl")
         p.add_argument("--n-allocs", type=int, default=3, help="input placements pooled per measurement")
+        p.add_argument("--shapes-file", default=None, help="JSON with a 'shapes' list (e.g. sweep_screen/subset.json); "
+                                                           "overrides --suite")
+    p = add("sweep", cmd_sweep)
+    p.add_argument("--suite", default="all")
+    p.add_argument("--per-suite", type=int, default=24, help="shapes per suite in the coarse subset")
+    p.add_argument("--max-gflop", type=float, default=1200.0, help="skip shapes above this many GFLOP")
+    p.add_argument("--workers", type=int, default=10, help="parallel compile processes")
+    p.add_argument("--session", default=None)
+    p.add_argument("--list-only", action="store_true", help="write the subset and stop")
     p = add("noise", cmd_noise)
     p.add_argument("--shapes", default="suites/v1/noise.json")
     p.add_argument("--backends", default="torch,triton:bm128_bn128_bk32_w4_s4_g8_sk1")

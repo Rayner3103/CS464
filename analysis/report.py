@@ -30,9 +30,13 @@ def _label(r) -> str:
     return "ours:" + r["config_key"]
 
 
+_SUITE_REGIME = {"S1": "S1 square", "S3": "S3 skinny/tall", "S4": "S4 large-K", "S5": "S5 unaligned",
+                 "S6": "S6 wave-boundary", "S7": "S7 random"}
+
+
 def _regime(r) -> str:
-    if r["suite"] == "S1":
-        return "S1 square"
+    if r["suite"] in _SUITE_REGIME:
+        return _SUITE_REGIME[r["suite"]]
     m = r["M"]
     if m <= 16:
         return "S2 decode (M<=16)"
@@ -278,10 +282,16 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
         ours = [c for c in piv.columns if c.startswith("ours:")]
         piv["oracle(ours)"] = piv[ours].min(axis=1)
         piv["oracle_cfg"] = piv[ours].idxmin(axis=1).str.replace("ours:", "")
-        # B6 restricted to the hand-picked set: the single config with best geomean regret over all shapes.
-        regret = piv[ours].div(piv["oracle(ours)"], axis=0)
+        # B6: the single config with best geomean regret, over the configs measured on every shape (the hand-picked
+        # set; sweep top-k configs appear on only some shapes, and B6 over the full space comes from the screen data).
+        full = [c for c in ours if piv[c].notna().all()]
+        piv["oracle(fixed set)"] = piv[full].min(axis=1)
+        regret = piv[full].div(piv["oracle(ours)"], axis=0)
         b6 = np.exp(np.log(regret).mean()).idxmin()
         piv["B6(ours,fixed)"] = piv[b6]
+        sweep = len(full) < len(ours)
+        if sweep:
+            piv["sweep/handpicked"] = piv["oracle(fixed set)"] / piv["oracle(ours)"]
         piv["ours/B5"] = piv["B5 triton tutorial"] / piv["oracle(ours)"]
         piv["ours/B1"] = piv["B1 torch.matmul"] / piv["oracle(ours)"]
         piv["B6/B1"] = piv["B1 torch.matmul"] / piv["B6(ours,fixed)"]
@@ -299,6 +309,8 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
             piv["B3+/B3"] = piv["B3 cublasLt best-of-N"] / piv["B3+ cublasLt deep"]
             piv["B3+/B1"] = piv["B1 torch.matmul"] / piv["B3+ cublasLt deep"]
             metrics = ["ours/B3+", "ours/B3", "ours/B1", "B3+/B3", "B3+/B1", "B3/B1", "B2/B1", "oracle/B6", "ours/B5"]
+        if sweep:
+            metrics = metrics[:1] + ["sweep/handpicked"] + metrics[1:]
         flops = 2 * piv.index.get_level_values("M") * piv.index.get_level_values("N") * piv.index.get_level_values("K")
         piv["B1_tflops"] = flops / piv["B1 torch.matmul"] / 1e6
         piv["oracle_tflops"] = flops / piv["oracle(ours)"] / 1e6
@@ -357,7 +369,8 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
                 md.append(f"torch.matmul (B1) launches the same kernel(s) as the cuBLASLt top-1 (B2) on "
                           f"{int(same.sum())}/{len(same)} shapes.\n")
         wins = piv["oracle_cfg"].value_counts()
-        md.append("\nOracle (hand-picked) winner counts: " + ", ".join(f"`{k}`: {v}" for k, v in wins.items()) + "\n")
+        md.append(f"\nOracle winner counts ({len(wins)} distinct configs; top 10): "
+                  + ", ".join(f"`{k}`: {v}" for k, v in wins.head(10).items()) + "\n")
 
         # Per-shape table for S1 (small enough to read in full).
         s1 = piv.xs("S1 square", level="regime", drop_level=False).reset_index() if "S1 square" in piv.index.get_level_values("regime") else None
