@@ -4,6 +4,76 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-15: B2/B3 (cuBLASLt) added; G2 passes, G4 narrows sharply
+
+Run: `bench-20261015-015054-lock1755-b3` (standard conditions, commit `8c896ab`, 3336 rows, all valid), in
+`results_lock1755_b3.jsonl`. Full tables: [`week1_results_lock1755_b3.md`](week1_results_lock1755_b3.md).
+B2 = cuBLASLt heuristic top-1. B3 = best of the heuristic's top-16 after timing each, which in practice is **a median of 4 candidates (1–9)**.
+
+### Headline (cold L2, 143 shapes)
+
+| | median | p10 | p90 | min | max |
+|---|---|---|---|---|---|
+| ours (5-config oracle) vs **B3** | **0.993** | 0.88 | 1.09 | 0.66 | 1.36 |
+| ours vs B1 (for reference) | 1.008 | 0.92 | 1.31 | 0.66 | 1.51 |
+| **B3 vs B1** (what timing cuBLAS's own candidates buys) | 1.001 | 1.00 | 1.18 | 0.99 | **1.57** |
+| B2 vs B1 | 1.000 | 1.00 | 1.00 | 0.96 | 1.05 |
+
+- **B1 is B2.** `torch.matmul` launches exactly the cuBLASLt top-1 kernel on 143/143 shapes (recorded kernel names).
+- **G2 passes.** Median ours/B3 = 0.993, well above the 0.90 bar. Five hand-picked Triton configs reach vendor-oracle parity
+  on the median shape.
+- **Most of our earlier "wins over cuBLAS" were cuBLAS heuristic misses, not kernel advantages.** B3 recovers them by timing ≤ 8
+  of cuBLAS's own candidates:
+  - The 5120/13824 family (512×5120×5120: B1 751 µs → B3 483 µs): the heuristic ranks split-K algorithms 5th–6th.
+  - M=1 decode (1×1024×4096): a dedicated `gemvx` kernel, ranked 4th, beats the GEMM that B1 uses.
+  - 32×13824×5120 (the 38% "regression"): the heuristic picks a 256×64-tile kernel for 32 rows; its 2nd candidate is 11% faster.
+
+  Against B3, all of these sit at 0.93–1.03×.
+
+### G4: where ours still beats B3 by more than 5%
+
+| regime | n | ours > B3 by >5% | within 2% | ours < B3 by >5% |
+|---|---|---|---|---|
+| S2 decode (M ≤ 16) | 55 | **11 (20%)** | 20 | 3 |
+| S2 small batch (32–128) | 33 | 5 (15%) | 7 | 16 |
+| S1 square | 22 | 5 (23%) | 3 | 11 |
+| S2 prefill (M ≥ 512) | 33 | 1 (3%) | 16 | 1 |
+
+The surviving wins cluster in **one identifiable sub-regime: K = 4096 with N ∈ {1024, 11008, 12288} at M ≤ 128**
+(LLaMA-7B gate/up, the QKV projection, 1024-wide KV). There we are 1.06–1.17× faster than B3 with `bm16_bn64_bk128` (decode) and
+`bm64_bn64` (M = 32–64). Two shapes also show split-K wins: 128×1024×4096 at 1.34×, and 512×11008×4096 at 1.15×.
+
+**Caveats that keep G4 open:**
+- **B3 is shallowest exactly where we win.** On the 11008 shapes cuBLASLt returns 1–2 near-identical candidates (both the
+  older `s1688` 256×64 kernel). A full algorithm enumeration (`cublasLtMatmulAlgoGetIds`/`AlgoInit`/`AlgoCheck` over
+  tiles × stages × split-K) may close these gaps. Until it is tried, these wins mean "beats cuBLAS's best heuristic candidate", not
+  "beats cuBLAS".
+- The square-shape wins (512³ at 1.36×, 1024³ at 1.22×, 128³, 256³, 64³) are all under 50 µs except 1024³, which is outside G1's coverage.
+- Losses to B3 are concentrated in unaligned squares (4097³ 0.79×, 2049³ 0.84×, 4095³ 0.84×, 1000³ 0.66×), M = 128 small batch, and
+  M = 1 GEMV (0.79×; we have no GEMV-style config).
+
+### Gate status (supersedes earlier tables)
+
+| Gate | Status |
+|---|---|
+| G1 measurement validity | **Pass** for kernels ≥ 50 µs under standard conditions |
+| G2 family ≥ 90% of B3 | **Pass**: median 99.3% with only 5 hand-picked configs |
+| G3 selection value | Positive: oracle/B6 median 1.04, p90 2.19; decode median 1.53 |
+| G4 differentiation | **Narrow and provisional**: a K = 4096, M ≤ 128 sub-regime, 6–17% over a shallow B3. Needs a deeper B3 |
+| G5 tractability | Not started |
+
+**Implications for the project:**
+1. The honest bar is B3, not B1. A trivial "time cuBLAS's own top-8" selector already captures up to 1.57× over `torch.matmul`.
+   Any learned selector must be compared against that, not against B1.
+2. Per-shape selection is valuable for both families. Whether *our* family adds anything beyond the vendor's candidates
+   depends on the deeper-B3 check and on the full config sweep (M3/M4), which may widen the K = 4096 / small-M advantage.
+
+### Next steps
+1. **Deeper B3:** enumerate cuBLASLt algorithms beyond the heuristic (AlgoGetIds → AlgoInit → set tile/stages/split-K →
+   AlgoCheck), capped per shape, at least on the G4 shapes. This decides whether the K = 4096 wins are real.
+2. Full pruned Triton config sweep (M3/M4) on a coarse subset of all suites, then the portfolio study (M5) for G5.
+3. Add a GEMV-style config (M = 1) and fix unaligned strides; both are among our main losses to B3.
+
 ## Update 2026-10-14: G1 closed under standard conditions; baselines re-run locked
 
 > The sections below this one are the original 2026-10-09 results, measured **unlocked on driver 595.91.07**. For any
