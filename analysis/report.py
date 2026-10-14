@@ -326,9 +326,14 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
             o["g2_bar"] = bar
             o["g2_median_ours_over_bar"] = r.median()
             if has_deep:
-                n_full = int(piv["deep_screened_all"].fillna(False).astype(bool).sum())
-                md.append(f"\nDeep search (B3+): exhaustively screened on {n_full}/{len(piv)} shapes; elsewhere budget-limited "
-                          f"(median {piv['deep_n_screened'].median():.0f} of {piv['deep_n_valid'].median():.0f} valid configs screened).\n")
+                full = piv["deep_screened_all"].fillna(False).astype(bool)
+                lim = piv[~full]
+                line = f"\nDeep search (B3+): exhaustively screened on {int(full.sum())}/{len(piv)} shapes."
+                if len(lim):
+                    frac = (lim["deep_n_screened"] / lim["deep_n_valid"]).clip(upper=1)
+                    line += (f" Budget-limited on {len(lim)} (screened a median {frac.median():.0%}, min {frac.min():.0%} "
+                             f"of valid configs; seeds always included).")
+                md.append(line + "\n")
             md.append(f"\n**G2** (oracle >= ~90% of {bar} on the median shape): median ours/{bar} = {r.median():.3f} "
                       f"-> {'PASS' if r.median() >= 0.9 else 'FAIL'}. cuBLASLt returned a median of "
                       f"{piv['lt_candidates'].median():.0f} candidates per shape (min {piv['lt_candidates'].min():.0f}, "

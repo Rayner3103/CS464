@@ -4,6 +4,73 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-15 (later): deeper B3 (B3+) closes the K = 4096 gap; G4 does not hold with 5 configs
+
+Run: `bench-20261015-023430-lock1755-b3plus` (standard conditions, commit `08e2a2c`, 5624 rows, all valid), in
+`results_lock1755_b3plus.jsonl`. It re-measures B1, B5, ours, B2/B3 and B3+ in the same session. Full tables:
+[`week1_results_lock1755_b3plus.md`](week1_results_lock1755_b3plus.md).
+**B3+** = the best of B3 and the 8 fastest configs from an enumerate-and-screen search over cuBLASLt's algorithm space
+(algo × tile × stages × split-K × reduction × swizzle × custom; `baselines/cublaslt_search.py`). Each search ran in its own process with a 20 s budget per shape.
+Every shape was screened exhaustively except 33 large ones (median 27% of valid configs screened, minimum 1% on 16384³; the heuristic's seeds were always included).
+
+### Headline (cold L2, 143 shapes)
+
+| | median | p10 | p90 | min | max |
+|---|---|---|---|---|---|
+| ours (5-config oracle) vs **B3+** | **0.959** | 0.83 | 1.01 | 0.66 | 1.15 |
+| ours vs B3 (same session) | 0.991 | 0.88 | 1.08 | 0.66 | 1.36 |
+| **B3+ vs B3** (what the deeper search buys) | 1.028 | 1.00 | 1.15 | 1.00 | **1.67** |
+| B3+ vs B1 | 1.055 | 1.00 | 1.44 | 1.00 | 1.67 |
+
+| regime (cold) | ours/B3+ median | B3+/B3 median | ours > B3+ by >5% | within 2% | ours < B3+ by >5% |
+|---|---|---|---|---|---|
+| S1 square (22) | 0.921 | 1.011 | 3 (64³, 128³, 256³; all < 7 µs) | 1 | 14 |
+| S2 decode, M ≤ 16 (55) | 0.989 | 1.028 | **0** | 33 | 13 |
+| S2 small batch, 32–128 (33) | 0.901 | 1.060 | **0** | 5 | 25 |
+| S2 prefill, M ≥ 512 (33) | 0.957 | 1.026 | **0** | 0 | 10 |
+
+Hot L2 gives the same picture: overall 0.947, with a single win over B3+ (128³, under 5 µs).
+
+- **The K = 4096 small-M wins were cuBLAS heuristic misses.** On 2–16 × {11008, 12288} × 4096, ours/B3 was 1.07–1.17. Against
+  B3+ it is **1.000–1.007**, i.e. a tie. The deep search finds split-K / tile configs that the heuristic never offers (e.g.
+  8×11008×4096: B3 159 µs → B3+ 136 µs, ours 136 µs). The 128×1024×4096 split-K win (1.34× over B3) turns into a 0.80× loss: B3+ is
+  1.67× faster than B3 there.
+- **No regime survives G4 with the 5 hand-picked configs.** The only shapes where we beat B3+ by more than 5% are µs-scale squares, which G1 does not cover
+  (per-launch timing has ~1 µs granularity) and which do not count.
+- **G2 still passes, with less margin.** Median 95.9% of B3+. The weakest regime is small batch (median 0.901, right at the bar).
+  Prefill sits at a uniform ~4% gap (0.93–0.97), and B3+ was budget-limited on most of those shapes, so the true gap may be slightly larger.
+- **Largest remaining losses:** non-multiple-of-16 squares (1000³, 1023³, 1025³ at 0.66–0.71; 3000³ at 0.67), M = 128 small batch
+  (0.80–0.87), and M = 1 GEMV (0.76 on 1×1024×4096).
+- **The vendor oracle is a moving target.** Timing cuBLAS's own heuristic list gives +0.1% at the median (B3/B1). A 20 s enumerate-and-screen
+  search adds a further 2.8% at the median and up to 1.67×. Any claim of "beats cuBLAS" has to be made against B3+.
+
+### What G4 failing means here
+
+G4 is defined on **our family's oracle**, and so far that oracle covers 5 configs. This result shows that 5 configs do not differentiate
+from a well-searched cuBLAS. It does not yet show that the full Triton space cannot. That is settled by the full sweep (M3/M4), compared against B3+ under
+the same budget treatment.
+
+If G4 still fails after the sweep, then per plan §8, **the project remains viable as a research/learning project on selection (G3, G5) or as a
+non-NVIDIA backend project, not as a cuBLAS competitor on the RTX 3080.** In that case the selector's target becomes "pick the best of
+{our configs ∪ cuBLASLt configs}", and B3+ is the oracle to approach.
+
+### Gate status (supersedes earlier tables)
+
+| Gate | Status |
+|---|---|
+| G1 measurement validity | **Pass** for kernels ≥ 50 µs under standard conditions |
+| G2 family ≥ 90% of B3+ | **Pass**: median 95.9% with 5 hand-picked configs (small batch 90.1%, at the bar) |
+| G3 selection value | Positive: oracle/B6 median 1.04, p90 2.19; decode median 1.60 |
+| G4 differentiation | **Fails with 5 configs** against B3+ (0 regimes; earlier K = 4096 wins are ties). Final verdict after the full sweep |
+| G5 tractability | Not started |
+
+### Next steps
+1. Full pruned Triton config sweep (M3/M4) on a coarse subset of all suites, judged against B3+. This is the deciding input for G4 and
+   the input to the portfolio study (M5, G5).
+2. Targeted configs for the loss clusters: a GEMV-style config for M = 1, split-K variants for M = 128 × small N, and the
+   unaligned-stride / masking path for non-multiple-of-16 squares.
+3. If the sweep is run on large shapes, raise the B3+ budget there (e.g. 60 s) or note the coverage, since B3+ was budget-limited on 33 shapes.
+
 ## Update 2026-10-15: B2/B3 (cuBLASLt) added; G2 passes, G4 narrows sharply
 
 Run: `bench-20261015-015054-lock1755-b3` (standard conditions, commit `8c896ab`, 3336 rows, all valid), in
