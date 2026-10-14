@@ -17,10 +17,13 @@ import torch
 
 from tune.correctness import placed_inputs, reference, validate
 from tune.env import provenance, write_env
+from tune.profile import cuda_kernel_names
 from tune.records import RecordWriter, alignment_flags, completed_keys, measurement_key
 from tune.timing import TimingConfig, benchmark, pool
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
+# Vendor backends whose choice of device kernel is opaque: record the kernel names they actually launch.
+KERNEL_NAME_FAMILIES = {"torch_matmul", "cublaslt"}
 LAYOUT = "NN"
 
 
@@ -32,8 +35,13 @@ class Candidate:
     backend: object  # has make_runner(a, b, out=None) -> Callable[[], Tensor]
 
 
-def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False) -> list[Candidate]:
-    """Backend spec strings: torch | triton_tutorial | triton:handpicked | triton:<config_key>."""
+def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False,
+                   dtype: torch.dtype = torch.float16) -> list[Candidate]:
+    """Backend spec strings: torch | triton_tutorial | triton:handpicked | triton:<config_key> | cublaslt[:N].
+
+    cublaslt[:N] expands to cuBLASLt's top-N heuristic candidates for this shape (default 16; it often returns fewer).
+    Rank 0 is B2; the per-shape best over all of them is B3.
+    """
     from baselines.torch_mm import TorchMatmul
     from baselines.triton_tutorial import TritonTutorialMatmul
     from kernels.config_space import HANDPICKED, shape_violations
@@ -41,6 +49,11 @@ def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False
 
     if spec == "torch":
         return [Candidate(TorchMatmul.family, "default", {}, TorchMatmul())]
+    if spec == "cublaslt" or spec.startswith("cublaslt:"):
+        from baselines.cublaslt import candidates as lt_candidates
+        n = int(spec.split(":", 1)[1]) if ":" in spec else 16
+        cands = lt_candidates(M, N, K, dtype, n)
+        return [Candidate(c.family, c.key, {**c.cfg, "n_requested": n, "n_returned": len(cands)}, c) for c in cands]
     if spec == "triton_tutorial":
         b = TritonTutorialMatmul()
         return [Candidate(b.family, "default", b.cfg, b)]
@@ -102,7 +115,7 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
                 log(f"[runner] budget of {budget_s:.0f}s exhausted after {i}/{len(shapes)} shapes")
                 break
             M, N, K = s["M"], s["N"], s["K"]
-            cands = [c for spec in backend_specs for c in candidates_for(spec, M, N, K, prune_shapes)]
+            cands = [c for spec in backend_specs for c in candidates_for(spec, M, N, K, prune_shapes, tdtype)]
             todo = []
             for c in cands:
                 for cm in cache_modes:
@@ -125,17 +138,22 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
                 continue
 
             # Validate every candidate once, then time the valid ones on n_allocs input placements.
-            validity: dict[str, tuple] = {}
+            validity: dict[tuple, tuple] = {}  # keyed by (family, config_key): "default" is shared across families
             timed: dict[int, list] = {}
             rows: dict[int, dict] = {}
             for j, (c, cm, row) in enumerate(todo):
-                if c.config_key not in validity:
+                vkey = (c.family, c.config_key)
+                if vkey not in validity:
                     inflight.write_text(json.dumps({"key": list(measurement_key(row)), "row": row}, default=str))
                     chk = validate(c.backend, M, N, K, tdtype, ref=ref, inputs=(a, b))
-                    validity[c.config_key] = (chk.valid, chk.failure_reason, chk.max_abs_err)
+                    kernels = None
+                    if chk.valid and c.family in KERNEL_NAME_FAMILIES:
+                        kernels = cuda_kernel_names(c.backend.make_runner(a, b))
+                    validity[vkey] = (chk.valid, chk.failure_reason, chk.max_abs_err, kernels)
                     inflight.unlink()
-                valid, reason, err = validity[c.config_key]
-                rows[j] = {**row, "valid": valid, "failure_reason": reason, "max_abs_err": err, "n_allocs": n_allocs}
+                valid, reason, err, kernels = validity[vkey]
+                rows[j] = {**row, "valid": valid, "failure_reason": reason, "max_abs_err": err, "n_allocs": n_allocs,
+                           "cuda_kernels": kernels}
                 if valid:
                     timed[j] = []
             del ref

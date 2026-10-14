@@ -249,7 +249,20 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
         d = df[df["cache_mode"] == cm]
         if d.empty:
             continue
+        # cuBLASLt candidates have per-shape config keys; reduce them to B2 (heuristic rank 0) and B3 (best timed).
+        lt = d[d["kernel_family"] == "cublaslt"].copy()
+        d = d[d["kernel_family"] != "cublaslt"]
         piv = d.pivot_table(index=["M", "N", "K", "regime"], columns="kernel", values="time_median_us")
+        idx = ["M", "N", "K", "regime"]
+        has_lt = not lt.empty
+        if has_lt:
+            lt["rank"] = lt["config"].map(lambda c: c.get("heuristic_rank"))
+            g = lt.groupby(idx)
+            best = lt.loc[g["time_median_us"].idxmin()].set_index(idx)
+            piv["B3 cublasLt best-of-N"] = g["time_median_us"].min()
+            piv["B3_cfg"] = best["config_key"]
+            piv["B2 cublasLt top-1"] = lt[lt["rank"] == 0].set_index(idx)["time_median_us"]
+            piv["lt_candidates"] = g.size()
         ours = [c for c in piv.columns if c.startswith("ours:")]
         piv["oracle(ours)"] = piv[ours].min(axis=1)
         piv["oracle_cfg"] = piv[ours].idxmin(axis=1).str.replace("ours:", "")
@@ -262,6 +275,13 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
         piv["B6/B1"] = piv["B1 torch.matmul"] / piv["B6(ours,fixed)"]
         piv["oracle/B6"] = piv["B6(ours,fixed)"] / piv["oracle(ours)"]
         piv["B5/B1"] = piv["B1 torch.matmul"] / piv["B5 triton tutorial"]
+        metrics = ["ours/B5", "ours/B1", "B6/B1", "oracle/B6", "B5/B1"]
+        if has_lt:
+            piv["ours/B3"] = piv["B3 cublasLt best-of-N"] / piv["oracle(ours)"]
+            piv["ours/B2"] = piv["B2 cublasLt top-1"] / piv["oracle(ours)"]
+            piv["B3/B1"] = piv["B1 torch.matmul"] / piv["B3 cublasLt best-of-N"]
+            piv["B2/B1"] = piv["B1 torch.matmul"] / piv["B2 cublasLt top-1"]
+            metrics = ["ours/B3", "ours/B2", "ours/B1", "B3/B1", "B2/B1", "oracle/B6", "ours/B5"]
         flops = 2 * piv.index.get_level_values("M") * piv.index.get_level_values("N") * piv.index.get_level_values("K")
         piv["B1_tflops"] = flops / piv["B1 torch.matmul"] / 1e6
         piv["oracle_tflops"] = flops / piv["oracle(ours)"] / 1e6
@@ -277,12 +297,37 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
         md.append("Speedup columns are time_baseline / time_ours (>1 means ours is faster).\n")
         tab = []
         for reg, grp in piv.groupby(level="regime"):
-            for col in ["ours/B5", "ours/B1", "B6/B1", "oracle/B6", "B5/B1"]:
+            for col in metrics:
                 tab.append({"regime": reg, "metric": col, **_dist(grp[col])})
-        for col in ["ours/B5", "ours/B1", "B6/B1", "oracle/B6", "B5/B1"]:
+        for col in metrics:
             tab.append({"regime": "ALL", "metric": col, **_dist(piv[col])})
             o[col] = _dist(piv[col])
         md.append(_fmt_table(pd.DataFrame(tab), "{:.3f}"))
+        if has_lt:
+            r = piv["ours/B3"].dropna()
+            o["g2_median_ours_over_b3"] = r.median()
+            md.append(f"\n**G2** (oracle >= ~90% of B3 on the median shape): median ours/B3 = {r.median():.3f} "
+                      f"-> {'PASS' if r.median() >= 0.9 else 'FAIL'}. cuBLASLt returned a median of "
+                      f"{piv['lt_candidates'].median():.0f} candidates per shape (min {piv['lt_candidates'].min():.0f}, "
+                      f"max {piv['lt_candidates'].max():.0f}).\n")
+            g4 = []
+            for reg, grp in piv.groupby(level="regime"):
+                x = grp["ours/B3"].dropna()
+                g4.append({"regime": reg, "n": len(x), "ours > B3 by >5%": int((x > 1.05).sum()),
+                           "share": (x > 1.05).mean(), "ours < B3 by >5%": int((x < 0.95).sum()),
+                           "within 2%": int(((x - 1).abs() <= 0.02).sum())})
+            o["g4"] = g4
+            md.append("**G4** (ours beats B3 by >5% in some identifiable regime):\n")
+            md.append(_fmt_table(pd.DataFrame(g4), "{:.2f}") + "\n")
+            # Does torch.matmul run the same kernel as the cuBLASLt heuristic's top-1?
+            k1 = d[d["kernel_family"] == "torch_matmul"].set_index(idx)["cuda_kernels"] if "cuda_kernels" in d else None
+            k2 = lt[lt["rank"] == 0].set_index(idx)["cuda_kernels"] if "cuda_kernels" in lt else None
+            if k1 is not None and k2 is not None:
+                both = pd.concat([k1.rename("b1"), k2.rename("b2")], axis=1).dropna()
+                same = (both["b1"].map(tuple) == both["b2"].map(tuple))
+                o["b1_same_kernel_as_b2"] = float(same.mean())
+                md.append(f"torch.matmul (B1) launches the same kernel(s) as the cuBLASLt top-1 (B2) on "
+                          f"{int(same.sum())}/{len(same)} shapes.\n")
         wins = piv["oracle_cfg"].value_counts()
         md.append("\nOracle (hand-picked) winner counts: " + ", ".join(f"`{k}`: {v}" for k, v in wins.items()) + "\n")
 
@@ -290,8 +335,12 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
         s1 = piv.xs("S1 square", level="regime", drop_level=False).reset_index() if "S1 square" in piv.index.get_level_values("regime") else None
         if s1 is not None:
             md.append("\n### S1 square sweep (median us)\n")
-            md.append(_fmt_table(s1[["M", "B1 torch.matmul", "B5 triton tutorial", "oracle(ours)", "oracle_cfg",
-                                     "B1_tflops", "oracle_tflops", "ours/B1", "ours/B5"]], "{:.2f}"))
+            cols = ["M", "B1 torch.matmul", "B5 triton tutorial", "oracle(ours)", "oracle_cfg", "B1_tflops",
+                    "oracle_tflops", "ours/B1", "ours/B5"]
+            if has_lt:
+                cols[3:3] = ["B2 cublasLt top-1", "B3 cublasLt best-of-N"]
+                cols.append("ours/B3")
+            md.append(_fmt_table(s1[cols], "{:.2f}"))
 
         if roof is not None and cm == "cold":
             _roofline_plot(piv, roof, figs / f"roofline{tag}.png")

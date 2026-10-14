@@ -71,3 +71,30 @@ def test_shape_rules():
     sk = MatmulConfig(64, 64, 64, SPLIT_K=16)
     assert "split_k_starved" in shape_violations(sk, 64, 64, 512)
     assert "split_k_workspace_too_large" in shape_violations(sk, 16384, 16384, 16384)
+
+
+@requires_cuda
+def test_cublaslt_candidates_correct():
+    from baselines.cublaslt import candidates
+    for M, N, K in [(1, 1, 1), (129, 257, 1031), (64, 4096, 4096)]:
+        cs = candidates(M, N, K, n=8)
+        assert cs, (M, N, K)
+        assert cs[0].cfg["heuristic_rank"] == 0
+        for c in cs:
+            assert validate(c, M, N, K).valid, c.key
+
+
+@requires_cuda
+def test_runner_validates_each_family_separately(tmp_path, monkeypatch):
+    """torch and triton_tutorial both use config_key 'default'; each must get its own validation and kernel names."""
+    import json
+    from tune.runner import run
+    monkeypatch.setenv("TUNE_CLOCK_LOCK", "none")
+    path = run([{"M": 64, "N": 64, "K": 64, "suite": "t"}], ["torch", "triton_tutorial", "cublaslt:4"], tmp_path,
+               cache_modes=("hot",), timing_overrides={"max_time_s": 0.05}, log=lambda *_: None)
+    rows = [json.loads(l) for l in open(path)]
+    fams = {r["kernel_family"] for r in rows}
+    assert {"torch_matmul", "triton_tutorial_default", "cublaslt"} <= fams
+    assert all(r["valid"] for r in rows)
+    assert next(r for r in rows if r["kernel_family"] == "torch_matmul")["cuda_kernels"]
+    assert next(r for r in rows if r["kernel_family"] == "triton_tutorial_default")["cuda_kernels"] is None
