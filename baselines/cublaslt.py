@@ -116,11 +116,13 @@ class CublasLtMatmul:
 
     family = "cublaslt"
 
-    def __init__(self, problem: _Problem, result: _HeuristicResult, rank: int):
-        self.problem, self.result, self.rank = problem, result, rank
-        self.cfg = {"heuristic_rank": rank, "workspace_bytes": int(result.workspaceSize),
-                    "waves": round(float(result.wavesCount), 3), **algo_config(problem.lib, result.algo)}
-        self.key = (f"h{rank}_a{self.cfg.get('algo_id')}_t{self.cfg.get('tile_id')}_s{self.cfg.get('stages_id')}"
+    def __init__(self, problem: _Problem, result: _HeuristicResult, rank: int, family: str = "cublaslt",
+                 prefix: str = "h", extra: dict | None = None):
+        self.problem, self.result, self.rank, self.family = problem, result, rank, family
+        rank_key = "heuristic_rank" if prefix == "h" else "search_rank"
+        self.cfg = {rank_key: rank, "workspace_bytes": int(result.workspaceSize),
+                    "waves": round(float(result.wavesCount), 3), **algo_config(problem.lib, result.algo), **(extra or {})}
+        self.key = (f"{prefix}{rank}_a{self.cfg.get('algo_id')}_t{self.cfg.get('tile_id')}_s{self.cfg.get('stages_id')}"
                     f"_sk{self.cfg.get('splitk')}_r{self.cfg.get('reduction')}_sw{self.cfg.get('swizzle')}"
                     f"_c{self.cfg.get('custom')}")
 
@@ -148,6 +150,28 @@ class CublasLtMatmul:
             return c
         run._keepalive = (ws, alpha, beta, algo, args_ptrs)  # keep ctypes buffers alive with the closure
         return run
+
+
+def deep_candidates(M: int, N: int, K: int, dtype=torch.float16, budget_s: float = 20.0, top_k: int = 8,
+                    cache_dir=None) -> list[CublasLtMatmul]:
+    """Deeper B3: the fastest `top_k` configs from an enumerate-and-screen search (baselines/cublaslt_search.py)."""
+    from pathlib import Path
+    from baselines.cublaslt_search import build_algo, search_isolated
+    if cache_dir is None:  # the runner points this at <out_dir>/lt_search for each run
+        import os
+        from tune.env import default_data_dir
+        cache_dir = os.environ.get("TUNE_LT_SEARCH_DIR") or default_data_dir() / "lt_search"
+    dname = {torch.float16: "fp16", torch.bfloat16: "bf16"}[dtype]
+    d = search_isolated(M, N, K, dname, Path(cache_dir), budget_s=budget_s, top_k=top_k)
+    stats = {k: d.get(k) for k in ("n_valid_configs", "n_screened", "screened_all", "best_seed_us", "error")}
+    p = _Problem(M, N, K, dtype)
+    out = []
+    for rank, t in enumerate(d.get("top", [])):
+        res = build_algo(p, _CUDA_DTYPE[dtype], t["cfg"])
+        if res is not None:
+            out.append(CublasLtMatmul(p, res, rank, family="cublaslt_deep", prefix="d",
+                                      extra={"screen_us": round(t["us"], 3), **stats}))
+    return out
 
 
 def candidates(M: int, N: int, K: int, dtype=torch.float16, n: int = 16) -> list[CublasLtMatmul]:

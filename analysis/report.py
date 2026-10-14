@@ -250,8 +250,9 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
         if d.empty:
             continue
         # cuBLASLt candidates have per-shape config keys; reduce them to B2 (heuristic rank 0) and B3 (best timed).
-        lt = d[d["kernel_family"] == "cublaslt"].copy()
-        d = d[d["kernel_family"] != "cublaslt"]
+        lt_all = d[d["kernel_family"].isin(["cublaslt", "cublaslt_deep"])].copy()
+        lt = lt_all[lt_all["kernel_family"] == "cublaslt"].copy()
+        d = d[~d["kernel_family"].isin(["cublaslt", "cublaslt_deep"])]
         piv = d.pivot_table(index=["M", "N", "K", "regime"], columns="kernel", values="time_median_us")
         idx = ["M", "N", "K", "regime"]
         has_lt = not lt.empty
@@ -263,6 +264,17 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
             piv["B3_cfg"] = best["config_key"]
             piv["B2 cublasLt top-1"] = lt[lt["rank"] == 0].set_index(idx)["time_median_us"]
             piv["lt_candidates"] = g.size()
+        has_deep = (lt_all["kernel_family"] == "cublaslt_deep").any()
+        if has_deep:
+            ga = lt_all.groupby(idx)
+            best_all = lt_all.loc[ga["time_median_us"].idxmin()].set_index(idx)
+            piv["B3+ cublasLt deep"] = ga["time_median_us"].min()
+            piv["B3+_cfg"] = best_all["config_key"]
+            deep = lt_all[lt_all["kernel_family"] == "cublaslt_deep"]
+            first = deep.groupby(idx)["config"].first()
+            piv["deep_screened_all"] = first.map(lambda c: c.get("screened_all"))
+            piv["deep_n_screened"] = first.map(lambda c: c.get("n_screened"))
+            piv["deep_n_valid"] = first.map(lambda c: c.get("n_valid_configs"))
         ours = [c for c in piv.columns if c.startswith("ours:")]
         piv["oracle(ours)"] = piv[ours].min(axis=1)
         piv["oracle_cfg"] = piv[ours].idxmin(axis=1).str.replace("ours:", "")
@@ -282,6 +294,11 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
             piv["B3/B1"] = piv["B1 torch.matmul"] / piv["B3 cublasLt best-of-N"]
             piv["B2/B1"] = piv["B1 torch.matmul"] / piv["B2 cublasLt top-1"]
             metrics = ["ours/B3", "ours/B2", "ours/B1", "B3/B1", "B2/B1", "oracle/B6", "ours/B5"]
+        if has_lt and has_deep:
+            piv["ours/B3+"] = piv["B3+ cublasLt deep"] / piv["oracle(ours)"]
+            piv["B3+/B3"] = piv["B3 cublasLt best-of-N"] / piv["B3+ cublasLt deep"]
+            piv["B3+/B1"] = piv["B1 torch.matmul"] / piv["B3+ cublasLt deep"]
+            metrics = ["ours/B3+", "ours/B3", "ours/B1", "B3+/B3", "B3+/B1", "B3/B1", "B2/B1", "oracle/B6", "ours/B5"]
         flops = 2 * piv.index.get_level_values("M") * piv.index.get_level_values("N") * piv.index.get_level_values("K")
         piv["B1_tflops"] = flops / piv["B1 torch.matmul"] / 1e6
         piv["oracle_tflops"] = flops / piv["oracle(ours)"] / 1e6
@@ -304,20 +321,26 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
             o[col] = _dist(piv[col])
         md.append(_fmt_table(pd.DataFrame(tab), "{:.3f}"))
         if has_lt:
-            r = piv["ours/B3"].dropna()
-            o["g2_median_ours_over_b3"] = r.median()
-            md.append(f"\n**G2** (oracle >= ~90% of B3 on the median shape): median ours/B3 = {r.median():.3f} "
+            bar = "B3+" if has_deep else "B3"
+            r = piv[f"ours/{bar}"].dropna()
+            o["g2_bar"] = bar
+            o["g2_median_ours_over_bar"] = r.median()
+            if has_deep:
+                n_full = int(piv["deep_screened_all"].fillna(False).astype(bool).sum())
+                md.append(f"\nDeep search (B3+): exhaustively screened on {n_full}/{len(piv)} shapes; elsewhere budget-limited "
+                          f"(median {piv['deep_n_screened'].median():.0f} of {piv['deep_n_valid'].median():.0f} valid configs screened).\n")
+            md.append(f"\n**G2** (oracle >= ~90% of {bar} on the median shape): median ours/{bar} = {r.median():.3f} "
                       f"-> {'PASS' if r.median() >= 0.9 else 'FAIL'}. cuBLASLt returned a median of "
                       f"{piv['lt_candidates'].median():.0f} candidates per shape (min {piv['lt_candidates'].min():.0f}, "
                       f"max {piv['lt_candidates'].max():.0f}).\n")
             g4 = []
             for reg, grp in piv.groupby(level="regime"):
-                x = grp["ours/B3"].dropna()
-                g4.append({"regime": reg, "n": len(x), "ours > B3 by >5%": int((x > 1.05).sum()),
-                           "share": (x > 1.05).mean(), "ours < B3 by >5%": int((x < 0.95).sum()),
+                x = grp[f"ours/{bar}"].dropna()
+                g4.append({"regime": reg, "n": len(x), f"ours > {bar} by >5%": int((x > 1.05).sum()),
+                           "share": (x > 1.05).mean(), f"ours < {bar} by >5%": int((x < 0.95).sum()),
                            "within 2%": int(((x - 1).abs() <= 0.02).sum())})
             o["g4"] = g4
-            md.append("**G4** (ours beats B3 by >5% in some identifiable regime):\n")
+            md.append(f"**G4** (ours beats {bar} by >5% in some identifiable regime):\n")
             md.append(_fmt_table(pd.DataFrame(g4), "{:.2f}") + "\n")
             # Does torch.matmul run the same kernel as the cuBLASLt heuristic's top-1?
             k1 = d[d["kernel_family"] == "torch_matmul"].set_index(idx)["cuda_kernels"] if "cuda_kernels" in d else None
@@ -338,8 +361,8 @@ def baseline_analysis(data: Path, figs: Path, results_name: str = "results.jsonl
             cols = ["M", "B1 torch.matmul", "B5 triton tutorial", "oracle(ours)", "oracle_cfg", "B1_tflops",
                     "oracle_tflops", "ours/B1", "ours/B5"]
             if has_lt:
-                cols[3:3] = ["B2 cublasLt top-1", "B3 cublasLt best-of-N"]
-                cols.append("ours/B3")
+                cols[3:3] = ["B2 cublasLt top-1", "B3 cublasLt best-of-N"] + (["B3+ cublasLt deep"] if has_deep else [])
+                cols.append("ours/B3+" if has_deep else "ours/B3")
             md.append(_fmt_table(s1[cols], "{:.2f}"))
 
         if roof is not None and cm == "cold":

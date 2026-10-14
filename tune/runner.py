@@ -7,6 +7,7 @@ candidate as invalid ("crashed_previous_run") and moves on. Completed rows are s
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ from tune.timing import TimingConfig, benchmark, pool
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 # Vendor backends whose choice of device kernel is opaque: record the kernel names they actually launch.
-KERNEL_NAME_FAMILIES = {"torch_matmul", "cublaslt"}
+KERNEL_NAME_FAMILIES = {"torch_matmul", "cublaslt", "cublaslt_deep"}
 LAYOUT = "NN"
 
 
@@ -41,6 +42,8 @@ def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False
 
     cublaslt[:N] expands to cuBLASLt's top-N heuristic candidates for this shape (default 16; it often returns fewer).
     Rank 0 is B2; the per-shape best over all of them is B3.
+    cublaslt_deep[:budget_s] runs an enumerate-and-screen search over cuBLASLt's configuration space (in a subprocess,
+    cached in data/<hw>/lt_search/) and expands to the 8 fastest configs; the best over cublaslt and cublaslt_deep is B3+.
     """
     from baselines.torch_mm import TorchMatmul
     from baselines.triton_tutorial import TritonTutorialMatmul
@@ -49,6 +52,10 @@ def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False
 
     if spec == "torch":
         return [Candidate(TorchMatmul.family, "default", {}, TorchMatmul())]
+    if spec == "cublaslt_deep" or spec.startswith("cublaslt_deep:"):
+        from baselines.cublaslt import deep_candidates
+        budget = float(spec.split(":", 1)[1]) if ":" in spec else 20.0
+        return [Candidate(c.family, c.key, c.cfg, c) for c in deep_candidates(M, N, K, dtype, budget_s=budget)]
     if spec == "cublaslt" or spec.startswith("cublaslt:"):
         from baselines.cublaslt import candidates as lt_candidates
         n = int(spec.split(":", 1)[1]) if ":" in spec else 16
@@ -89,6 +96,7 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
     out_dir.mkdir(parents=True, exist_ok=True)
     session_id = session_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     env = write_env(out_dir, session_id=session_id, kind="benchmark")
+    os.environ["TUNE_LT_SEARCH_DIR"] = str(out_dir / "lt_search")  # deep cuBLASLt search cache lives with the run
     results = out_dir / out_name
     inflight = out_dir / "inflight.json"
     done = completed_keys(results)

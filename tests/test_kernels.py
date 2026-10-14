@@ -98,3 +98,16 @@ def test_runner_validates_each_family_separately(tmp_path, monkeypatch):
     assert all(r["valid"] for r in rows)
     assert next(r for r in rows if r["kernel_family"] == "torch_matmul")["cuda_kernels"]
     assert next(r for r in rows if r["kernel_family"] == "triton_tutorial_default")["cuda_kernels"] is None
+
+
+@requires_cuda
+def test_cublaslt_deep_search_correct_and_cached(tmp_path):
+    from baselines.cublaslt import deep_candidates
+    from baselines.cublaslt_search import cache_path
+    cs = deep_candidates(64, 256, 512, budget_s=2.0, top_k=3, cache_dir=tmp_path)
+    assert cs and all(c.family == "cublaslt_deep" for c in cs)
+    assert cache_path(tmp_path, 64, 256, 512, "fp16").exists()
+    for c in cs:
+        assert validate(c, 64, 256, 512).valid, c.key
+    again = deep_candidates(64, 256, 512, budget_s=2.0, top_k=3, cache_dir=tmp_path)  # served from cache
+    assert [c.key for c in again] == [c.key for c in cs]
