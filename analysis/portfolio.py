@@ -176,3 +176,179 @@ def build(data: Path, report: Path, eps_list=(0.02, 0.03, 0.05)) -> tuple[Path, 
     out = report / "sweep_portfolio.md"
     out.write_text("\n".join(md) + "\n")
     return out, summary
+
+
+SMALL_US = 50.0  # below this the oracle is a ~1 us-tick event time (see methodology); report those shapes separately
+
+
+def _split_info(screen_dir: Path, shapes: list[dict]) -> list[dict]:
+    """Attach suite / split from the screen dir's subset.json to each loaded shape."""
+    p = Path(screen_dir) / "subset.json"
+    meta = {(s["M"], s["N"], s["K"]): s for s in json.loads(p.read_text())["shapes"]} if p.exists() else {}
+    return [dict(s, **{k: meta.get((s["M"], s["N"], s["K"]), {}).get(k) for k in ("suite", "split")}) for s in shapes]
+
+
+def align(keys_from: list[str], keys_to: list[str], T_to: np.ndarray) -> np.ndarray:
+    """Columns of T_to in the order of keys_from; inf for a config never timed in T_to's screen."""
+    col = {k: i for i, k in enumerate(keys_to)}
+    out = np.full((T_to.shape[0], len(keys_from)), np.inf)
+    for j, k in enumerate(keys_from):
+        if k in col:
+            out[:, j] = T_to[:, col[k]]
+    return out
+
+
+def _stats(r: np.ndarray) -> dict:
+    """Regret summary (r = t / oracle) over shapes."""
+    if not len(r):
+        return {"n": 0}
+    return {"n": int(len(r)), "mean": float(np.minimum(r, REGRET_CAP).mean() - 1), "p50": float(np.percentile(r, 50) - 1),
+            "p95": float(np.percentile(r, 95) - 1), "max": float(r.max() - 1), "frac_le_5pct": float((r <= 1.05).mean())}
+
+
+def stage2_regret(rows: list[dict], portfolio: list[str], sizes) -> tuple[list[dict], dict[int, np.ndarray]]:
+    """Stage-2 (re-measured) regret of portfolio prefixes. Per shape, oracle = fastest valid row (the screen's top-8
+    tiles plus the portfolio members); prefix n = fastest valid row among the first n portfolio keys."""
+    by_shape: dict[tuple, dict[str, float]] = {}
+    for r in rows:
+        if r.get("valid") and r.get("kernel_family", "").startswith("triton") and r.get("time_median_us"):
+            d = by_shape.setdefault((r["M"], r["N"], r["K"]), {})
+            d[r["config_key"]] = min(d.get(r["config_key"], np.inf), r["time_median_us"])
+    shapes = sorted(by_shape)
+    oracle = np.array([min(by_shape[s].values()) for s in shapes])
+    regrets = {}
+    for n in sizes:
+        keys = portfolio[:n]
+        regrets[n] = np.array([min((by_shape[s].get(k, np.inf) for k in keys)) for s in shapes]) / oracle
+    meta = [{"M": s[0], "N": s[1], "K": s[2], "oracle_us": float(o)} for s, o in zip(shapes, oracle)]
+    return meta, regrets
+
+
+def build_heldout(data: Path, report: Path, sizes=(1, 5, 10, 16, 20, 25, 29, 30, 40, 50, 60, 100),
+                  eps_list=(0.02, 0.03, 0.05), results: str = "results_lock1755_heldout.jsonl") -> tuple[Path, dict]:
+    """G5 out of sample: fit B6, the greedy portfolio and set covers on the tune-split screen, then score them on the
+    held-out screen, where the per-shape oracle is the best of the full space on that held-out shape."""
+    shapes, keys, T = load_screen(data / "sweep_screen")
+    R = regret_matrix(T)
+    order = greedy_portfolio(R)
+    cv_in = curve(R, order)
+    g5_in = next((c["size"] for c in cv_in if c["p95"] < 0.05), None)
+    b6 = int(np.log(np.minimum(R, REGRET_CAP)).mean(axis=0).argmin())
+    covers = {eps: set_cover(R, eps) for eps in eps_list}
+
+    hdir = data / "sweep_screen_heldout"
+    hshapes, hkeys, hT = load_screen(hdir)
+    hshapes = _split_info(hdir, hshapes)
+    oracle = hT.min(axis=1)
+    Rh = align(keys, hkeys, hT) / oracle[:, None]  # tune-fitted configs scored against the held-out oracle
+    small = oracle < SMALL_US
+    groups = {"all": np.ones(len(hshapes), bool), f">= {SMALL_US:.0f} us": ~small, f"< {SMALL_US:.0f} us": small}
+    for sp in sorted({s["split"] for s in hshapes if s["split"]}):
+        groups[sp] = np.array([s["split"] == sp for s in hshapes])
+    # In-sample reference split the same way.
+    small_in = T.min(axis=1) < SMALL_US
+
+    def best_of(Rx, members):
+        return Rx[:, members].min(axis=1)
+
+    rows = []
+    for n in sizes:
+        if n > len(order):
+            continue
+        r_h, r_i = best_of(Rh, order[:n]), best_of(R, order[:n])
+        rows.append({"size": n, "in_sample": _stats(r_i), "in_sample_ge50": _stats(r_i[~small_in]),
+                     **{f"heldout[{g}]": _stats(r_h[m]) for g, m in groups.items()}})
+    cv_h = curve(Rh, order)
+    g5_h = next((c["size"] for c in cv_h if c["p95"] < 0.05), None)
+    # Re-fit on the held-out shapes themselves: how large a portfolio would they need if we could tune on them?
+    cv_refit = curve(regret_matrix(hT), greedy_portfolio(regret_matrix(hT)))
+    g5_refit = next((c["size"] for c in cv_refit if c["p95"] < 0.05), None)
+    g5_size = g5_in or 29
+    r_g5 = best_of(Rh, order[:g5_size])
+    worst = np.argsort(-r_g5)[:12]
+    hk = {k: i for i, k in enumerate(hkeys)}
+    worst_rows = []
+    for i in worst:
+        j = int(np.argmin(Rh[i, order[:g5_size]]))
+        worst_rows.append({**{k: hshapes[i][k] for k in ("M", "N", "K", "suite", "split")},
+                           "oracle_us": float(oracle[i]), "oracle_cfg": hkeys[int(hT[i].argmin())],
+                           "portfolio_us": float(oracle[i] * r_g5[i]), "portfolio_cfg": keys[order[:g5_size][j]],
+                           "regret": float(r_g5[i] - 1)})
+    cover_rows = {str(eps): {"size": len(c), **_stats(best_of(Rh, c)),
+                             "ge50": _stats(best_of(Rh, c)[~small])} for eps, c in covers.items()}
+    b6_h = Rh[:, b6]
+    summary = {"n_tune_shapes": len(shapes), "n_heldout_shapes": len(hshapes),
+               "heldout_split_counts": {g: int(m.sum()) for g, m in groups.items()},
+               "g5_size_in_sample": g5_in, "g5_size_heldout_tune_order": g5_h, "g5_size_heldout_refit": g5_refit,
+               "b6": keys[b6], "b6_heldout": _stats(b6_h), "rows": rows, "set_covers": cover_rows, "worst": worst_rows,
+               "missing_configs": int(sum(k not in hk for k in (keys[j] for j in order[:g5_size])))}
+    report.mkdir(parents=True, exist_ok=True)
+    (report / "sweep_portfolio_heldout_summary.json").write_text(json.dumps(summary, indent=1))
+
+    pct = lambda x: f"{100 * x:.1f}%"
+    md = ["# Triton config sweep: held-out G5 check (auto-generated)\n",
+          f"Portfolio, B6 and set covers are fit on the tune-split screen (`{data / 'sweep_screen'}`, {len(shapes)} shapes) "
+          f"and scored on the held-out screen (`{hdir}`, {len(hshapes)} shapes: "
+          + ", ".join(f"{g} {int(m.sum())}" for g, m in groups.items() if g != "all") + "). "
+          "Held-out oracle = best of the full pruned space on that shape. Regret = t / oracle - 1, screen times.\n",
+          "## G5: tune-fitted greedy portfolio on held-out shapes (p95 regret)\n",
+          "| size | in-sample | in-sample >= 50 us | " + " | ".join(f"held-out {g}" for g in groups) + " |",
+          "|---|---|---|" + "---|" * len(groups)]
+    for r in rows:
+        md.append(f"| {r['size']} | {pct(r['in_sample']['p95'])} | {pct(r['in_sample_ge50']['p95'])} | "
+                  + " | ".join(pct(r[f'heldout[{g}]']['p95']) if r[f'heldout[{g}]']['n'] else "-" for g in groups) + " |")
+    md.append("\nSame table, mean regret:\n")
+    md.append("| size | in-sample | " + " | ".join(f"held-out {g}" for g in groups) + " |")
+    md.append("|---|---|" + "---|" * len(groups))
+    for r in rows:
+        md.append(f"| {r['size']} | {pct(r['in_sample']['mean'])} | "
+                  + " | ".join(pct(r[f'heldout[{g}]']['mean']) if r[f'heldout[{g}]']['n'] else "-" for g in groups) + " |")
+    md.append(f"\n**Smallest tune-order prefix with held-out p95 < 5%: {g5_h if g5_h else '> ' + str(len(cv_h))}** "
+              f"(in-sample: {g5_in}; a greedy portfolio re-fit on the held-out shapes themselves would need {g5_refit}).\n")
+    md.append(f"B6 (`{keys[b6]}`) on held-out shapes: median regret {pct(np.median(b6_h) - 1)}, "
+              f"p90 {pct(np.percentile(b6_h, 90) - 1)} (G3 out of sample).\n")
+    md.append("Tune-fitted set covers on held-out shapes:\n")
+    md.append("| eps | size | held-out p95 | held-out max | shapes within 5% | >= 50 us p95 |")
+    md.append("|---|---|---|---|---|---|")
+    for eps, c in cover_rows.items():
+        md.append(f"| {pct(float(eps))} | {c['size']} | {pct(c['p95'])} | {pct(c['max'])} | {pct(c['frac_le_5pct'])} | "
+                  f"{pct(c['ge50']['p95']) if c['ge50']['n'] else '-'} |")
+    md.append(f"\n## Worst held-out shapes for the {g5_size}-config portfolio\n")
+    md.append("| shape | suite / split | oracle us | oracle config | portfolio us | portfolio config | regret |")
+    md.append("|---|---|---|---|---|---|---|")
+    for w in worst_rows:
+        md.append(f"| {w['M']}x{w['N']}x{w['K']} | {w['suite']} / {w['split']} | {w['oracle_us']:.2f} | `{w['oracle_cfg']}` | "
+                  f"{w['portfolio_us']:.2f} | `{w['portfolio_cfg']}` | {pct(w['regret'])} |")
+    res = data / results
+    if res.exists():
+        rows2 = [json.loads(l) for l in res.read_text().splitlines() if l.strip()]
+        used = hdir / "portfolio_summary_used.json"
+        pkeys = json.loads((used if used.exists() else report / "sweep_portfolio_summary.json").read_text())["portfolio"]
+        n_meas = max(len({r["config_key"] for r in rows2 if r["config_key"] in pkeys}), 1)
+        s2_sizes = [n for n in (1, 5, 10, 16, 20, 25, 29) if n <= n_meas]
+        meta, reg = stage2_regret(rows2, pkeys, s2_sizes)
+        small2 = np.array([m["oracle_us"] < SMALL_US for m in meta])
+        split_of = {(s["M"], s["N"], s["K"]): s["split"] for s in hshapes}
+        sp2 = np.array([split_of.get((m["M"], m["N"], m["K"])) for m in meta])
+        g2 = {"all": np.ones(len(meta), bool), f">= {SMALL_US:.0f} us": ~small2, f"< {SMALL_US:.0f} us": small2,
+              **{sp: sp2 == sp for sp in sorted(set(sp2) - {None})}}
+        summary["stage2"] = {"results": str(res), "n_shapes": len(meta), "n_invalid_rows": sum(not r.get("valid") for r in rows2),
+                             "rows": [{"size": n, **{g: _stats(reg[n][m]) for g, m in g2.items()}} for n in s2_sizes]}
+        md.append(f"\n## Stage-2 confirmation (re-measured, `{results}`)\n")
+        md.append(f"Each held-out shape re-timed cold (adaptive repeats, 3 input placements): the screen's 8 fastest tiles "
+                  f"for that shape plus the first {s2_sizes[-1]} portfolio members. Oracle = fastest of those. "
+                  f"{len(meta)} shapes, {summary['stage2']['n_invalid_rows']} invalid rows. "
+                  "Sub-50 us cold times carry ~1 us event-tick quantization.\n")
+        md.append("| size | " + " | ".join(f"{g} p95 / mean" for g in g2) + " |")
+        md.append("|---|" + "---|" * len(g2))
+        for n in s2_sizes:
+            md.append(f"| {n} | " + " | ".join(f"{pct(_stats(reg[n][m])['p95'])} / {pct(_stats(reg[n][m])['mean'])}"
+                                               if m.any() else "-" for m in g2.values()) + " |")
+        n = s2_sizes[-1]
+        worst2 = np.argsort(-reg[n])[:8]
+        md.append(f"\nWorst shapes at size {n} (stage 2): " + ", ".join(
+            f"{meta[i]['M']}x{meta[i]['N']}x{meta[i]['K']} {pct(reg[n][i] - 1)} ({meta[i]['oracle_us']:.1f} us)" for i in worst2) + "\n")
+        (report / "sweep_portfolio_heldout_summary.json").write_text(json.dumps(summary, indent=1))
+    out = report / "sweep_portfolio_heldout.md"
+    out.write_text("\n".join(md) + "\n")
+    return out, summary

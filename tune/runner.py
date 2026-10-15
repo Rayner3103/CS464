@@ -42,6 +42,8 @@ def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False
     cublaslt[:N] | cublaslt_deep[:budget_s].
 
     triton:sweep[:k] expands to the k fastest configs (default 8) of the stage-1 screen for this shape.
+    triton:portfolio[:n] expands to the first n (default 29) members of the tune-fitted greedy portfolio
+    (TUNE_PORTFOLIO, default reports/sweep_portfolio_summary.json). triton:<config_key> takes any config key.
 
     cublaslt[:N] expands to cuBLASLt's top-N heuristic candidates for this shape (default 16; it often returns fewer).
     Rank 0 is B2; the per-shape best over all of them is B3.
@@ -82,10 +84,17 @@ def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False
             tops = top_configs(Path(sweep_dir), M, N, K, k)
             cfgs = [t["cfg"] for t in tops]
             extra = {t["cfg"].key(): {"screen_us": t["screen_us"], "screen_rank": t["screen_rank"]} for t in tops}
+        elif which == "portfolio" or which.startswith("portfolio:"):
+            # The first n members of the greedy portfolio fit on the tune-split screen (analysis/portfolio.py).
+            from tune.sweep import parse_key
+            n = int(which.split(":", 1)[1]) if ":" in which else 29
+            summary = Path(os.environ.get("TUNE_PORTFOLIO", "reports/sweep_portfolio_summary.json"))
+            keys = json.loads(summary.read_text())["portfolio"][:n]
+            cfgs = [parse_key(k) for k in keys]
+            extra = {k: {"portfolio_rank": i} for i, k in enumerate(keys)}
         else:
-            cfgs = [c for c in HANDPICKED.values() if c.key() == which]
-            if not cfgs:
-                raise ValueError(f"unknown triton config {which!r}")
+            from tune.sweep import parse_key
+            cfgs = [c for c in HANDPICKED.values() if c.key() == which] or [parse_key(which)]
         out = []
         for c in cfgs:
             v = shape_violations(c, M, N, K)

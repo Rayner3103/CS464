@@ -113,17 +113,19 @@ def cmd_benchmark(args):
 
 
 def cmd_sweep(args):
-    from tune.sweep import coarse_subset, run_sweep
-    shapes = coarse_subset(_shapes(args.suite), args.per_suite, args.max_gflop)
-    sweep_dir = args.out / "sweep_screen"
+    from tune.sweep import HELDOUT_SPLITS, coarse_subset, run_sweep
+    splits = HELDOUT_SPLITS if args.split == "heldout" else ("tune",)
+    screen_dir = args.screen_dir or ("sweep_screen_heldout" if args.split == "heldout" else "sweep_screen")
+    shapes = coarse_subset(_shapes(args.suite), args.per_suite, args.max_gflop, splits)
+    sweep_dir = args.out / screen_dir
     sweep_dir.mkdir(parents=True, exist_ok=True)
     subset = sweep_dir / "subset.json"
-    subset.write_text(json.dumps({"suite": args.suite, "per_suite": args.per_suite, "max_gflop": args.max_gflop,
+    subset.write_text(json.dumps({"suite": args.suite, "split": args.split, "per_suite": args.per_suite, "max_gflop": args.max_gflop,
                                   "n": len(shapes), "shapes": shapes}, indent=1))
     print(f"{len(shapes)} shapes -> {subset}")
     if args.list_only:
         return
-    print(f"screen -> {run_sweep(shapes, args.out, workers=args.workers, session_id=args.session)}")
+    print(f"screen -> {run_sweep(shapes, args.out, workers=args.workers, session_id=args.session, screen_dir=screen_dir)}")
 
 
 def cmd_noise(args):
@@ -141,7 +143,12 @@ def cmd_drift(args):
 
 
 def cmd_portfolio(args):
-    from analysis.portfolio import build
+    from analysis.portfolio import build, build_heldout
+    if args.heldout:
+        out, s = build_heldout(args.data, args.report)
+        print(f"{s['n_heldout_shapes']} held-out shapes; G5 size in-sample {s['g5_size_in_sample']}, held-out "
+              f"{s['g5_size_heldout_tune_order']} (re-fit {s['g5_size_heldout_refit']}) -> {out}")
+        return
     out, s = build(args.data, args.report)
     print(f"{s['n_shapes']} shapes x {s['n_configs']} configs; B6 {s['b6']} median regret {100 * s['b6_regret_median']:.1f}%; "
           f"G5 size {s['g5_portfolio_size_p95_lt_5pct']} -> {out}")
@@ -196,6 +203,10 @@ def main(argv=None):
     p.add_argument("--workers", type=int, default=10, help="parallel compile processes")
     p.add_argument("--session", default=None)
     p.add_argument("--list-only", action="store_true", help="write the subset and stop")
+    p.add_argument("--split", choices=["tune", "heldout"], default="tune",
+                   help="heldout = heldout_region + heldout_random shapes (G5 out-of-sample check)")
+    p.add_argument("--screen-dir", default=None,
+                   help="directory under --out; default sweep_screen (tune) or sweep_screen_heldout (heldout)")
     p = add("noise", cmd_noise)
     p.add_argument("--shapes", default="suites/v1/noise.json")
     p.add_argument("--backends", default="torch,triton:bm128_bn128_bk32_w4_s4_g8_sk1")
@@ -218,6 +229,8 @@ def main(argv=None):
     p.set_defaults(fn=cmd_portfolio)
     p.add_argument("--data", type=Path, default=None)
     p.add_argument("--report", type=Path, default=Path("reports"))
+    p.add_argument("--heldout", action="store_true",
+                   help="score the tune-fitted portfolio on data/<hw>/sweep_screen_heldout (G5 out of sample)")
 
     args = ap.parse_args(argv)
     if args.clock_lock is not None:

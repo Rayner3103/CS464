@@ -4,6 +4,51 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-15 (night): held-out G5 check; the 29-config portfolio does not generalize to p95 < 5%
+
+**What ran.** The portfolio, B6 and the set covers were fit only on the 160 tune-split screen shapes. They were then scored on shapes they never saw:
+- **Held-out screen:** session `sweep-heldout-20261015-210132-lock1755` (`python -m tune sweep --split heldout`, 1.3 h). It covered all
+  **86 held-out shapes** up to 1.2 TFLOP: 55 `heldout_random` (S7) and 31 `heldout_region` (K between 9000 and 12000, or M between 300 and 450; from S2, S6 and S7).
+  It used the same full pruned space and screen protocol as the tune screen: 307,648 cells, 0 invalid, 0 crashes. The data is in `data/<hw>/sweep_screen_heldout/`,
+  kept apart from the tune screen; the subset is in `reports/snapshot/lock1755/sweep_subset_heldout.json`.
+- **Stage-2 confirmation:** session `bench-20261015-222149-lock1755-heldout` (10 min, 3,102 rows, all valid). Each held-out shape was re-timed with
+  the full cold protocol over its 8 best screen tiles plus the 29 portfolio members (`triton:sweep:8,triton:portfolio:29`). The oracle is the fastest
+  of those. 7.7% of rows hit the power cap (throttle 0x4); all of them are on the 11 largest shapes, and none is among the worst-regret shapes.
+
+Tables: [`sweep_portfolio_heldout.md`](sweep_portfolio_heldout.md) (`python -m tune portfolio --heldout`).
+
+### G5 out of sample
+
+| 29-config portfolio | p95 regret | mean regret | shapes within 5% of oracle |
+|---|---|---|---|
+| tune shapes (in-sample, screen) | 5.0% | 1.4% | 95% |
+| held-out, screen vs full-space oracle | **17.0%** | 4.2% | 76% |
+| held-out, stage 2 (re-measured) | **11.0%** | 2.2% | 84% |
+| held-out ≥ 50 µs, stage 2 | 9.7% | 2.3% | 83% |
+| held-out `heldout_region`, stage 2 | 8.9% | 2.6% | 77% |
+| held-out `heldout_random`, stage 2 | 11.9% | 1.9% | 87% |
+
+- **G5 fails out of sample.** Following the tune-fitted greedy order, held-out p95 regret stays above 5% even at 100 configs on screen data (9.3%).
+  In stage 2, 29 configs give 11.0%. The two numbers bracket the truth: the screen oracle is the minimum over about 10,000 noisy few-sample times,
+  so it is biased low and regret is overstated. The stage-2 oracle only sees 37 candidates, so regret is understated.
+- **The typical shape is fine; the tail is the problem.** Median regret is 0–1%, mean 2.2%. About 16% of held-out shapes (14 of 86) are more than 5% off.
+- **This is overfitting, not a harder shape set.** A greedy portfolio re-fit on the held-out shapes themselves needs 31 configs for p95 < 5%,
+  almost the same as the in-sample 29. Held-out shapes are not intrinsically harder. Their best configs are just not in a portfolio chosen
+  from 160 shapes: the tail of the greedy list mostly memorizes individual tune shapes.
+- **The worst shapes** (stage 2) are skinny shapes (one of M or N small) with K over 1000, where the right split-K and tile combination is missing.
+  Examples: 226×2141×1139 at +19.5%, 15×3363×2632 at +13.2%, 20×1×11869 at +12.5%, 14244×16×1257 at +11.4%, 37×922×10110 at +9.6%.
+  The largest regret is 124×28×26 at +21.9%, but that is only 0.9 µs on a 4.1 µs kernel, inside the cold event tick.
+- **G3 holds out of sample.** B6 (`bm32_bn32_bk32_w4_s5_g1_sk1`) has median regret 48% and p95 487% on held-out shapes, so per-shape selection is still worth a lot.
+
+**Implication for the selector.** A fixed small portfolio with a perfect picker is not enough to stay within 5% at the tail on unseen shapes.
+Options, cheapest first:
+1. Build the portfolio from more tune shapes. The screen is about 55 s per shape, so a few hundred more tune shapes is an overnight run.
+2. Allow a larger portfolio (about 60–100), since the selector only needs to rank members, not cover the space.
+3. Fall back to a short online search over the top-k predicted configs for shapes outside the training distribution.
+
+Option 2 can be checked now: on screen data, held-out p95 is 10.3% at 60 configs and 9.3% at 100. So size alone does not close
+the gap; coverage of shape space does.
+
 ## Update 2026-10-15 (evening): full Triton config sweep (M3/M4); G2, G3 and G5 pass, G4 only for tiny GEMMs
 
 **Stage 1 (screen):** session `sweep-20261015-075746-lock1755` (`python -m tune sweep`, 4.1 h). It covered a coarse subset of

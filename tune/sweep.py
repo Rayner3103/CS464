@@ -31,12 +31,16 @@ SLOW_FACTOR = 1.5
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def coarse_subset(shapes: list[dict], per_suite: int, max_gflop: float) -> list[dict]:
-    """Deterministic stratified subset: tune-split, in-range shapes only, evenly spaced by FLOPs within each suite."""
+HELDOUT_SPLITS = ("heldout_region", "heldout_random")
+
+
+def coarse_subset(shapes: list[dict], per_suite: int, max_gflop: float, splits=("tune",)) -> list[dict]:
+    """Deterministic stratified subset: in-range shapes of the given splits only, evenly spaced by FLOPs within each
+    suite."""
     out, seen = [], set()
     by_suite: dict[str, list[dict]] = {}
     for s in shapes:
-        if s.get("split") != "tune" or s.get("out_of_range") or 2e-9 * s["M"] * s["N"] * s["K"] > max_gflop:
+        if s.get("split") not in splits or s.get("out_of_range") or 2e-9 * s["M"] * s["N"] * s["K"] > max_gflop:
             continue
         by_suite.setdefault(s["suite"], []).append(s)
     for suite in sorted(by_suite):
@@ -273,9 +277,10 @@ def top_configs(sweep_dir: Path, M: int, N: int, K: int, k: int, dtype: str = "f
     return out
 
 
-def run_sweep(shapes: list[dict], out_dir: Path, *, workers: int, session_id: str | None = None, log=print) -> Path:
+def run_sweep(shapes: list[dict], out_dir: Path, *, workers: int, session_id: str | None = None, log=print,
+              screen_dir: str = "sweep_screen") -> Path:
     from tune.env import write_env
-    sweep_dir = out_dir / "sweep_screen"
+    sweep_dir = out_dir / screen_dir
     env = write_env(out_dir, session_id=session_id, kind="sweep")
     t0 = time.perf_counter()
     manifest = {"session_id": env["session_id"], "screen_version": SCREEN_VERSION, "shapes": []}
