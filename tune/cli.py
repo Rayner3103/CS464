@@ -9,6 +9,7 @@
   noise      noise-floor study -> data/<hw_id>/noise.jsonl
   drift      thermal drift run -> data/<hw_id>/drift-*.csv
   analyze    build plots + markdown summaries into reports/
+  portfolio  config-space reduction from the sweep screen (B6 over the full space, G3, G5) -> reports/sweep_portfolio.md
 """
 from __future__ import annotations
 
@@ -134,6 +135,13 @@ def cmd_drift(args):
     print(f"drift -> {run_drift(args.out, minutes=args.minutes, n=args.n)}")
 
 
+def cmd_portfolio(args):
+    from analysis.portfolio import build
+    out, s = build(args.data, args.report)
+    print(f"{s['n_shapes']} shapes x {s['n_configs']} configs; B6 {s['b6']} median regret {100 * s['b6_regret_median']:.1f}%; "
+          f"G5 size {s['g5_portfolio_size_p95_lt_5pct']} -> {out}")
+
+
 def cmd_analyze(args):
     from analysis.report import build_reports
     build_reports(args.data, args.report, args.results)
@@ -199,10 +207,15 @@ def main(argv=None):
     p.add_argument("--results", default="results.jsonl",
                    help="benchmark file under --data, e.g. results_lock1755.jsonl (outputs get a _lock1755 suffix)")
 
+    p = sub.add_parser("portfolio")
+    p.set_defaults(fn=cmd_portfolio)
+    p.add_argument("--data", type=Path, default=None)
+    p.add_argument("--report", type=Path, default=Path("reports"))
+
     args = ap.parse_args(argv)
     if args.clock_lock is not None:
         os.environ["TUNE_CLOCK_LOCK"] = args.clock_lock
-    if args.cmd == "analyze":
+    if args.cmd in ("analyze", "portfolio"):
         args.data = args.data or default_data_dir()
     else:
         args.out = args.out or default_data_dir()
