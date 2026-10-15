@@ -4,6 +4,96 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-15 (evening): full Triton config sweep (M3/M4); G2, G3 and G5 pass, G4 only for tiny GEMMs
+
+**Stage 1 (screen):** session `sweep-20261015-075746-lock1755` (`python -m tune sweep`, 4.1 h). It covered a coarse subset of
+**160 shapes**: about 23 per suite from S1–S7, tune split only, at most 1.2 TFLOP per shape, stratified by FLOPs
+(`reports/snapshot/lock1755/sweep_subset.json`). Every config in the pruned space was tried on each shape: up to 10,840 per shape,
+**912,913 shape × config cells** in total. Each cell was compiled, validated against the fp32 reference and screen-timed with a cold L2
+(1 sample, cut at 1.5× the best so far, otherwise 5 samples; 15 samples with a trimmed mean under 50 µs). Results:
+0 invalid configs, 0 crashes. Per-shape files are in `data/<hw>/sweep_screen/`.
+
+**Stage 2 (full protocol):** session `bench-20261015-075746-lock1755-sweep` (38 min, 9,226 rows, all valid). For each shape, the 8 best
+distinct tiles from the screen were timed alongside the 5 hand-picked configs, B1, B5, B2/B3 and B3+, in one session.
+Tables: [`week1_results_lock1755_sweep.md`](week1_results_lock1755_sweep.md).
+
+**Stage 2b (µs kernels):** the 74 subset shapes whose best kernel runs under 50 µs were re-timed with **CUDA-graph amortized timing** (hot, 50 launches
+per graph, `--graph-batch 50`), as the methodology prescribes for kernels below the event tick. Session `bench-20261015-125953-lock1755-sweep-graph`, 2,259 rows, all valid.
+Tables: [`week1_results_lock1755_sweep_graph.md`](week1_results_lock1755_sweep_graph.md).
+
+### Headline (cold L2, per-launch, 160 shapes)
+
+| | median | p10 | p90 | min | max |
+|---|---|---|---|---|---|
+| ours (sweep oracle) vs **B3+** | **0.988** | 0.85 | 1.07 | 0.69 | 1.27 |
+| sweep oracle vs the 5 hand-picked configs | **1.075** | 1.00 | 2.20 | 1.00 | 4.72 |
+| ours vs B1 | 1.075 | 0.95 | 1.36 | 0.78 | 1.94 |
+| B3+ vs B1 | 1.078 | 1.01 | 1.36 | 0.99 | 1.95 |
+
+The sweep's gain over the hand-picked configs is largest in S4 large-K (median 2.16×, from split-K variants), S3 skinny (1.26×) and S7 random (1.16×).
+
+### Where ours stands against B3+
+
+| kernel size | timing | n | median ours/B3+ | ours ahead >5% | within 2% | ours behind >5% |
+|---|---|---|---|---|---|---|
+| ≥ 50 µs | cold, per-launch | 86 | 0.981 | **0** | 39 | 28 |
+| ≥ 50 µs, all of M, N, K divisible by 16 | cold, per-launch | 50 | 0.988 | 0 | | |
+| ≥ 50 µs, some dimension unaligned | cold, per-launch | 36 | **0.904** | 0 | | |
+| < 50 µs | hot, graph-amortized | 74 | 0.979 | 22 | 13 | 25 |
+| B3+ < 5 µs | hot, graph-amortized | 20 | 1.087 | **12** | | 4 |
+| B3+ 15–50 µs | hot, graph-amortized | 17 | 0.954 | 0 | | 6 |
+
+- **For kernels at or above 50 µs (the range G1 covers), ours never beats B3+ by more than 5%.** On aligned shapes we are at parity (0.988). All 10 worst
+  losses are unaligned shapes (3000³ 0.75×, 4088³ 0.76×, 4094³ 0.78×, 8191³ 0.84×, and S5/S7 odd shapes). This is a kernel-level limitation, not a
+  selection one: with row strides that are not 16-byte aligned, Triton cannot issue vectorized 16-byte loads. A fix needs a different kernel
+  (padding or a copy-to-aligned prologue), not better config choice.
+- **Ours does win on tiny GEMMs (B3+ under about 5 µs).** With graph-amortized timing (the event tick does not limit it), ours is 1.08–1.23× faster
+  on 12 of 20 such shapes: 64³, 128³, 256³, 127×2039×7, 4093×7×7 and seven S7 shapes with K ≤ 449. The absolute savings are only
+  0.23–0.59 µs per call. Just above the band (5–15 µs) a few more wins persist: 8–16 × 1024 × 1024 at 1.11–1.12×, 1024×64×1024 at 1.14×, 16 × {128, 256} × 4096
+  with split-K at 1.12–1.14×, and 518×813×87 at 1.20×. Losses there are just as common. The likely cause is cuBLAS's fixed per-kernel cost on problems
+  that use only a handful of CTAs.
+- **Losses under 50 µs** cluster in large-K split-K with tiny M and N (14×2×5131 0.63×, 7×7×2039 0.80×, 16×64×16384 0.85×). Our split-K writes fp32 partials
+  and runs a separate reduction kernel, while cuBLAS uses a fused or atomic reduction. That is also a kernel-level fix.
+
+### Portfolio study (G3, G5) from the screen data
+
+From [`sweep_portfolio.md`](sweep_portfolio.md) (`python -m tune portfolio`). Regret is measured against the per-shape screen oracle.
+- **G3, best single config over the full space:** B6 = `bm32_bn32_bk32_w4_s5_g1_sk1`. Its regret vs the per-shape oracle is median **74%**, p90 307%.
+  In stage 2, the hand-picked B6 vs the sweep oracle has median 1.23×, p90 6.2×. Per-shape selection is clearly worth it.
+- **G5, portfolio size:** a greedy portfolio of **29 configs** reaches p95 regret under 5% (mean 1.3%). 16 configs give a p95 of 8.7%, 50 configs 2.0%.
+  Set cover needs 32 configs at ε = 5%, 43 at 3% and 54 at 2%.
+- **Which parameters matter**, ranked by the regret from forcing each one to its worst value: SPLIT_K (121%) ≫ BLOCK_M (48%) > BLOCK_K (26%) >
+  BLOCK_N (19%) ≫ num_warps (8%), num_stages (5%), GROUP_M (2%). The selector's features should capture the split-K and tile-size
+  decisions. Stages and GROUP_M barely matter.
+- **Caveats:** this is in-sample: the portfolio is chosen and evaluated on the same 160 tune-split shapes. Screen times are few-sample, so the regrets
+  are slightly pessimistic. The held-out check is still to do: screen the held-out shapes, then evaluate the tune-shape portfolio on them.
+
+### Gate status (supersedes earlier tables)
+
+| Gate | Status |
+|---|---|
+| G1 measurement validity | **Pass** for kernels ≥ 50 µs, cold per-launch. The graph-amortized mode used for < 50 µs has no across-session noise study yet |
+| G2 family ≥ 90% of B3+ | **Pass**: median 98.8% over 160 shapes from all 7 suites (aligned shapes at or above 50 µs: 98.8%; unaligned: 90.4%) |
+| G3 selection value | **Pass**: full-space B6 regret median 74%, p90 307% (the gate asks for > 10% median or > 30% p90) |
+| G4 differentiation | **Fails at or above 50 µs** (0 of 86 shapes beat B3+ by > 5%). **Narrow pass for tiny GEMMs** (B3+ < ~5 µs: 12 of 20 shapes, 8–23%, 0.23–0.59 µs absolute), pending a repeat session in graph mode |
+| G5 tractability | **Pass (in-sample)**: 29 configs reach p95 regret < 5%. Held-out validation pending |
+
+### Conclusion (plan §8: written down explicitly, because G4 is mostly failing)
+
+On the RTX 3080, a well-searched cuBLASLt (B3+) is at least as fast as the best of our Triton family for every GEMM large enough
+to matter (at least 50 µs). The family reaches parity on aligned shapes and loses about 10% on unaligned ones. The only regime where we beat B3+ is tiny
+GEMMs under about 5 µs, by fractions of a microsecond. That matters only where launches are amortized (CUDA graphs) and such GEMMs dominate.
+So **the project is not viable as a cuBLAS competitor on this GPU. It is viable as a selection project:** G3 and G5 both pass strongly
+(selection is worth 74% at the median over any single config, and about 30 configs suffice). The practical framing that follows is a selector that
+picks from {our portfolio ∪ cuBLASLt configs} (B3+ is itself a selection over a config space), or a non-NVIDIA backend target where no B3+ exists.
+
+### Next steps
+1. **Held-out G5 check:** screen the held-out S1/S2/S6/S7 shapes and evaluate the 29-config tune-split portfolio on them.
+2. **Trivial selector baselines (plan 8.1.7):** nearest-neighbour on (log M, log N, log K) and a hand-written rule, evaluated on held-out shapes
+   against the oracle and against B3+.
+3. **Repeat the graph-mode µs measurement in a second session** (and after a reboot) to establish its noise floor before relying on the tiny-GEMM wins.
+4. Kernel-level fixes, if differentiation still matters: an aligned-copy or padded path for unaligned strides, and a fused or atomic split-K reduction.
+
 ## Update 2026-10-15 (later): deeper B3 (B3+) closes the K = 4096 gap; G4 does not hold with 5 configs
 
 Run: `bench-20261015-023430-lock1755-b3plus` (standard conditions, commit `08e2a2c`, 5624 rows, all valid), in
