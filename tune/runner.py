@@ -149,7 +149,8 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
                 for cm in cache_modes:
                     row = {**base_row, "M": M, "N": N, "K": K, "alignment_flags": alignment_flags(M, N, K),
                            "kernel_family": c.family, "config_key": c.config_key, "config": c.config,
-                           "cache_mode": cm, "batch": 1, "use_graph": False, "suite": s.get("suite"),
+                           "cache_mode": cm, "batch": (timing_overrides or {}).get("batch", 1),
+                           "use_graph": (timing_overrides or {}).get("use_graph", False), "suite": s.get("suite"),
                            "split": s.get("split")}
                     if measurement_key(row) not in done:
                         todo.append((c, cm, row))

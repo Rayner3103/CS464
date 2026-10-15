@@ -100,6 +100,11 @@ def cmd_benchmark(args):
         timing["max_time_s"] = args.max_time_s
     if args.target_rse is not None:
         timing["target_rse"] = args.target_rse
+    if args.graph_batch:
+        # Amortized per-launch time for us-scale kernels (methodology: per-launch events tick in ~1.02 us steps).
+        if set(args.cache_modes.split(",")) != {"hot"}:
+            raise SystemExit("--graph-batch needs --cache-modes hot (cold flushes L2 before every launch)")
+        timing.update(batch=args.graph_batch, use_graph=True)
     path = run(_shapes(args.suite, args.shapes_file), args.backends.split(","), args.out, dtype=args.dtype,
                cache_modes=tuple(args.cache_modes.split(",")), timing_overrides=timing,
                budget_s=_parse_budget(args.budget), session_id=args.session, prune_shapes=args.prune_shapes,
@@ -180,6 +185,8 @@ def main(argv=None):
         p.add_argument("--target-rse", type=float, default=None)
         p.add_argument("--out-name", default="results.jsonl")
         p.add_argument("--n-allocs", type=int, default=3, help="input placements pooled per measurement")
+        p.add_argument("--graph-batch", type=int, default=0,
+                       help="time N launches captured in a CUDA graph and report time/N (hot only)")
         p.add_argument("--shapes-file", default=None, help="JSON with a 'shapes' list (e.g. sweep_screen/subset.json); "
                                                            "overrides --suite")
     p = add("sweep", cmd_sweep)
