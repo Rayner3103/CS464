@@ -47,8 +47,9 @@ analysis/
   report.py          analyze: baseline/noise/drift tables and figures
   portfolio.py       B6 over the full space, greedy portfolio, set cover, parameter importance, held-out G5
   selectors.py       trivial selectors (b6, nn1, knn5, rule, nn1f, knnf, knnc), picks file, held-out scoring
+  learned.py         learned selectors v0: DT, linear SVM, LightGBM, RF, logistic regression; cls and rank forms; grouped CV
   alloc_variance.py  allocation-placement noise experiment
-tests/       pytest unit tests (43 tests; most need a CUDA GPU)
+tests/       pytest unit tests (50 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)
@@ -57,7 +58,7 @@ learning/    background study notes (not part of the harness)
 ## 3. Environment
 
 - Use the existing Python environment; versions are pinned in `requirements.txt` (torch 2.13.0+cu130, triton 3.7.1,
-  numpy, pandas, pyarrow, matplotlib, nvidia-ml-py, pytest). Run everything **from the repo root** as `python -m ...`.
+  numpy, pandas, pyarrow, matplotlib, nvidia-ml-py, pytest, scikit-learn, lightgbm). Run everything **from the repo root** as `python -m ...`.
 - **Standard conditions** (every gate number assumes them): SM clock locked at 1755 MHz by the user
   (`sudo nvidia-smi -lgc 1755,1755`; reset with `sudo nvidia-smi -rgc`), declared to the harness with
   `python -m tune --clock-lock 1755 <cmd>` (or `TUNE_CLOCK_LOCK=1755`), driver 595.99.02, 3 input placements pooled,
@@ -83,6 +84,7 @@ Measuring commands pin the process to one CPU core and write under `data/<hw_id>
 | `analyze --results results_lock1755.jsonl` | Tables + figures; output names get the results tag as a suffix | `reports/week1_results*.md`, `reports/figures/` |
 | `portfolio [--heldout --results ...]` | B6 over the full space, greedy portfolio curve, set cover, parameter importance; `--heldout` scores the tune-fitted portfolio on held-out shapes | `reports/sweep_portfolio[_heldout].md` + summary JSON |
 | `selectors [--results ... --graph-results ...]` | Fit trivial selectors on the tune screen, write picks, score on held-out shapes (screen + stage 2) | `data/<hw>/selector_picks.json`, `reports/selector_baselines.md` |
+| `learned [--results ... --graph-results ...]` | Grouped-CV grid search (cached, ~2 h first run) and held-out scoring of the 10 learned selectors; reads `selector_picks.json` for b6/knn5/knnf | `data/<hw>/learned_picks.json`, `learned_search.json`, `reports/learned_selectors.md` |
 
 ### Backend spec strings (`--backends`, comma-separated; `runner.candidates_for`)
 
@@ -94,7 +96,7 @@ Measuring commands pin the process to one CPU core and write under `data/<hw_id>
 | `triton:<config_key>` | any config, e.g. `triton:bm64_bn64_bk64_w4_s3_g1_sk8` |
 | `triton:sweep[:k]` | the k (default 8) fastest screened configs for this shape (`TUNE_SWEEP_DIR`) |
 | `triton:portfolio[:n]` | first n (default 29) members of the greedy portfolio (`TUNE_PORTFOLIO`, default `reports/sweep_portfolio_summary.json`) |
-| `triton:picks` | selector picks for this shape (`TUNE_PICKS`, default `data/<hw>/selector_picks.json`) |
+| `triton:picks` | selector picks for this shape (`TUNE_PICKS`, default `data/<hw>/selector_picks.json`; `learned_picks.json` for the learned selectors) |
 | `cublaslt[:N]` | cuBLASLt heuristic top-N (default 16; often returns 1–9). Rank 0 = B2, per-shape best = B3 |
 | `cublaslt_deep[:budget_s]` | B3+ search (default 20 s/shape, cached in `TUNE_LT_SEARCH_DIR` = `data/<hw>/lt_search/`); best of `cublaslt` ∪ `cublaslt_deep` = B3+ |
 
@@ -171,9 +173,10 @@ Other findings to keep in mind:
 - Losses ≥ 50 µs are kernel-level: unaligned strides (no 16-byte vector loads) and split-K reduction cost on tiny M, N. Better selection cannot fix them.
 - Parameter importance: SPLIT_K ≫ BLOCK_M > BLOCK_K > BLOCK_N ≫ warps, stages, GROUP_M.
 - Measured roofline: 62.9 TFLOP/s fp16 tensor, 686 GB/s DRAM. Under sustained load the card power-caps (throttle 0x4).
-- **Current selector bar** (held-out, latest sessions `selectors3` / `selectors3-graph`): knnf at ≥ 50 µs cold (median 1.9%,
-  p95 37%), knn5 under 50 µs graph (median 3.7%, p95 22%), knnf overall cold (median 1.8%, p95 23%, mean 6.5%). A learned model must beat these with this same harness. Per-candidate k-NN (knnc) does
-  not: same per-candidate features, worse median (cold 4.4% vs knnf 1.8%); only its ≥ 50 µs tail is a little better (p95 32% vs 37%).
+- **Current selector bar: lgbm_rank** (`analysis/learned.py`; held-out sessions `learned` / `learned-graph`). This is a LightGBM regressor of log regret per
+  (shape, candidate) over each tune shape's top-5 pool, with shape features + config params + `candidate_features`. Cold, all shapes: median 1.4%, p95 18.3%, mean 4.1%.
+  Cold ≥ 50 µs: 1.8%, p95 19%. Graph < 50 µs: 2.4%, p95 13.5%, mean 4.3%. In the same sessions knnf had cold 2.3% / 23% / 6.6% (≥ 50 µs p95 36%) and knn5 had graph 3.7% / 22% / 6.8%.
+  rf_rank is a close second. Shape → config classifiers (cls form) and every linear model are worse than k-NN. Against B3+ nothing changes: G4 still fails at ≥ 50 µs.
 
 ## 7. Rules for agents
 
@@ -244,11 +247,8 @@ python -m tune selectors       # re-score with both stage-2 files
 
 ## 9. Open next steps
 
-1. **Learned selector v0**: rank candidate configs per shape with a trained model over shape features plus
-   `candidate_features` (already computed per candidate). A nearest-neighbour vote over these features (knnc) is not enough:
-   similar per-candidate conditions on tune shapes do not predict a config's regret on a new shape. Evaluate with
-   `triton:picks` + `tune selectors` against knnf/knn5.
-2. **Top-k + short online search**: time the model's top 3–5 at first use to close the tail.
+1. **Learned selector v0: done** (lgbm_rank, see §6 and `reports/week1.md` 2026-10-19 late). Next: lambdarank / regression blends, a larger candidate pool.
+2. **Top-k + short online search**: time lgbm_rank's top 3–5 at first use to close the tail (worst stage-2 shape is still +29%).
 3. **Joint {Triton ∪ cuBLASLt} selection**, especially under 50 µs where the families split the wins.
 4. Noise study for graph-amortized mode (second session plus a reboot) before relying on tiny-GEMM wins.
 5. Kernel-level fixes if differentiation matters: an aligned-copy or padded path for unaligned strides, and a fused or atomic split-K reduction.

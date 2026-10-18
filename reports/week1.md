@@ -4,6 +4,83 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-19 (late): learned selectors v0 — per-candidate LightGBM sets a new bar
+
+**What ran.** `analysis/learned.py` (`python -m tune learned`) fits five model families in two forms, on the tune screen only:
+- **cls:** shape → config classification over the first P members of a greedy portfolio, refit per fold. A shape's label is the first member within 2% of its best member.
+  Inputs are the 22 shape features (dims, fill, align). Models: decision tree, LinearSVC, LightGBM, random forest, logistic regression.
+- **rank:** per-candidate scoring over the union of each training shape's top-5 configs (868 candidates). Each row has the 22 shape features, the 7 config parameters and the 6
+  `candidate_features`. The trees, the forest and LightGBM regress capped log regret (LightGBM could also pick lambdarank). LinearSVR regresses log regret and logistic regression
+  classifies "within 5% of the oracle", both on standardized inputs plus every shape × candidate product.
+
+Hyperparameters come from grouped 20-fold CV on the tune shapes, lowest capped mean regret. Each fit sees 290–353 shapes, and drops every tune shape that shares two of M, N, K with a
+fold shape. The share-two-dims graph has one component of 258 shapes, so GroupKFold was not an option. 198 grid points, about 2 h of CPU, cached per model in
+`data/<hw>/learned_search.json`. The grids were widened once, on tune CV only, wherever the first pass's winner sat on an edge. No held-out shape informed any fit or choice.
+
+**Re-measured** in fresh sessions on a clean harness (commit `3bbc349`, `harness_dirty: false`). Each session also re-times b6 / knn5 / knnf, so everything shares one oracle and B3+:
+- `bench-20261019-032812-lock1755-learned`: cold, 86 shapes, 2,760 rows, 0 invalid, 5.8% power-capped.
+- `-learned-graph`: graph-amortized, 56 shapes under 50 µs, 1,815 rows, 0 invalid, 5.5% power-capped.
+
+Tables: [`learned_selectors.md`](learned_selectors.md).
+
+**Regret vs the per-shape Triton oracle, median / p95 (mean):**
+
+| selector | tune CV mean | held-out screen | stage 2 cold, all 86 | cold, ≥ 50 µs (30) | graph, < 50 µs (56) |
+|---|---|---|---|---|---|
+| knn5 (bar < 50 µs) | 8.4% | 4.7% / 25.4% (10.8%) | 3.0% / 24.2% (9.7%) | 3.6% / 65.3% | 3.7% / 22.1% (6.8%) |
+| knnf (bar ≥ 50 µs) | 7.5% | 4.1% / 27.3% (7.8%) | 2.3% / 23.0% (6.6%) | 1.9% / 36.4% | 4.7% / 25.4% (7.5%) |
+| dt_cls | 14.6% | 7.8% / 43.9% (15.1%) | 6.4% / 41.4% (14.2%) | 5.3% / 38.3% | 10.8% / 51.9% (17.0%) |
+| svm_cls | 13.5% | 8.0% / 53.6% (15.3%) | 6.5% / 51.8% (14.1%) | 5.2% / 57.9% | 11.1% / 57.6% (18.2%) |
+| lgbm_cls | 10.1% | 4.1% / 37.7% (11.0%) | 3.0% / 39.0% (9.9%) | 2.3% / 70.1% | 5.1% / 31.8% (8.9%) |
+| rf_cls | 9.0% | 4.3% / 32.7% (11.4%) | 3.2% / 32.3% (10.3%) | 1.7% / 28.4% | 5.5% / 52.1% (13.4%) |
+| logreg_cls | 11.1% | 7.4% / 52.5% (13.2%) | 5.9% / 51.8% (11.7%) | 3.3% / 38.7% | 10.5% / 71.4% (17.5%) |
+| dt_rank | 11.6% | 4.6% / 65.7% (14.3%) | 4.4% / 67.7% (13.2%) | 1.1% / 43.5% | 9.4% / 80.0% (17.4%) |
+| svm_rank | 22.4% | 13.7% / 73.5% (21.9%) | 10.5% / 70.4% (19.7%) | 15.9% / 83.7% | 15.1% / 85.5% (21.6%) |
+| **lgbm_rank** | **4.8%** | **3.6% / 18.1% (5.5%)** | **1.4% / 18.3% (4.1%)** | 1.8% / 19.1% | **2.4% / 13.5% (4.3%)** |
+| rf_rank | 5.3% | 4.4% / 18.5% (6.4%) | 2.9% / **17.3%** (5.1%) | **1.2% / 18.6%** | 3.0% / 13.5% (5.2%) |
+| logreg_rank | 22.1% | 8.5% / 63.7% (17.3%) | 5.4% / 64.6% (15.3%) | 6.8% / 81.7% | 8.4% / 53.2% (15.1%) |
+
+lgbm_rank: regression objective, 255 leaves, 1,500 trees, learning rate 0.05. rf_rank: 100 trees, max_features 0.66, min leaf 5. Tune CV for knn5 / knnf uses the same folds,
+with their weights fixed as fit on all tune shapes, which slightly favours them.
+
+- **Per-candidate tree ensembles are the first selectors to beat the k-NN bar, and they do it in every regime.** Against knnf in cold stage 2, lgbm_rank's mean drops from 6.6% to 4.1% and its p95 from 23% to 18%.
+  At ≥ 50 µs its p95 is 19% against knnf's 36%, about half. Under 50 µs (graph) its mean drops from 6.8% to 4.3% and its p95 from 22% to 13.5% against knn5. The ranking also holds shape by shape:
+  - Cold, beyond ε (2% ≥ 50 µs, 5% below): lgbm_rank is faster than knnf on 21 shapes, slower on 10 and tied on 55 (geomean 1.022×). Against knn5 it is 23 / 7 / 57 (1.036×).
+  - Graph, ε 5%: 17 / 6 / 33 against knnf and 16 / 10 / 32 against knn5.
+  
+  Its worst stage-2 shape is 226×2141×1139 at +29%, where knnf's worst is +45%.
+- **CV picks the same winner as held-out does.** lgbm_rank has the lowest tune-CV mean (4.8%), rf_rank is second (5.3%). The held-out screen mean (5.5%, 6.4%) and stage-2 cold mean (4.1%, 5.1%) rank them the same, with every other learned selector at ≥ 9.9%. So naming
+  lgbm_rank the bar is not a choice made on held-out data.
+- **The form matters more than the model.** The same features fed to classifiers over a static label set (cls) stay at a 32–54% held-out p95. That is despite label-set ceilings of 12.5% p95 for P = 32,
+  because P has to be small for the labels to be learnable, and a misclassification costs the full regret. Per-candidate scoring lets the model reuse what it learned about one config on others.
+- **Linear models fail in both forms**, even with every shape × candidate product (svm_rank / logreg_rank CV about 22%). Regret is not close to linear in these features. Single decision trees overfit (rank p95 66–68%).
+- **What the trees use.** In both lgbm_rank and rf_rank, the candidate's own K steps per split and its waves (from `candidate_features`) carry 36–38% of the importance. Next come
+  BLOCK_M, wave efficiency and BLOCK_N. The per-candidate features that k-NN voting could not exploit (knnc) do work when a model can weigh them against the shape.
+- **Against B3+ nothing changes** (median t_B3+/t_pick, cold ≥ 50 µs): lgbm_rank 0.933, knnf 0.913, Triton oracle 0.964. G4 still fails at ≥ 50 µs. Under 50 µs (graph), lgbm_rank reaches
+  0.992, against 0.951 for knnf and 1.017 for the oracle, so a joint {Triton ∪ cuBLASLt} selector is where the remaining margin is.
+- **knnf / knn5 reproduce for the fourth session in a row** (knnf cold 2.3% / 23.0% / 6.6% vs 1.8% / 22.9% / 6.5% in `selectors3`; knn5 graph 3.7% / 22.1% vs 3.7% / 22.3%).
+
+**Caveats.** lgbm_rank's winner is again on the edge of its grid (255 leaves, 1,500 trees), but CV gains have flattened (4.9% → 4.8% from 127 to 255 leaves). Lambdarank has the best
+CV median (1.6–1.9%) but a worse mean, so it lost under the mean rule. The cold ≥ 50 µs column has only 30 shapes, so its p95 is about the second-worst shape.
+
+**New bar:** lgbm_rank, cold all median 1.4% / p95 18.3% / mean 4.1%, ≥ 50 µs 1.8% / 19.1%, graph < 50 µs 2.4% / 13.5% / 4.3%.
+
+**Next:** top-k from lgbm_rank plus a short online search (time its top 3–5, AGENTS next step 2), which now has a calibrated ranker to draw from. Add cuBLASLt algorithms as
+candidates in the same ranker (joint selection). Check the ranker on a lambdarank / regression blend, or try a pool beyond the top 5.
+
+Reproduce:
+```bash
+python -m tune learned            # CV search (cached in data/<hw>/learned_search.json), held-out picks -> data/<hw>/learned_picks.json
+D=data/rtx3080_sm86_68sms_10gb
+export TUNE_SWEEP_DIR=$D/sweep_screen_heldout TUNE_PICKS=$D/learned_picks.json
+python -m tune --clock-lock 1755 benchmark --shapes-file $D/sweep_screen_heldout/subset.json \
+  --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20 --cache-modes cold --out-name results_lock1755_learned.jsonl
+python -m tune --clock-lock 1755 benchmark --shapes-file $D/sweep_screen_heldout/subset_lt50us.json \
+  --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20 --cache-modes hot --graph-batch 50 \
+  --out-name results_lock1755_learned_graph.jsonl
+python -m tune learned            # re-score with both stage-2 files
+```
+
 ## Update 2026-10-19 (later): per-candidate fill and split features (knnc) do not beat knnf
 
 **What changed.** `candidate_features` computes the fill and split features for **each candidate's own tile and split** rather than for fixed
