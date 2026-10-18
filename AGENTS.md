@@ -171,8 +171,8 @@ Other findings to keep in mind:
 - Losses ≥ 50 µs are kernel-level: unaligned strides (no 16-byte vector loads) and split-K reduction cost on tiny M, N. Better selection cannot fix them.
 - Parameter importance: SPLIT_K ≫ BLOCK_M > BLOCK_K > BLOCK_N ≫ warps, stages, GROUP_M.
 - Measured roofline: 62.9 TFLOP/s fp16 tensor, 686 GB/s DRAM. Under sustained load the card power-caps (throttle 0x4).
-- **Current selector bar** (held-out): knnf at ≥ 50 µs cold (median 1.9%, p95 37%), knn5 under 50 µs graph (median 3.5%,
-  p95 21%), overall p95 ≈ 23%, mean ≈ 6%. A learned model must beat these with this same harness. Per-candidate k-NN (knnc) does
+- **Current selector bar** (held-out, latest sessions `selectors3` / `selectors3-graph`): knnf at ≥ 50 µs cold (median 1.9%,
+  p95 37%), knn5 under 50 µs graph (median 3.7%, p95 22%), knnf overall cold (median 1.8%, p95 23%, mean 6.5%). A learned model must beat these with this same harness. Per-candidate k-NN (knnc) does
   not: same per-candidate features, worse median (cold 4.4% vs knnf 1.8%); only its ≥ 50 µs tail is a little better (p95 32% vs 37%).
 
 ## 7. Rules for agents
