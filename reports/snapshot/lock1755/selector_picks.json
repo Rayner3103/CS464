@@ -3,10 +3,41 @@
   "b6",
   "nn1",
   "knn5",
-  "rule"
+  "rule",
+  "nn1f",
+  "knnf"
  ],
+ "feature_fits": {
+  "knnf": {
+   "weights": {
+    "fill": 1.5,
+    "align": 0.5
+   },
+   "k": 3,
+   "n": 477,
+   "mean": 0.05929210955788711,
+   "p50": 0.020618556701030855,
+   "p95": 0.22483457935894124,
+   "max": 1.4387149247661655,
+   "frac_le_5pct": 0.660377358490566
+  },
+  "nn1f": {
+   "weights": {
+    "fill": 0.5,
+    "align": 0.5
+   },
+   "k": 1,
+   "n": 477,
+   "mean": 0.07706060315793106,
+   "p50": 0.02865086778026371,
+   "p95": 0.2968262928016856,
+   "max": 0.7450284090909092,
+   "frac_le_5pct": 0.5953878406708596
+  }
+ },
  "picks": {
   "105x6x9": [
+   "bm16_bn32_bk16_w2_s2_g1_sk1",
    "bm16_bn32_bk16_w2_s5_g4_sk1",
    "bm16_bn32_bk32_w2_s5_g4_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
@@ -16,7 +47,9 @@
    "bm16_bn128_bk16_w4_s4_g1_sk1",
    "bm16_bn128_bk32_w4_s4_g1_sk1",
    "bm16_bn128_bk64_w8_s2_g1_sk1",
-   "bm32_bn32_bk32_w4_s5_g1_sk1"
+   "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn64_bk16_w4_s2_g1_sk2",
+   "bm32_bn64_bk32_w8_s3_g1_sk1"
   ],
   "12094x232x3": [
    "bm32_bn32_bk32_w4_s5_g1_sk1",
@@ -26,6 +59,7 @@
   ],
   "124x28x26": [
    "bm16_bn32_bk32_w2_s3_g16_sk1",
+   "bm16_bn32_bk32_w2_s3_g1_sk1",
    "bm16_bn32_bk32_w2_s5_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn32_bk32_w4_s4_g8_sk1"
@@ -34,9 +68,11 @@
    "bm128_bn128_bk32_w8_s3_g1_sk2",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk16_w4_s4_g1_sk4",
-   "bm64_bn128_bk64_w4_s3_g8_sk2"
+   "bm64_bn128_bk64_w4_s3_g8_sk2",
+   "bm64_bn64_bk32_w4_s3_g8_sk2"
   ],
   "12937x577x4649": [
+   "bm128_bn64_bk32_w4_s2_g4_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk32_w4_s4_g8_sk1",
    "bm64_bn128_bk64_w4_s3_g16_sk1",
@@ -46,6 +82,7 @@
    "bm16_bn32_bk16_w2_s5_g1_sk8",
    "bm16_bn32_bk64_w2_s2_g1_sk8",
    "bm16_bn64_bk128_w4_s3_g1_sk2",
+   "bm16_bn64_bk64_w4_s3_g1_sk8",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "12x629x18": [
@@ -58,21 +95,26 @@
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm32_bn64_bk32_w4_s2_g16_sk1",
    "bm32_bn64_bk32_w4_s3_g16_sk1",
-   "bm64_bn128_bk64_w4_s3_g8_sk1"
+   "bm64_bn128_bk64_w4_s3_g8_sk1",
+   "bm64_bn64_bk32_w8_s2_g4_sk1"
   ],
   "14244x16x1257": [
    "bm128_bn32_bk128_w4_s2_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn32_bk64_w4_s5_g1_sk1",
    "bm64_bn32_bk128_w4_s3_g8_sk1",
+   "bm64_bn32_bk32_w4_s2_g4_sk1",
    "bm64_bn32_bk64_w8_s3_g8_sk2"
   ],
   "15x1001x5": [
+   "bm16_bn128_bk16_w8_s3_g1_sk1",
    "bm16_bn32_bk16_w2_s2_g1_sk1",
    "bm16_bn32_bk32_w2_s3_g1_sk1",
    "bm16_bn64_bk16_w4_s4_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "15x1x356": [
+   "bm16_bn32_bk32_w2_s4_g1_sk8",
    "bm16_bn32_bk64_w2_s3_g1_sk2",
    "bm32_bn32_bk128_w4_s2_g1_sk1",
    "bm32_bn32_bk16_w4_s2_g1_sk8",
@@ -82,11 +124,14 @@
    "bm16_bn128_bk32_w4_s4_g1_sk1",
    "bm16_bn128_bk64_w4_s3_g1_sk4",
    "bm16_bn64_bk128_w4_s3_g1_sk1",
-   "bm32_bn32_bk32_w4_s5_g1_sk1"
+   "bm32_bn32_bk128_w4_s4_g1_sk1",
+   "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn64_bk64_w4_s4_g1_sk2"
   ],
   "16x4096x11008": [
    "bm16_bn128_bk64_w4_s3_g1_sk4",
    "bm16_bn128_bk64_w4_s4_g1_sk1",
+   "bm16_bn64_bk128_w4_s2_g1_sk1",
    "bm16_bn64_bk128_w4_s3_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
@@ -94,15 +139,18 @@
    "bm16_bn64_bk64_w4_s2_g1_sk1",
    "bm16_bn64_bk64_w4_s3_g1_sk1",
    "bm16_bn64_bk64_w4_s5_g1_sk1",
+   "bm32_bn32_bk16_w4_s5_g1_sk4",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "1836x15x2": [
+   "bm16_bn32_bk16_w2_s2_g8_sk1",
    "bm16_bn32_bk16_w2_s5_g16_sk1",
    "bm16_bn32_bk16_w2_s5_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn32_bk16_w4_s4_g8_sk1"
   ],
   "191x4625x29": [
+   "bm32_bn128_bk32_w8_s5_g8_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm32_bn64_bk16_w2_s3_g8_sk1",
    "bm32_bn64_bk64_w8_s3_g8_sk1",
@@ -111,6 +159,8 @@
   "19x380x184": [
    "bm16_bn64_bk128_w4_s3_g1_sk1",
    "bm16_bn64_bk128_w4_s4_g1_sk1",
+   "bm16_bn64_bk64_w4_s2_g16_sk1",
+   "bm16_bn64_bk64_w4_s3_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm32_bn64_bk64_w4_s3_g1_sk1"
   ],
@@ -121,8 +171,10 @@
   ],
   "1x709x521": [
    "bm16_bn64_bk128_w4_s3_g1_sk2",
+   "bm16_bn64_bk32_w4_s2_g1_sk8",
    "bm16_bn64_bk32_w4_s5_g1_sk1",
    "bm16_bn64_bk32_w4_s5_g1_sk4",
+   "bm16_bn64_bk64_w4_s2_g1_sk8",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "2048x4096x11008": [
@@ -138,70 +190,87 @@
   ],
   "2125x1x1": [
    "bm16_bn32_bk16_w2_s3_g1_sk1",
+   "bm16_bn32_bk16_w2_s5_g16_sk1",
    "bm16_bn32_bk16_w2_s5_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn32_bk16_w4_s4_g8_sk1"
   ],
   "226x2141x1139": [
+   "bm128_bn64_bk32_w4_s2_g16_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk32_w4_s4_g8_sk1",
    "bm64_bn64_bk32_w4_s3_g1_sk1",
-   "bm64_bn64_bk32_w4_s3_g1_sk4"
+   "bm64_bn64_bk32_w4_s3_g1_sk4",
+   "bm64_bn64_bk32_w8_s3_g4_sk1"
   ],
   "232x3389x2": [
    "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn64_bk16_w2_s5_g1_sk1",
    "bm32_bn64_bk16_w4_s2_g8_sk1",
    "bm32_bn64_bk16_w4_s3_g4_sk1",
    "bm64_bn128_bk16_w4_s4_g8_sk1"
   ],
   "277x3x161": [
+   "bm16_bn32_bk64_w2_s2_g8_sk1",
    "bm16_bn32_bk64_w2_s4_g8_sk1",
    "bm32_bn32_bk128_w4_s5_g8_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn32_bk64_w4_s3_g8_sk1"
   ],
   "27x715x3003": [
+   "bm16_bn32_bk128_w2_s2_g1_sk8",
+   "bm16_bn64_bk64_w4_s3_g1_sk8",
    "bm32_bn32_bk128_w4_s5_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm32_bn64_bk128_w4_s3_g1_sk8",
    "bm32_bn64_bk64_w8_s2_g1_sk8"
   ],
   "28x3030x4012": [
+   "bm16_bn128_bk32_w8_s3_g1_sk4",
    "bm16_bn64_bk64_w4_s4_g16_sk1",
    "bm32_bn128_bk32_w4_s5_g1_sk1",
    "bm32_bn128_bk64_w4_s3_g1_sk4",
-   "bm32_bn32_bk32_w4_s5_g1_sk1"
+   "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn64_bk64_w4_s4_g1_sk2"
   ],
   "2954x1x2031": [
    "bm128_bn32_bk64_w8_s3_g1_sk8",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn32_bk64_w4_s3_g4_sk2",
    "bm64_bn32_bk128_w4_s3_g8_sk2",
-   "bm64_bn32_bk32_w8_s2_g8_sk4"
+   "bm64_bn32_bk32_w8_s2_g8_sk4",
+   "bm64_bn32_bk64_w8_s3_g4_sk4"
   ],
   "2x1373x3759": [
    "bm16_bn128_bk64_w4_s3_g1_sk8",
+   "bm16_bn32_bk32_w2_s5_g1_sk8",
    "bm16_bn64_bk32_w4_s5_g1_sk4",
+   "bm16_bn64_bk64_w4_s4_g1_sk8",
    "bm16_bn64_bk64_w4_s5_g1_sk4",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "2x4096x11008": [
    "bm16_bn128_bk64_w4_s3_g1_sk4",
+   "bm16_bn128_bk64_w8_s3_g1_sk1",
    "bm16_bn128_bk64_w8_s5_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "2x8901x9643": [
    "bm16_bn128_bk32_w4_s4_g1_sk1",
    "bm16_bn128_bk32_w4_s5_g1_sk1",
+   "bm16_bn128_bk32_w8_s3_g1_sk4",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "3186x1x2": [
    "bm16_bn32_bk16_w2_s3_g1_sk1",
+   "bm16_bn32_bk16_w2_s5_g16_sk1",
    "bm16_bn32_bk16_w2_s5_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn32_bk16_w4_s4_g8_sk1"
   ],
   "320x1x79": [
    "bm16_bn32_bk32_w2_s3_g16_sk1",
+   "bm16_bn32_bk64_w2_s3_g1_sk1",
    "bm32_bn32_bk128_w4_s5_g8_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn32_bk64_w4_s3_g8_sk1"
@@ -213,6 +282,7 @@
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "335x42x96": [
+   "bm16_bn32_bk64_w2_s4_g16_sk1",
    "bm16_bn64_bk64_w4_s5_g1_sk1",
    "bm32_bn32_bk128_w4_s5_g8_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
@@ -234,19 +304,24 @@
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm32_bn64_bk32_w4_s5_g8_sk8",
    "bm32_bn64_bk64_w8_s5_g1_sk8",
+   "bm64_bn32_bk64_w8_s5_g8_sk8",
+   "bm64_bn64_bk32_w4_s5_g8_sk8",
    "bm64_bn64_bk64_w4_s3_g8_sk8"
   ],
   "3433x4x111": [
    "bm16_bn32_bk32_w2_s5_g16_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm32_bn32_bk64_w4_s2_g4_sk1",
+   "bm32_bn32_bk64_w4_s4_g1_sk1",
    "bm64_bn32_bk64_w4_s3_g8_sk1"
   ],
   "3522x1x647": [
    "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn32_bk64_w4_s3_g4_sk2",
    "bm64_bn32_bk128_w4_s3_g8_sk2",
    "bm64_bn32_bk32_w8_s3_g8_sk4",
-   "bm64_bn32_bk32_w8_s5_g4_sk4"
+   "bm64_bn32_bk32_w8_s5_g4_sk4",
+   "bm64_bn32_bk64_w8_s3_g4_sk4"
   ],
   "364x11780x8": [
    "bm32_bn128_bk16_w4_s4_g4_sk1",
@@ -256,22 +331,27 @@
   ],
   "369x17x12": [
    "bm32_bn32_bk16_w4_s3_g4_sk1",
+   "bm32_bn32_bk16_w4_s4_g8_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn32_bk16_w4_s4_g8_sk1",
    "bm64_bn64_bk16_w4_s3_g8_sk1"
   ],
   "378x147x306": [
+   "bm16_bn64_bk64_w4_s4_g16_sk1",
+   "bm32_bn32_bk128_w4_s4_g1_sk1",
    "bm32_bn32_bk128_w4_s5_g8_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn64_bk64_w4_s3_g8_sk2"
   ],
   "37x922x10110": [
+   "bm16_bn32_bk32_w2_s5_g1_sk8",
    "bm32_bn32_bk128_w4_s5_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm32_bn64_bk128_w4_s3_g8_sk4",
    "bm32_bn64_bk32_w4_s4_g1_sk8"
   ],
   "380x6978x216": [
+   "bm128_bn64_bk32_w4_s3_g4_sk1",
    "bm128_bn64_bk32_w4_s4_g16_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk32_w4_s4_g8_sk1",
@@ -281,30 +361,39 @@
    "bm32_bn128_bk32_w8_s5_g8_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk64_w4_s3_g8_sk1",
+   "bm64_bn64_bk32_w8_s2_g4_sk1",
    "bm64_bn64_bk32_w8_s3_g4_sk1"
   ],
   "384x2176x1024": [
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk32_w4_s4_g8_sk1",
    "bm64_bn64_bk16_w2_s4_g1_sk1",
-   "bm64_bn64_bk32_w4_s3_g1_sk1"
+   "bm64_bn64_bk32_w4_s3_g16_sk1",
+   "bm64_bn64_bk32_w4_s3_g1_sk1",
+   "bm64_bn64_bk32_w4_s3_g8_sk1"
   ],
   "384x2176x4096": [
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk32_w4_s4_g4_sk1",
    "bm64_bn128_bk32_w4_s4_g8_sk1",
-   "bm64_bn64_bk32_w4_s3_g8_sk2"
+   "bm64_bn64_bk32_w4_s3_g16_sk1",
+   "bm64_bn64_bk32_w4_s3_g8_sk2",
+   "bm64_bn64_bk64_w8_s3_g1_sk1"
   ],
   "384x2x10369": [
+   "bm16_bn32_bk64_w2_s2_g1_sk16",
    "bm32_bn32_bk128_w4_s2_g1_sk2",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn32_bk64_w4_s3_g16_sk8",
    "bm64_bn32_bk128_w4_s3_g8_sk16",
    "bm64_bn32_bk64_w8_s3_g1_sk16"
   ],
   "3x1449x5884": [
    "bm16_bn128_bk64_w4_s3_g1_sk8",
+   "bm16_bn32_bk32_w2_s5_g1_sk8",
    "bm16_bn64_bk128_w4_s2_g1_sk4",
    "bm16_bn64_bk128_w4_s4_g1_sk1",
+   "bm16_bn64_bk64_w4_s4_g1_sk8",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "3x2x5": [
@@ -316,6 +405,7 @@
   "4065x8842x28": [
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk16_w4_s3_g1_sk1",
+   "bm64_bn128_bk16_w4_s5_g16_sk1",
    "bm64_bn128_bk16_w4_s5_g8_sk1",
    "bm64_bn128_bk32_w4_s4_g8_sk1"
   ],
@@ -323,9 +413,12 @@
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm32_bn64_bk16_w2_s4_g8_sk8",
    "bm64_bn128_bk64_w4_s3_g8_sk4",
+   "bm64_bn64_bk32_w4_s3_g1_sk4",
    "bm64_bn64_bk32_w4_s4_g8_sk4"
   ],
   "426x273x53": [
+   "bm16_bn64_bk64_w4_s5_g1_sk1",
+   "bm32_bn32_bk128_w4_s2_g16_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm32_bn64_bk32_w4_s2_g16_sk1",
    "bm32_bn64_bk32_w4_s5_g4_sk1",
@@ -335,9 +428,11 @@
    "bm16_bn64_bk64_w4_s4_g4_sk1",
    "bm32_bn128_bk32_w4_s4_g8_sk1",
    "bm32_bn32_bk16_w4_s4_g1_sk1",
-   "bm32_bn32_bk32_w4_s5_g1_sk1"
+   "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn64_bk64_w8_s4_g1_sk1"
   ],
   "443x4723x393": [
+   "bm128_bn64_bk32_w4_s3_g4_sk1",
    "bm128_bn64_bk32_w4_s4_g16_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk32_w4_s4_g8_sk1",
@@ -346,12 +441,16 @@
   "448x1088x1024": [
    "bm128_bn64_bk32_w8_s4_g8_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn64_bk16_w4_s3_g1_sk1",
+   "bm64_bn128_bk32_w8_s3_g8_sk1",
    "bm64_bn128_bk64_w4_s3_g8_sk2",
    "bm64_bn64_bk32_w4_s3_g1_sk1"
   ],
   "448x1088x4096": [
    "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm64_bn128_bk32_w8_s3_g1_sk1",
    "bm64_bn128_bk64_w4_s3_g8_sk2",
+   "bm64_bn128_bk64_w8_s3_g1_sk1",
    "bm64_bn64_bk32_w4_s3_g8_sk2",
    "bm64_bn64_bk64_w4_s4_g1_sk1"
   ],
@@ -362,12 +461,14 @@
    "bm64_bn128_bk64_w4_s2_g16_sk1"
   ],
   "490x3576x46": [
+   "bm32_bn128_bk16_w4_s4_g4_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk32_w4_s4_g8_sk1",
    "bm64_bn64_bk16_w4_s2_g4_sk1",
    "bm64_bn64_bk16_w4_s4_g4_sk1"
   ],
   "49x59x920": [
+   "bm16_bn32_bk16_w2_s5_g1_sk8",
    "bm16_bn32_bk64_w2_s2_g16_sk8",
    "bm32_bn32_bk16_w4_s5_g1_sk8",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
@@ -376,12 +477,15 @@
   "4x2x10": [
    "bm16_bn32_bk16_w2_s2_g1_sk1",
    "bm16_bn32_bk16_w2_s4_g1_sk1",
+   "bm16_bn32_bk32_w2_s2_g1_sk1",
    "bm16_bn32_bk32_w2_s4_g1_sk1",
+   "bm16_bn32_bk32_w2_s5_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "4x4096x11008": [
    "bm16_bn128_bk32_w4_s5_g1_sk1",
    "bm16_bn128_bk64_w4_s3_g1_sk4",
+   "bm16_bn128_bk64_w8_s5_g1_sk1",
    "bm16_bn64_bk128_w4_s4_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
@@ -392,9 +496,11 @@
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "4x889x14165": [
+   "bm16_bn32_bk64_w2_s5_g1_sk8",
    "bm16_bn64_bk128_w4_s2_g1_sk4",
    "bm16_bn64_bk128_w4_s3_g1_sk8",
    "bm16_bn64_bk128_w4_s4_g1_sk1",
+   "bm16_bn64_bk64_w4_s4_g1_sk8",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "512x4096x11008": [
@@ -404,6 +510,8 @@
    "bm64_bn128_bk32_w4_s4_g8_sk1"
   ],
   "51x324x5709": [
+   "bm16_bn32_bk128_w2_s2_g1_sk8",
+   "bm16_bn64_bk64_w4_s2_g1_sk8",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm32_bn32_bk64_w4_s5_g16_sk4",
    "bm32_bn64_bk128_w4_s3_g8_sk8",
@@ -413,10 +521,12 @@
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk16_w4_s5_g8_sk1",
    "bm64_bn64_bk32_w4_s4_g8_sk1",
+   "bm64_bn64_bk32_w8_s3_g16_sk1",
    "bm64_bn64_bk32_w8_s3_g4_sk1"
   ],
   "590x24x2": [
    "bm16_bn32_bk16_w2_s5_g4_sk1",
+   "bm32_bn32_bk16_w4_s3_g4_sk1",
    "bm32_bn32_bk16_w4_s4_g16_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn32_bk16_w4_s4_g8_sk1"
@@ -427,8 +537,10 @@
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "5x4624x2297": [
+   "bm16_bn128_bk32_w4_s4_g1_sk1",
    "bm16_bn128_bk32_w8_s3_g1_sk4",
    "bm16_bn128_bk64_w4_s3_g1_sk2",
+   "bm16_bn128_bk64_w8_s4_g1_sk1",
    "bm16_bn64_bk128_w4_s3_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
@@ -436,6 +548,7 @@
    "bm16_bn128_bk32_w4_s4_g1_sk1",
    "bm16_bn128_bk32_w8_s5_g1_sk1",
    "bm16_bn32_bk32_w2_s3_g1_sk1",
+   "bm16_bn64_bk16_w4_s3_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "6189x3339x7": [
@@ -447,6 +560,7 @@
   "64x4096x11008": [
    "bm32_bn128_bk32_w4_s5_g1_sk1",
    "bm32_bn128_bk64_w4_s3_g8_sk2",
+   "bm32_bn128_bk64_w4_s4_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk16_w4_s4_g1_sk4"
   ],
@@ -454,16 +568,20 @@
    "bm32_bn128_bk32_w4_s3_g8_sk2",
    "bm32_bn128_bk32_w4_s4_g8_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn64_bk16_w4_s2_g1_sk2",
+   "bm64_bn128_bk16_w4_s2_g16_sk4",
    "bm64_bn128_bk32_w4_s4_g8_sk1"
   ],
   "6x58x1": [
    "bm16_bn64_bk16_w4_s4_g1_sk1",
+   "bm16_bn64_bk16_w4_s5_g1_sk1",
    "bm16_bn64_bk32_w4_s5_g1_sk1",
    "bm32_bn32_bk16_w4_s2_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "7039x1x93": [
    "bm16_bn32_bk32_w2_s5_g16_sk1",
+   "bm32_bn32_bk32_w4_s3_g8_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn32_bk32_w4_s4_g8_sk1",
    "bm64_bn32_bk32_w8_s4_g4_sk1"
@@ -472,6 +590,7 @@
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm32_bn64_bk32_w4_s2_g16_sk1",
    "bm32_bn64_bk32_w4_s3_g16_sk1",
+   "bm32_bn64_bk32_w4_s3_g4_sk1",
    "bm64_bn64_bk32_w4_s4_g8_sk1"
   ],
   "757x39x2": [
@@ -483,11 +602,14 @@
   "79x15624x2135": [
    "bm32_bn256_bk16_w4_s4_g16_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn64_bk16_w4_s3_g1_sk2",
    "bm64_bn128_bk32_w4_s4_g8_sk1",
+   "bm64_bn128_bk32_w4_s5_g1_sk1",
    "bm64_bn64_bk16_w4_s4_g1_sk1"
   ],
   "8192x4096x11008": [
    "bm128_bn128_bk16_w4_s2_g4_sk1",
+   "bm128_bn128_bk16_w8_s3_g4_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1",
    "bm64_bn128_bk32_w4_s4_g8_sk1",
    "bm64_bn128_bk32_w4_s5_g8_sk1"
@@ -496,6 +618,7 @@
    "bm16_bn128_bk32_w4_s4_g1_sk1",
    "bm16_bn128_bk64_w4_s3_g1_sk4",
    "bm16_bn64_bk128_w4_s3_g1_sk1",
+   "bm16_bn64_bk128_w4_s4_g1_sk1",
    "bm32_bn32_bk32_w4_s5_g1_sk1"
   ],
   "8x4096x11008": [
@@ -505,15 +628,18 @@
   ],
   "93x2101x22": [
    "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm32_bn64_bk16_w8_s5_g1_sk1",
    "bm32_bn64_bk32_w4_s4_g4_sk1",
    "bm32_bn64_bk64_w8_s3_g8_sk1",
    "bm64_bn128_bk32_w4_s4_g8_sk1"
   ],
   "9475x1686x12": [
    "bm32_bn32_bk32_w4_s5_g1_sk1",
+   "bm64_bn128_bk16_w4_s3_g1_sk1",
    "bm64_bn128_bk16_w4_s4_g8_sk1",
    "bm64_bn128_bk16_w4_s5_g8_sk1",
-   "bm64_bn64_bk16_w4_s4_g4_sk1"
+   "bm64_bn64_bk16_w4_s4_g4_sk1",
+   "bm64_bn64_bk32_w4_s2_g8_sk1"
   ]
  },
  "by_selector": {
@@ -868,6 +994,182 @@
    "8x4096x11008": "bm16_bn128_bk64_w4_s3_g1_sk4",
    "93x2101x22": "bm64_bn128_bk32_w4_s4_g8_sk1",
    "9475x1686x12": "bm64_bn128_bk16_w4_s4_g8_sk1"
+  },
+  "nn1f": {
+   "105x6x9": "bm16_bn32_bk16_w2_s5_g4_sk1",
+   "11x14054x2380": "bm32_bn64_bk16_w4_s2_g1_sk2",
+   "12094x232x3": "bm64_bn32_bk16_w4_s2_g1_sk1",
+   "124x28x26": "bm16_bn32_bk32_w2_s5_g1_sk1",
+   "128x4096x11008": "bm128_bn128_bk32_w8_s3_g1_sk2",
+   "12937x577x4649": "bm64_bn128_bk64_w4_s3_g16_sk1",
+   "12x56x836": "bm16_bn32_bk64_w2_s2_g1_sk8",
+   "12x629x18": "bm16_bn32_bk32_w2_s3_g1_sk1",
+   "1316x272x100": "bm32_bn64_bk32_w4_s2_g16_sk1",
+   "14244x16x1257": "bm64_bn32_bk32_w4_s2_g4_sk1",
+   "15x1001x5": "bm16_bn128_bk16_w8_s3_g1_sk1",
+   "15x1x356": "bm32_bn32_bk16_w4_s2_g1_sk8",
+   "15x3363x2632": "bm32_bn32_bk128_w4_s4_g1_sk1",
+   "16x4096x11008": "bm16_bn64_bk128_w4_s3_g1_sk1",
+   "16x79x103": "bm32_bn32_bk16_w4_s5_g1_sk4",
+   "1836x15x2": "bm16_bn32_bk16_w2_s5_g1_sk1",
+   "191x4625x29": "bm32_bn64_bk64_w8_s3_g8_sk1",
+   "19x380x184": "bm16_bn64_bk64_w4_s2_g16_sk1",
+   "1x4096x11008": "bm16_bn128_bk64_w8_s5_g1_sk1",
+   "1x709x521": "bm16_bn64_bk32_w4_s2_g1_sk8",
+   "2048x4096x11008": "bm64_bn64_bk32_w4_s4_g8_sk1",
+   "20x1x11869": "bm16_bn32_bk128_w2_s5_g1_sk16",
+   "2125x1x1": "bm16_bn32_bk16_w2_s5_g1_sk1",
+   "226x2141x1139": "bm128_bn64_bk32_w4_s2_g16_sk1",
+   "232x3389x2": "bm32_bn64_bk16_w4_s2_g8_sk1",
+   "277x3x161": "bm32_bn32_bk128_w4_s5_g8_sk1",
+   "27x715x3003": "bm16_bn32_bk128_w2_s2_g1_sk8",
+   "28x3030x4012": "bm16_bn128_bk32_w8_s3_g1_sk4",
+   "2954x1x2031": "bm32_bn32_bk64_w4_s3_g4_sk2",
+   "2x1373x3759": "bm16_bn64_bk64_w4_s4_g1_sk8",
+   "2x4096x11008": "bm16_bn128_bk64_w8_s5_g1_sk1",
+   "2x8901x9643": "bm16_bn128_bk32_w8_s3_g1_sk4",
+   "3186x1x2": "bm16_bn32_bk16_w2_s5_g1_sk1",
+   "320x1x79": "bm16_bn32_bk64_w2_s3_g1_sk1",
+   "32x4096x11008": "bm16_bn128_bk64_w4_s4_g8_sk1",
+   "335x42x96": "bm16_bn64_bk64_w4_s5_g1_sk1",
+   "33x190x18": "bm16_bn32_bk32_w2_s5_g1_sk1",
+   "3402x796x408": "bm128_bn64_bk32_w4_s2_g4_sk1",
+   "342x88x6772": "bm64_bn64_bk32_w4_s5_g8_sk8",
+   "3433x4x111": "bm16_bn32_bk32_w2_s5_g16_sk1",
+   "3522x1x647": "bm32_bn32_bk64_w4_s3_g4_sk2",
+   "364x11780x8": "bm32_bn128_bk16_w4_s4_g4_sk1",
+   "369x17x12": "bm64_bn64_bk16_w4_s3_g8_sk1",
+   "378x147x306": "bm16_bn64_bk64_w4_s4_g16_sk1",
+   "37x922x10110": "bm16_bn32_bk32_w2_s5_g1_sk8",
+   "380x6978x216": "bm128_bn64_bk32_w4_s4_g16_sk1",
+   "381x1401x250": "bm32_bn128_bk32_w8_s5_g8_sk1",
+   "384x2176x1024": "bm64_bn64_bk32_w4_s3_g16_sk1",
+   "384x2176x4096": "bm64_bn64_bk32_w4_s3_g16_sk1",
+   "384x2x10369": "bm16_bn32_bk64_w2_s2_g1_sk16",
+   "3x1449x5884": "bm16_bn64_bk64_w4_s4_g1_sk8",
+   "3x2x5": "bm16_bn32_bk16_w2_s2_g1_sk1",
+   "4065x8842x28": "bm64_bn128_bk16_w4_s3_g1_sk1",
+   "417x512x6739": "bm64_bn64_bk32_w4_s3_g1_sk4",
+   "426x273x53": "bm16_bn64_bk64_w4_s5_g1_sk1",
+   "42x3567x37": "bm16_bn64_bk64_w4_s4_g4_sk1",
+   "443x4723x393": "bm128_bn64_bk32_w4_s4_g16_sk1",
+   "448x1088x1024": "bm32_bn64_bk16_w4_s3_g1_sk1",
+   "448x1088x4096": "bm64_bn128_bk32_w8_s3_g1_sk1",
+   "4809x2130x7527": "bm64_bn128_bk64_w4_s2_g16_sk1",
+   "490x3576x46": "bm64_bn64_bk16_w4_s4_g4_sk1",
+   "49x59x920": "bm16_bn32_bk64_w2_s2_g16_sk8",
+   "4x2x10": "bm16_bn32_bk32_w2_s2_g1_sk1",
+   "4x4096x11008": "bm16_bn64_bk128_w4_s4_g1_sk1",
+   "4x59x4": "bm16_bn64_bk32_w4_s5_g1_sk1",
+   "4x889x14165": "bm16_bn64_bk64_w4_s4_g1_sk8",
+   "512x4096x11008": "bm64_bn128_bk16_w2_s5_g4_sk1",
+   "51x324x5709": "bm16_bn32_bk128_w2_s2_g1_sk8",
+   "5398x196x774": "bm64_bn128_bk16_w4_s5_g8_sk1",
+   "590x24x2": "bm16_bn32_bk16_w2_s5_g4_sk1",
+   "5x252x1176": "bm16_bn64_bk64_w4_s2_g1_sk8",
+   "5x4624x2297": "bm16_bn128_bk32_w4_s4_g1_sk1",
+   "5x9730x30": "bm16_bn128_bk32_w8_s5_g1_sk1",
+   "6189x3339x7": "bm32_bn128_bk16_w4_s2_g4_sk1",
+   "64x4096x11008": "bm32_bn128_bk32_w4_s5_g1_sk1",
+   "68x6420x10359": "bm64_bn128_bk16_w4_s2_g16_sk4",
+   "6x58x1": "bm16_bn64_bk16_w4_s5_g1_sk1",
+   "7039x1x93": "bm16_bn32_bk32_w2_s5_g16_sk1",
+   "727x233x63": "bm32_bn64_bk32_w4_s2_g16_sk1",
+   "757x39x2": "bm16_bn32_bk16_w2_s5_g4_sk1",
+   "79x15624x2135": "bm64_bn128_bk32_w4_s5_g1_sk1",
+   "8192x4096x11008": "bm64_bn128_bk32_w4_s5_g8_sk1",
+   "8x3568x3004": "bm16_bn128_bk32_w4_s4_g1_sk1",
+   "8x4096x11008": "bm16_bn128_bk64_w4_s5_g1_sk1",
+   "93x2101x22": "bm32_bn64_bk64_w8_s3_g8_sk1",
+   "9475x1686x12": "bm64_bn64_bk32_w4_s2_g8_sk1"
+  },
+  "knnf": {
+   "105x6x9": "bm16_bn32_bk16_w2_s2_g1_sk1",
+   "11x14054x2380": "bm32_bn64_bk32_w8_s3_g1_sk1",
+   "12094x232x3": "bm32_bn64_bk16_w4_s4_g4_sk1",
+   "124x28x26": "bm16_bn32_bk32_w2_s3_g1_sk1",
+   "128x4096x11008": "bm64_bn64_bk32_w4_s3_g8_sk2",
+   "12937x577x4649": "bm128_bn64_bk32_w4_s2_g4_sk1",
+   "12x56x836": "bm16_bn64_bk64_w4_s3_g1_sk8",
+   "12x629x18": "bm16_bn32_bk32_w2_s3_g1_sk1",
+   "1316x272x100": "bm64_bn64_bk32_w8_s2_g4_sk1",
+   "14244x16x1257": "bm32_bn32_bk64_w4_s5_g1_sk1",
+   "15x1001x5": "bm16_bn32_bk32_w2_s3_g1_sk1",
+   "15x1x356": "bm16_bn32_bk32_w2_s4_g1_sk8",
+   "15x3363x2632": "bm32_bn64_bk64_w4_s4_g1_sk2",
+   "16x4096x11008": "bm16_bn64_bk128_w4_s2_g1_sk1",
+   "16x79x103": "bm16_bn64_bk64_w4_s5_g1_sk1",
+   "1836x15x2": "bm16_bn32_bk16_w2_s2_g8_sk1",
+   "191x4625x29": "bm32_bn128_bk32_w8_s5_g8_sk1",
+   "19x380x184": "bm16_bn64_bk64_w4_s3_g1_sk1",
+   "1x4096x11008": "bm16_bn128_bk64_w8_s5_g1_sk1",
+   "1x709x521": "bm16_bn64_bk64_w4_s2_g1_sk8",
+   "2048x4096x11008": "bm64_bn128_bk16_w4_s5_g16_sk1",
+   "20x1x11869": "bm16_bn32_bk128_w2_s5_g1_sk16",
+   "2125x1x1": "bm16_bn32_bk16_w2_s5_g16_sk1",
+   "226x2141x1139": "bm64_bn64_bk32_w8_s3_g4_sk1",
+   "232x3389x2": "bm32_bn64_bk16_w2_s5_g1_sk1",
+   "277x3x161": "bm16_bn32_bk64_w2_s2_g8_sk1",
+   "27x715x3003": "bm16_bn64_bk64_w4_s3_g1_sk8",
+   "28x3030x4012": "bm32_bn64_bk64_w4_s4_g1_sk2",
+   "2954x1x2031": "bm64_bn32_bk64_w8_s3_g4_sk4",
+   "2x1373x3759": "bm16_bn32_bk32_w2_s5_g1_sk8",
+   "2x4096x11008": "bm16_bn128_bk64_w8_s3_g1_sk1",
+   "2x8901x9643": "bm16_bn128_bk32_w8_s3_g1_sk4",
+   "3186x1x2": "bm16_bn32_bk16_w2_s5_g16_sk1",
+   "320x1x79": "bm16_bn32_bk32_w2_s3_g16_sk1",
+   "32x4096x11008": "bm32_bn128_bk64_w4_s4_g1_sk1",
+   "335x42x96": "bm16_bn32_bk64_w2_s4_g16_sk1",
+   "33x190x18": "bm16_bn32_bk32_w2_s5_g1_sk1",
+   "3402x796x408": "bm128_bn64_bk32_w4_s2_g4_sk1",
+   "342x88x6772": "bm64_bn32_bk64_w8_s5_g8_sk8",
+   "3433x4x111": "bm32_bn32_bk64_w4_s4_g1_sk1",
+   "3522x1x647": "bm64_bn32_bk64_w8_s3_g4_sk4",
+   "364x11780x8": "bm32_bn128_bk16_w4_s5_g1_sk1",
+   "369x17x12": "bm32_bn32_bk16_w4_s4_g8_sk1",
+   "378x147x306": "bm32_bn32_bk128_w4_s4_g1_sk1",
+   "37x922x10110": "bm32_bn64_bk32_w4_s4_g1_sk8",
+   "380x6978x216": "bm128_bn64_bk32_w4_s3_g4_sk1",
+   "381x1401x250": "bm64_bn64_bk32_w8_s2_g4_sk1",
+   "384x2176x1024": "bm64_bn64_bk32_w4_s3_g8_sk1",
+   "384x2176x4096": "bm64_bn64_bk64_w8_s3_g1_sk1",
+   "384x2x10369": "bm32_bn32_bk64_w4_s3_g16_sk8",
+   "3x1449x5884": "bm16_bn32_bk32_w2_s5_g1_sk8",
+   "3x2x5": "bm32_bn32_bk16_w4_s2_g1_sk1",
+   "4065x8842x28": "bm64_bn128_bk16_w4_s5_g16_sk1",
+   "417x512x6739": "bm64_bn64_bk32_w4_s3_g1_sk4",
+   "426x273x53": "bm32_bn32_bk128_w4_s2_g16_sk1",
+   "42x3567x37": "bm32_bn64_bk64_w8_s4_g1_sk1",
+   "443x4723x393": "bm128_bn64_bk32_w4_s3_g4_sk1",
+   "448x1088x1024": "bm64_bn128_bk32_w8_s3_g8_sk1",
+   "448x1088x4096": "bm64_bn128_bk64_w8_s3_g1_sk1",
+   "4809x2130x7527": "bm64_bn128_bk64_w4_s2_g16_sk1",
+   "490x3576x46": "bm32_bn128_bk16_w4_s4_g4_sk1",
+   "49x59x920": "bm16_bn32_bk16_w2_s5_g1_sk8",
+   "4x2x10": "bm16_bn32_bk32_w2_s5_g1_sk1",
+   "4x4096x11008": "bm16_bn128_bk64_w8_s5_g1_sk1",
+   "4x59x4": "bm16_bn32_bk32_w2_s3_g1_sk1",
+   "4x889x14165": "bm16_bn32_bk64_w2_s5_g1_sk8",
+   "512x4096x11008": "bm64_bn128_bk16_w4_s4_g8_sk1",
+   "51x324x5709": "bm16_bn64_bk64_w4_s2_g1_sk8",
+   "5398x196x774": "bm64_bn64_bk32_w8_s3_g16_sk1",
+   "590x24x2": "bm32_bn32_bk16_w4_s3_g4_sk1",
+   "5x252x1176": "bm16_bn64_bk64_w4_s2_g1_sk8",
+   "5x4624x2297": "bm16_bn128_bk64_w8_s4_g1_sk1",
+   "5x9730x30": "bm16_bn64_bk16_w4_s3_g1_sk1",
+   "6189x3339x7": "bm64_bn128_bk16_w4_s3_g1_sk1",
+   "64x4096x11008": "bm32_bn128_bk64_w4_s4_g1_sk1",
+   "68x6420x10359": "bm32_bn64_bk16_w4_s2_g1_sk2",
+   "6x58x1": "bm32_bn32_bk16_w4_s2_g1_sk1",
+   "7039x1x93": "bm32_bn32_bk32_w4_s3_g8_sk1",
+   "727x233x63": "bm32_bn64_bk32_w4_s3_g4_sk1",
+   "757x39x2": "bm32_bn32_bk16_w4_s4_g16_sk1",
+   "79x15624x2135": "bm32_bn64_bk16_w4_s3_g1_sk2",
+   "8192x4096x11008": "bm128_bn128_bk16_w8_s3_g4_sk1",
+   "8x3568x3004": "bm16_bn64_bk128_w4_s4_g1_sk1",
+   "8x4096x11008": "bm16_bn128_bk64_w4_s5_g1_sk1",
+   "93x2101x22": "bm32_bn64_bk16_w8_s5_g1_sk1",
+   "9475x1686x12": "bm64_bn128_bk16_w4_s3_g1_sk1"
   }
  }
 }

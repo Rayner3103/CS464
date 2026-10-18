@@ -4,6 +4,55 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-19: selector baselines rebuilt with GPU-fill and alignment features
+
+**What changed.** The k-NN distance now uses derived shape features beyond (log2 M, log2 N, log2 K). The groups are built in `shape_features` and weighted in `embed`:
+- **fill:** for 6 reference tiles (16×64 … 128×128), log2(CTAs / 68 SMs) and wave efficiency, which is CTAs / (waves × SMs) and is low when the last wave is nearly empty.
+  It also includes log2 of the K steps per split if a 64×64 grid were split to fill the SMs.
+- **align:** whether M, N and K are divisible by 16 and by 8.
+
+The group weights and k come from a grid of 120 settings, scored only on the tune shapes with **grouped leave-one-out**: a tune shape may not use any neighbour that shares two
+of M, N, K with it. Plain leave-one-out let S2's M sweeps over one layer act as near-copies of each other. The best setting gives **knnf** (fill 1.5, align 0.5,
+k = 3), and the best k = 1 setting gives **nn1f** (fill 0.5, align 0.5). Both were fixed before any held-out shape was scored. The four earlier selectors and their picks are unchanged.
+I chose the feature groups after seeing the 2026-10-18 held-out misses, which were split-K and wave choices, but no weight or k was fit on held-out data.
+
+**Re-measured** in two new sessions with the same protocol as 2026-10-18, so all six selectors share each session's oracle and B3+:
+- `bench-20261018-235334-lock1755-selectors2`: cold, 86 shapes, 2,459 rows, 0 invalid.
+- `-selectors2-graph`: graph-amortized, 56 shapes under 50 µs, 1,625 rows, 0 invalid.
+
+5.0% and 4.4% of rows hit the power cap. Rows record `harness_dirty: true` because the feature code was uncommitted.
+Tables: [`selector_baselines.md`](selector_baselines.md).
+
+**Regret vs the per-shape Triton oracle, median / p95 (mean):**
+
+| selector | held-out screen | stage 2 cold, all 86 | cold, ≥ 50 µs (30) | graph, < 50 µs (56) | tune, grouped LOO |
+|---|---|---|---|---|---|
+| nn1 | 5.4% / 132% (30.7%) | 3.8% / 129% (29.0%) | 1.5% / 194% | 9.3% / 113% (26.5%) | 4.9% / 53% |
+| **nn1f** | 4.5% / 40% (10.2%) | 3.5% / **40%** (8.8%) | 1.5% / 40% | 8.2% / 41% (13.0%) | 2.9% / 30% |
+| knn5 | 4.7% / 25.4% (10.8%) | 2.9% / 23.7% (9.4%) | 3.7% / 65% | **3.5% / 20.9%** (6.5%) | 2.8% / 29% |
+| **knnf** | **4.1%** / 27.3% (**7.8%**) | **2.7% / 22.9% (6.4%)** | **1.9% / 37%** | 3.8% / 26.7% (7.3%) | 2.1% / 22.5% |
+| rule | 10.3% / 40.5% | 7.4% / 37.1% (13.2%) | 4.7% / 37% | 12.9% / 58.7% (18.4%) | 7.5% / 44% |
+
+**Against B3+, median t_B3+ / t_pick:** at ≥ 50 µs (cold), the Triton oracle is 0.964, knnf **0.922**, nn1f 0.927, knn5 0.896 and rule 0.879. Below 50 µs (graph), the oracle is 1.018,
+knn5 0.975 and knnf 0.952.
+
+- **The features fix 1-NN's catastrophic misses.** Its p95 drops from 129% to 40% (cold) and from 113% to 41% (graph). 14244×16×1257 goes from +466% to +46%, and 2×8901×9643 from +95%
+  to +9%.
+- **For k-NN they help on the larger kernels and not below 50 µs.** At ≥ 50 µs, knnf halves the median (3.7% → 1.9%) and the p95 tail (65% → 37%), and moves from 0.896 to
+  0.922 of B3+. The two motivating shapes are fixed: 2×8901×9643 goes from +95% to +9% and 28×3030×4012 from +272% to +17%, both now with split-K picks. Below 50 µs knnf is
+  slightly worse than knn5 (graph p95 26.7% vs 20.9%, mean 7.3% vs 6.5%). Across all 86 shapes it is a modest gain: mean 9.4% → 6.4%, p95 23.7% → 22.9%.
+- **The tail is not closed.** p95 is still about 23% overall. The worst ≥ 50 µs shapes for knnf are now different ones: 68×6420×10359 +46% (knn5 +29%), 79×15624×2135 +40% and
+  443×4723×393 +32%. These features stop the selector from transferring a config that is wrong for the target's grid, but they do not make it find the winner. With only
+  shape-level features, every neighbour vote still ranks whole configs.
+- **No selector differentiates from B3+ at ≥ 50 µs**, and the oracle itself cannot (0.964). That is unchanged.
+
+**The bar for a learned selector** is now knnf on large kernels (cold ≥ 50 µs: median 1.9%, p95 37%) and knn5 on small ones (graph: median 3.5%, p95 21%), with an
+overall p95 of about 23% and mean of about 6%. The next step is unchanged: per-candidate features (the fill and K-step features computed for each candidate's own tile and split,
+not for fixed reference tiles), so a model can score configs rather than vote between neighbours' winners.
+
+Reproduce: the commands at the end of the 2026-10-18 section with `--out-name results_lock1755_selectors2[_graph].jsonl`; `python -m tune selectors`
+now scores those files by default (pass `--results results_lock1755_selectors.jsonl --graph-results results_lock1755_selectors_graph.jsonl` for the first run).
+
 ## Update 2026-10-18: trivial selector baselines on held-out shapes (plan 8.1 item 7)
 
 **What ran.** Three selectors, each mapping (M, N, K) to one Triton config. All were fit only on the 477-shape tune screen and scored on the 86 held-out shapes

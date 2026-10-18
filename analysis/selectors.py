@@ -7,6 +7,12 @@ Each selector maps (M, N, K) to one config of the Triton family. All are fit on 
   * nn1    - nearest tune shape in (log2 M, log2 N, log2 K), Euclidean; take that shape's fastest config.
   * knn5   - the 5 nearest tune shapes; take the config with the lowest mean log regret over them.
   * rule   - a hand-written rule (`rule_config`): tile from M and N, split-K to fill the SMs, warps from the tile.
+  * nn1f / knnf - nn1 / k-NN on (log2 M, log2 N, log2 K) plus derived features (`shape_features`): how a few reference
+             tiles fill the SMs (CTA count, wave tail), K steps left per split, and 8/16-alignment of each dim. Group
+             weights and k are chosen on the tune shapes only, by grouped leave-one-out (`fit_features`).
+
+Leave-one-out on the tune shapes is grouped: a tune shape is never its own neighbour, nor is any tune shape sharing two
+of (M, N, K) with it (S2's M sweeps over one layer would otherwise be near-copies), so in-sample numbers mimic novel shapes.
 
 A selector only proposes configs that pass the static and shape pruning rules for the target shape (the same rules
 the screen used), so a pick is always runnable; a neighbour's best config that is pruned on the target is skipped.
@@ -14,9 +20,9 @@ the screen used), so a pick is always runnable; a neighbour's best config that i
 Scoring:
   * screen   - regret vs the held-out screen oracle (best of the full pruned space), as in analysis/portfolio.py.
   * stage 2  - one cold session that re-times, per held-out shape, the screen's top-8 tiles, every selector pick, B1,
-               B3 and B3+ (`results_lock1755_selectors.jsonl`). Regret vs the fastest Triton row; speedup vs B3+.
+               B3 and B3+ (`results_lock1755_selectors2.jsonl`). Regret vs the fastest Triton row; speedup vs B3+.
   * graph    - the same backends, hot, CUDA-graph amortized, on the held-out shapes whose screen oracle is under
-               50 us (the methodology's protocol below the event tick; `results_lock1755_selectors_graph.jsonl`).
+               50 us (the methodology's protocol below the event tick; `results_lock1755_selectors2_graph.jsonl`).
 """
 from __future__ import annotations
 
@@ -28,7 +34,9 @@ import numpy as np
 
 from analysis.portfolio import REGRET_CAP, SMALL_US, _split_info, _stats, align, load_screen, regret_matrix
 
-SELECTORS = ("b6", "nn1", "knn5", "rule")
+SELECTORS = ("b6", "nn1", "knn5", "rule", "nn1f", "knnf")
+FILL_TILES = ((16, 64), (16, 128), (32, 64), (64, 64), (64, 128), (128, 128))
+FEATURE_GRID = {"fill": (0, 0.5, 1, 1.5, 2, 3), "align": (0, 0.25, 0.5, 1), "k": (1, 3, 5, 7, 10)}
 LT_FAMILIES = ("cublaslt", "cublaslt_deep")
 
 
@@ -48,21 +56,64 @@ def features(shapes: list[dict]) -> np.ndarray:
     return np.log2(np.array([[s["M"], s["N"], s["K"]] for s in shapes], float))
 
 
+def shape_features(shapes: list[dict], sm_count: int) -> dict[str, np.ndarray]:
+    """Feature groups per shape. dims: log2 of M, N, K. fill: for each FILL_TILES tile, log2(CTAs / SMs) and the wave
+    efficiency CTAs / (waves * SMs) (low = a nearly empty last wave), plus log2 of the K steps (of 64) left per split
+    if a 64x64 grid were split to fill the SMs. align: M, N, K divisible by 16 and by 8."""
+    a = np.array([[s["M"], s["N"], s["K"]] for s in shapes], float)
+    M, N, K = a.T
+    fill = []
+    for bm, bn in FILL_TILES:
+        ctas = np.ceil(M / bm) * np.ceil(N / bn)
+        fill += [np.log2(ctas / sm_count), ctas / (np.ceil(ctas / sm_count) * sm_count)]
+    fill.append(np.log2(K / 64) - np.log2(np.maximum(1, sm_count / (np.ceil(M / 64) * np.ceil(N / 64)))))
+    align_ = [x % 16 == 0 for x in (M, N, K)] + [x % 8 == 0 for x in (M, N, K)]
+    return {"dims": np.log2(a), "fill": np.stack(fill, axis=1), "align": np.stack(align_, axis=1).astype(float)}
+
+
+def embed(groups: dict[str, np.ndarray], ref: dict[str, np.ndarray], weights: dict[str, float]) -> np.ndarray:
+    """Z-score each feature on the reference (tune) set; scale each group by weight / sqrt(group size), so a group's
+    weight, not its feature count, sets its share of the distance. dims always has weight 1."""
+    out = []
+    for g, w in {"dims": 1.0, **weights}.items():
+        if w > 0:
+            mu, sd = ref[g].mean(axis=0), ref[g].std(axis=0)
+            out.append(w * (groups[g] - mu) / np.where(sd > 0, sd, 1) / np.sqrt(groups[g].shape[1]))
+    return np.concatenate(out, axis=1)
+
+
+def share_two_dims(shapes: list[dict], others: list[dict]) -> np.ndarray:
+    """[i, j] True when shapes[i] and others[j] agree on at least two of M, N, K (includes identical shapes)."""
+    a = np.array([[s["M"], s["N"], s["K"]] for s in shapes])
+    b = np.array([[s["M"], s["N"], s["K"]] for s in others])
+    return (a[:, None, :] == b[None, :, :]).sum(axis=2) >= 2
+
+
 def knn_select(X_train: np.ndarray, R_train: np.ndarray, X: np.ndarray, ok: np.ndarray, k: int,
-               exclude_self: bool = False) -> np.ndarray:
+               exclude: np.ndarray | None = None) -> np.ndarray:
     """Per target row of X, the column with the lowest mean log regret over its k nearest training shapes, among the
     columns marked runnable in ok[target]. k = 1 is plain nearest neighbour (the neighbour's fastest runnable config).
-    exclude_self: X is X_train itself (leave-one-out)."""
+    exclude[i, j]: training shape j may not be a neighbour of target i (leave-one-out)."""
     logR = np.log(np.minimum(R_train, REGRET_CAP))
     D = ((X[:, None, :] - X_train[None, :, :]) ** 2).sum(axis=2)
-    if exclude_self:
-        np.fill_diagonal(D, np.inf)
-    out = np.empty(len(X), int)
-    for i in range(len(X)):
-        nb = np.argsort(D[i], kind="stable")[:k]
-        score = np.where(ok[i], logR[nb].mean(axis=0), np.inf)
-        out[i] = int(score.argmin())
-    return out
+    if exclude is not None:
+        D = np.where(exclude, np.inf, D)
+    nb = np.argsort(D, axis=1, kind="stable")[:, :k]
+    return np.where(ok, logR[nb].mean(axis=1), np.inf).argmin(axis=1)
+
+
+def fit_features(F: dict[str, np.ndarray], R: np.ndarray, ok: np.ndarray, exclude: np.ndarray,
+                 grid: dict = FEATURE_GRID) -> list[dict]:
+    """Grouped leave-one-out over the weight / k grid on the tune shapes. Returns every grid point with its in-sample
+    regret stats, best (lowest capped mean regret) first."""
+    import itertools
+    out = []
+    for wf, wa, k in itertools.product(grid["fill"], grid["align"], grid["k"]):
+        w = {"fill": wf, "align": wa}
+        X = embed(F, F, w)
+        r = R[np.arange(len(R)), knn_select(X, R, X, ok, k, exclude)]
+        out.append({"weights": w, "k": k, **_stats(r)})
+    return sorted(out, key=lambda g: g["mean"])
 
 
 def rule_config(M: int, N: int, K: int, hw):
@@ -123,6 +174,10 @@ def picks(data: Path, knn_ks=(1, 3, 5, 10)) -> dict:
     ok_held = np.array([[runnable(c, s["M"], s["N"], s["K"], hw) for c in cfgs] for s in hshapes])
     b6 = int(np.log(np.minimum(R, REGRET_CAP)).mean(axis=0).argmin())
     X, Xh = features(shapes), features(hshapes)
+    loo = share_two_dims(shapes, shapes)
+    F, Fh = shape_features(shapes, hw.sm_count), shape_features(hshapes, hw.sm_count)
+    grid = fit_features(F, R, ok_tune, loo)
+    fits = {"knnf": grid[0], "nn1f": next(g for g in grid if g["k"] == 1)}
     col = {k: j for j, k in enumerate(keys)}
 
     def rule_cols(ss):
@@ -138,10 +193,14 @@ def picks(data: Path, knn_ks=(1, 3, 5, 10)) -> dict:
     held = {"b6": np.full(len(hshapes), b6), "rule": rule_cols(hshapes)}
     for k in knn_ks:
         name = "nn1" if k == 1 else f"knn{k}"
-        tune[name] = knn_select(X, R, X, ok_tune, k, exclude_self=True)
+        tune[name] = knn_select(X, R, X, ok_tune, k, loo)
         held[name] = knn_select(X, R, Xh, ok_held, k)
+    for name, g in fits.items():
+        Xf, Xfh = embed(F, F, g["weights"]), embed(Fh, F, g["weights"])
+        tune[name] = knn_select(Xf, R, Xf, ok_tune, g["k"], loo)
+        held[name] = knn_select(Xf, R, Xfh, ok_held, g["k"])
     return {"keys": keys, "shapes": shapes, "T": T, "hshapes": hshapes, "hkeys": hkeys, "hT": hT,
-            "tune": tune, "held": held, "b6": keys[b6]}
+            "tune": tune, "held": held, "b6": keys[b6], "fits": fits, "grid": grid}
 
 
 def _rows(path: Path) -> list[dict]:
@@ -184,8 +243,8 @@ def _vs_bar(t: np.ndarray, bar: np.ndarray) -> dict:
             "ahead_gt5": int((x > 1.05).sum()), "within2": int((abs(x - 1) <= 0.02).sum()), "behind_gt5": int((x < 1 / 1.05).sum())}
 
 
-def build(data: Path, report: Path, results: str = "results_lock1755_selectors.jsonl",
-          graph_results: str = "results_lock1755_selectors_graph.jsonl") -> tuple[Path, dict]:
+def build(data: Path, report: Path, results: str = "results_lock1755_selectors2.jsonl",
+          graph_results: str = "results_lock1755_selectors2_graph.jsonl") -> tuple[Path, dict]:
     P = picks(data)
     keys, shapes, T, hshapes = P["keys"], P["shapes"], P["T"], P["hshapes"]
     R = regret_matrix(T)
@@ -197,7 +256,7 @@ def build(data: Path, report: Path, results: str = "results_lock1755_selectors.j
     held_keys = {n: [keys[j] for j in P["held"][n]] for n in names}
     pk = {f"{s['M']}x{s['N']}x{s['K']}": sorted({held_keys[n][i] for n in SELECTORS}) for i, s in enumerate(hshapes)}
     (data / "selector_picks.json").write_text(json.dumps(
-        {"selectors": list(SELECTORS), "picks": pk,
+        {"selectors": list(SELECTORS), "feature_fits": P["fits"], "picks": pk,
          "by_selector": {n: {f"{s['M']}x{s['N']}x{s['K']}": held_keys[n][i] for i, s in enumerate(hshapes)}
                          for n in SELECTORS}}, indent=1))
 
@@ -220,27 +279,44 @@ def build(data: Path, report: Path, results: str = "results_lock1755_selectors.j
 
     summary = {"n_tune_shapes": len(shapes), "n_heldout_shapes": len(hshapes), "b6": P["b6"],
                "heldout_split_counts": {g: int(m.sum()) for g, m in groups.items()},
-               "in_sample_loo": in_sample, "screen": screen, "exact_oracle_pick_rate": agree}
+               "in_sample_grouped_loo": in_sample, "screen": screen, "exact_oracle_pick_rate": agree,
+               "feature_fits": P["fits"], "feature_grid_top": P["grid"][:10]}
 
     pct = lambda x: f"{100 * x:.1f}%"
     md = ["# Trivial selector baselines on held-out shapes (auto-generated)\n",
           f"Selectors are fit on the tune-split screen ({len(shapes)} shapes x {len(keys)} configs) and scored on "
           f"{len(hshapes)} held-out shapes (" + ", ".join(f"{g} {int(m.sum())}" for g, m in groups.items() if g != "all")
-          + "). Features for the neighbour selectors: (log2 M, log2 N, log2 K), Euclidean. Every pick passes the "
+          + "). Features: (log2 M, log2 N, log2 K), Euclidean, for nn1 / knn*; the same plus SM-fill and alignment groups "
+          "(`shape_features`) for nn1f / knnf. Every pick passes the "
           "pruning rules for its target shape. `b6` = best single config on the tune screen "
           f"(`{P['b6']}`); `rule` = `analysis.selectors.rule_config`. Regret = t / oracle - 1.\n",
           "## Screen: regret vs the held-out per-shape best (full pruned space)\n",
-          "| selector | in-sample (tune, LOO) median / p95 | " + " | ".join(f"held-out {g} median / p95" for g in groups)
+          "| selector | in-sample (tune, grouped LOO) median / p95 | " + " | ".join(f"held-out {g} median / p95" for g in groups)
           + " | held-out mean | picks the oracle |", "|---|---|" + "---|" * len(groups) + "---|---|"]
     for n in names:
         md.append(f"| {n} | {pct(in_sample[n]['p50'])} / {pct(in_sample[n]['p95'])} | "
                   + " | ".join(f"{pct(screen[n][g]['p50'])} / {pct(screen[n][g]['p95'])}" for g in groups)
                   + f" | {pct(screen[n]['all']['mean'])} | {pct(agree[n])} |")
-    md.append("\nIn-sample uses leave-one-out for the neighbour selectors; the rule was written looking at these tune "
+    md.append("\nIn-sample uses grouped leave-one-out for the neighbour selectors (no tune shape sharing two of M, N, K "
+              "with the target is a neighbour); the rule was written looking at these tune "
               "shapes, so its in-sample number is optimistic. For reference, the tune-fitted 48-config greedy portfolio's "
               "held-out screen p95 is in `sweep_portfolio_heldout.md` (an oracle over 48 configs, not a selector).\n")
+    fdesc = lambda g: f"fill weight {g['weights']['fill']}, align weight {g['weights']['align']}, k = {g['k']}"
+    md.append("## Feature fit (tune shapes only)\n")
+    md.append(f"Grid: fill weight {FEATURE_GRID['fill']}, align weight {FEATURE_GRID['align']}, k {FEATURE_GRID['k']} "
+              "(dims weight 1). Chosen by the lowest capped mean regret under grouped leave-one-out on the tune shapes, "
+              f"before scoring any held-out shape. **knnf: {fdesc(P['fits']['knnf'])}. nn1f: {fdesc(P['fits']['nn1f'])}.**\n")
+    md.append("| fill | align | k | in-sample mean | median | p95 |")
+    md.append("|---|---|---|---|---|---|")
+    for g in P["grid"][:8]:
+        md.append(f"| {g['weights']['fill']} | {g['weights']['align']} | {g['k']} | {pct(g['mean'])} | {pct(g['p50'])} | "
+                  f"{pct(g['p95'])} |")
+    base = [g for g in P["grid"] if g["weights"] == {"fill": 0, "align": 0} and g["k"] in (1, 5)]
+    for g in sorted(base, key=lambda g: g["k"]):
+        md.append(f"| 0 | 0 | {g['k']} | {pct(g['mean'])} | {pct(g['p50'])} | {pct(g['p95'])} |")
+    md.append("\nThe last rows are the dims-only baselines (nn1, knn5) for comparison.\n")
     worst = {}
-    for n in ("nn1", "knn5", "rule"):
+    for n in ("nn1", "knn5", "rule", "knnf"):
         r = Rh[rows_i, P["held"][n]]
         worst[n] = [{"shape": f"{hshapes[i]['M']}x{hshapes[i]['N']}x{hshapes[i]['K']}", "split": hshapes[i]["split"],
                      "oracle_us": float(oracle_h[i]), "pick": keys[P["held"][n][i]], "regret": float(r[i] - 1)}
