@@ -10,6 +10,12 @@ Each selector maps (M, N, K) to one config of the Triton family. All are fit on 
   * nn1f / knnf - nn1 / k-NN on (log2 M, log2 N, log2 K) plus derived features (`shape_features`): how a few reference
              tiles fill the SMs (CTA count, wave tail), K steps left per split, and 8/16-alignment of each dim. Group
              weights and k are chosen on the tune shapes only, by grouped leave-one-out (`fit_features`).
+  * knnc   - per-candidate k-NN (`knnc_select`): the same fill and split features computed for each candidate's own
+             tile and split (`candidate_features`: waves at that config's residency, last-wave efficiency, K steps per
+             split, M x N and K padding, EVEN_K) plus log2 M, N, K. Each runnable config is scored by its own regret on
+             the k tune shapes where it saw the most similar conditions, so it can pick a config that was no
+             neighbour's winner. dims weight and k are fit by grouped leave-one-out (`fit_candidate`, cached in
+             data/<hw>/selector_knnc_fit.json because the fit takes minutes).
 
 Leave-one-out on the tune shapes is grouped: a tune shape is never its own neighbour, nor is any tune shape sharing two
 of (M, N, K) with it (S2's M sweeps over one layer would otherwise be near-copies), so in-sample numbers mimic novel shapes.
@@ -20,12 +26,13 @@ the screen used), so a pick is always runnable; a neighbour's best config that i
 Scoring:
   * screen   - regret vs the held-out screen oracle (best of the full pruned space), as in analysis/portfolio.py.
   * stage 2  - one cold session that re-times, per held-out shape, the screen's top-8 tiles, every selector pick, B1,
-               B3 and B3+ (`results_lock1755_selectors2.jsonl`). Regret vs the fastest Triton row; speedup vs B3+.
+               B3 and B3+ (`results_lock1755_selectors3.jsonl`). Regret vs the fastest Triton row; speedup vs B3+.
   * graph    - the same backends, hot, CUDA-graph amortized, on the held-out shapes whose screen oracle is under
-               50 us (the methodology's protocol below the event tick; `results_lock1755_selectors2_graph.jsonl`).
+               50 us (the methodology's protocol below the event tick; `results_lock1755_selectors3_graph.jsonl`).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -34,7 +41,7 @@ import numpy as np
 
 from analysis.portfolio import REGRET_CAP, SMALL_US, _split_info, _stats, align, load_screen, regret_matrix
 
-SELECTORS = ("b6", "nn1", "knn5", "rule", "nn1f", "knnf")
+SELECTORS = ("b6", "nn1", "knn5", "rule", "nn1f", "knnf", "knnc")
 FILL_TILES = ((16, 64), (16, 128), (32, 64), (64, 64), (64, 128), (128, 128))
 FEATURE_GRID = {"fill": (0, 0.5, 1, 1.5, 2, 3), "align": (0, 0.25, 0.5, 1), "k": (1, 3, 5, 7, 10)}
 LT_FAMILIES = ("cublaslt", "cublaslt_deep")
@@ -116,6 +123,84 @@ def fit_features(F: dict[str, np.ndarray], R: np.ndarray, ok: np.ndarray, exclud
     return sorted(out, key=lambda g: g["mean"])
 
 
+CAND_FEATURES = ("log2_waves", "wave_eff", "log2_ksteps", "log2_pad_mn", "log2_pad_k", "even_k")
+CAND_GRID = {"dims": (0, 0.25, 0.5, 1), "k": (3, 5, 10, 20)}
+
+
+def candidate_features(shapes: list[dict], cfgs: list, gpu: dict) -> np.ndarray:
+    """[shape, config, feature] for each candidate's own tile and split (CAND_FEATURES, then log2 M, N, K):
+    waves = CTAs x SPLIT_K / (SMs x resident CTAs per SM), with residency bounded by shared memory (same smem estimate
+    as the pruning rules), threads per SM and 16 CTAs per SM; wave_eff = the grid's share of its last full wave
+    (low = a nearly empty last wave); K steps (of BLOCK_K) per split; M x N padded to whole tiles over M x N; K padded
+    to whole BLOCK_K x SPLIT_K steps over K; whether the EVEN_K specialization applies."""
+    a = np.array([[s["M"], s["N"], s["K"]] for s in shapes], float)
+    M, N, K = (x[:, None] for x in a.T)
+    c = np.array([[x.BLOCK_M, x.BLOCK_N, x.BLOCK_K, x.num_warps, x.num_stages, x.SPLIT_K] for x in cfgs], float)
+    bm, bn, bk, warps, stages, sk = (x[None, :] for x in c.T)
+    smem = stages * (bm * bk + bk * bn) * 2
+    resident = np.maximum(1, np.minimum.reduce([gpu["smem_per_sm_bytes"] // smem,
+                                                gpu["max_threads_per_sm"] // (32 * warps), np.full_like(smem, 16)]))
+    tm, tn = np.ceil(M / bm), np.ceil(N / bn)
+    ctas = tm * tn * sk
+    cap = gpu["sm_count"] * resident
+    ksteps = np.ceil(K / (sk * bk))
+    feats = [np.log2(ctas / cap), ctas / (np.ceil(ctas / cap) * cap), np.log2(ksteps),
+             np.log2(tm * bm * tn * bn / (M * N)), np.log2(ksteps * sk * bk / K), (K % (bk * sk) == 0).astype(float)]
+    S, C = len(shapes), len(cfgs)
+    feats += [np.broadcast_to(np.log2(x), (S, C)) for x in (M, N, K)]
+    return np.stack(feats, axis=2).astype(np.float32)
+
+
+def cand_scale(Fc: np.ndarray, timed: np.ndarray, dims_weight: float) -> tuple[np.ndarray, np.ndarray]:
+    """Per-feature (mean, multiplier) from the timed tune cells: z-score, then dims scaled by dims_weight /
+    sqrt(3) and the candidate group by 1 / sqrt(its size), so dims_weight is the dims group's share of the distance."""
+    x = Fc[timed]
+    mu, sd = x.mean(axis=0), x.std(axis=0)
+    nc = len(CAND_FEATURES)
+    w = np.r_[np.full(nc, 1 / np.sqrt(nc)), np.full(3, dims_weight / np.sqrt(3))]
+    return mu, w / np.where(sd > 0, sd, 1)
+
+
+def knnc_select(Fc_train: np.ndarray, R_train: np.ndarray, Fc: np.ndarray, ok: np.ndarray, ks: tuple[int, ...],
+                scale: tuple[np.ndarray, np.ndarray], exclude: np.ndarray | None = None) -> np.ndarray:
+    """Per-candidate k-NN. For each target shape and each runnable config c, predict log regret as the mean over the k
+    tune shapes where c was timed and c's own features (candidate_features) are closest to c's features on the target;
+    pick the config with the lowest prediction. Unlike knn_select, a config wins on its own record, not by being some
+    neighbour's winner. exclude[i, j]: tune shape j may not be used for target i. Returns [len(ks), targets]: the
+    distances are computed once per target and shared by every k."""
+    mu, w = scale
+    timed = np.isfinite(R_train)
+    logR = np.log(np.minimum(R_train, REGRET_CAP)).astype(np.float32)
+    Zt = (Fc_train - mu) * w
+    out = np.empty((len(ks), len(Fc)), int)
+    for i in range(len(Fc)):
+        cols = np.flatnonzero(ok[i])
+        D = (((Zt[:, cols] - (Fc[i, cols] - mu) * w) ** 2).sum(axis=2))  # [tune shape, candidate]
+        D[~timed[:, cols]] = np.inf
+        if exclude is not None:
+            D[exclude[i]] = np.inf
+        order = np.argsort(D, axis=0, kind="stable")[:max(ks)]
+        lr = np.where(np.isfinite(np.take_along_axis(D, order, axis=0)),
+                      np.take_along_axis(logR[:, cols], order, axis=0), np.log(REGRET_CAP))
+        csum = np.cumsum(lr, axis=0)
+        for j, k in enumerate(ks):
+            out[j, i] = cols[int(csum[k - 1].argmin())]  # mean over k neighbours: same argmin as the sum
+    return out
+
+
+def fit_candidate(Fc: np.ndarray, R: np.ndarray, ok: np.ndarray, exclude: np.ndarray,
+                  grid: dict = CAND_GRID) -> list[dict]:
+    """Grouped leave-one-out over dims weight x k on the tune shapes, best (lowest capped mean regret) first. Each
+    entry keeps its leave-one-out picks (config column per tune shape) for the in-sample report."""
+    timed = np.isfinite(R)
+    out = []
+    for wd in grid["dims"]:
+        P = knnc_select(Fc, R, Fc, ok, grid["k"], cand_scale(Fc, timed, wd), exclude)
+        for j, k in enumerate(grid["k"]):
+            out.append({"dims_weight": wd, "k": k, **_stats(R[np.arange(len(R)), P[j]]), "picks": P[j].tolist()})
+    return sorted(out, key=lambda g: g["mean"])
+
+
 def rule_config(M: int, N: int, K: int, hw):
     """Hand-written rule. Written by looking at the tune-split oracle configs (never the held-out ones), then frozen.
 
@@ -178,6 +263,17 @@ def picks(data: Path, knn_ks=(1, 3, 5, 10)) -> dict:
     F, Fh = shape_features(shapes, hw.sm_count), shape_features(hshapes, hw.sm_count)
     grid = fit_features(F, R, ok_tune, loo)
     fits = {"knnf": grid[0], "nn1f": next(g for g in grid if g["k"] == 1)}
+    gpu = json.loads((Path(data) / "env.json").read_text())["gpu"]
+    Fc, Fch = candidate_features(shapes, cfgs, gpu), candidate_features(hshapes, cfgs, gpu)
+    tag = hashlib.sha1(json.dumps([keys, [(s["M"], s["N"], s["K"]) for s in shapes], CAND_FEATURES, CAND_GRID,
+                                   gpu["sm_count"]]).encode()).hexdigest()
+    cache = Path(data) / "selector_knnc_fit.json"
+    cdoc = json.loads(cache.read_text()) if cache.exists() else {}
+    if cdoc.get("tag") != tag:
+        cdoc = {"tag": tag, "grid": fit_candidate(Fc, R, ok_tune, loo)}
+        cache.write_text(json.dumps(cdoc))
+    cgrid = cdoc["grid"]
+    fits["knnc"] = {k: v for k, v in cgrid[0].items() if k != "picks"}
     col = {k: j for j, k in enumerate(keys)}
 
     def rule_cols(ss):
@@ -195,12 +291,15 @@ def picks(data: Path, knn_ks=(1, 3, 5, 10)) -> dict:
         name = "nn1" if k == 1 else f"knn{k}"
         tune[name] = knn_select(X, R, X, ok_tune, k, loo)
         held[name] = knn_select(X, R, Xh, ok_held, k)
-    for name, g in fits.items():
+    tune["knnc"] = np.array(cgrid[0]["picks"])
+    held["knnc"] = knnc_select(Fc, R, Fch, ok_held, (cgrid[0]["k"],), cand_scale(Fc, np.isfinite(R), cgrid[0]["dims_weight"]))[0]
+    for name, g in ((n, g) for n, g in fits.items() if n != "knnc"):
         Xf, Xfh = embed(F, F, g["weights"]), embed(Fh, F, g["weights"])
         tune[name] = knn_select(Xf, R, Xf, ok_tune, g["k"], loo)
         held[name] = knn_select(Xf, R, Xfh, ok_held, g["k"])
     return {"keys": keys, "shapes": shapes, "T": T, "hshapes": hshapes, "hkeys": hkeys, "hT": hT,
-            "tune": tune, "held": held, "b6": keys[b6], "fits": fits, "grid": grid}
+            "tune": tune, "held": held, "b6": keys[b6], "fits": fits, "grid": grid,
+            "cgrid": [{k: v for k, v in g.items() if k != "picks"} for g in cgrid]}
 
 
 def _rows(path: Path) -> list[dict]:
@@ -243,8 +342,8 @@ def _vs_bar(t: np.ndarray, bar: np.ndarray) -> dict:
             "ahead_gt5": int((x > 1.05).sum()), "within2": int((abs(x - 1) <= 0.02).sum()), "behind_gt5": int((x < 1 / 1.05).sum())}
 
 
-def build(data: Path, report: Path, results: str = "results_lock1755_selectors2.jsonl",
-          graph_results: str = "results_lock1755_selectors2_graph.jsonl") -> tuple[Path, dict]:
+def build(data: Path, report: Path, results: str = "results_lock1755_selectors3.jsonl",
+          graph_results: str = "results_lock1755_selectors3_graph.jsonl") -> tuple[Path, dict]:
     P = picks(data)
     keys, shapes, T, hshapes = P["keys"], P["shapes"], P["T"], P["hshapes"]
     R = regret_matrix(T)
@@ -280,7 +379,7 @@ def build(data: Path, report: Path, results: str = "results_lock1755_selectors2.
     summary = {"n_tune_shapes": len(shapes), "n_heldout_shapes": len(hshapes), "b6": P["b6"],
                "heldout_split_counts": {g: int(m.sum()) for g, m in groups.items()},
                "in_sample_grouped_loo": in_sample, "screen": screen, "exact_oracle_pick_rate": agree,
-               "feature_fits": P["fits"], "feature_grid_top": P["grid"][:10]}
+               "feature_fits": P["fits"], "feature_grid_top": P["grid"][:10], "candidate_grid": P["cgrid"]}
 
     pct = lambda x: f"{100 * x:.1f}%"
     md = ["# Trivial selector baselines on held-out shapes (auto-generated)\n",
@@ -315,8 +414,17 @@ def build(data: Path, report: Path, results: str = "results_lock1755_selectors2.
     for g in sorted(base, key=lambda g: g["k"]):
         md.append(f"| 0 | 0 | {g['k']} | {pct(g['mean'])} | {pct(g['p50'])} | {pct(g['p95'])} |")
     md.append("\nThe last rows are the dims-only baselines (nn1, knn5) for comparison.\n")
+    cf = P["fits"]["knnc"]
+    md.append(f"Per-candidate k-NN (knnc), grid dims weight {CAND_GRID['dims']} x k {CAND_GRID['k']} (candidate features "
+              f"{', '.join(CAND_FEATURES)} share weight 1), same selection rule. **knnc: dims weight {cf['dims_weight']}, "
+              f"k = {cf['k']}.**\n")
+    md.append("| dims weight | k | in-sample mean | median | p95 |")
+    md.append("|---|---|---|---|---|")
+    for g in P["cgrid"]:
+        md.append(f"| {g['dims_weight']} | {g['k']} | {pct(g['mean'])} | {pct(g['p50'])} | {pct(g['p95'])} |")
+    md.append("")
     worst = {}
-    for n in ("nn1", "knn5", "rule", "knnf"):
+    for n in ("nn1", "knn5", "rule", "knnf", "knnc"):
         r = Rh[rows_i, P["held"][n]]
         worst[n] = [{"shape": f"{hshapes[i]['M']}x{hshapes[i]['N']}x{hshapes[i]['K']}", "split": hshapes[i]["split"],
                      "oracle_us": float(oracle_h[i]), "pick": keys[P["held"][n][i]], "regret": float(r[i] - 1)}

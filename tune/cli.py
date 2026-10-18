@@ -247,8 +247,8 @@ def main(argv=None):
     p.set_defaults(fn=cmd_selectors)
     p.add_argument("--data", type=Path, default=None)
     p.add_argument("--report", type=Path, default=Path("reports"))
-    p.add_argument("--results", default="results_lock1755_selectors2.jsonl", help="cold stage-2 file under --data")
-    p.add_argument("--graph-results", default="results_lock1755_selectors2_graph.jsonl",
+    p.add_argument("--results", default="results_lock1755_selectors3.jsonl", help="cold stage-2 file under --data")
+    p.add_argument("--graph-results", default="results_lock1755_selectors3_graph.jsonl",
                    help="graph-amortized stage-2 file under --data (< 50 us shapes)")
 
     args = ap.parse_args(argv)
