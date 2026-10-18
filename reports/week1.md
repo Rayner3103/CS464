@@ -4,6 +4,53 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-19 (later): per-candidate fill and split features (knnc) do not beat knnf
+
+**What changed.** `candidate_features` computes the fill and split features for **each candidate's own tile and split** rather than for fixed
+reference tiles. For every (shape, config) it has:
+- **waves:** CTAs × SPLIT_K / (68 SMs × resident CTAs per SM), with residency set by shared memory, threads and the 16-CTA limit.
+- **last-wave efficiency**, **K steps per split**, **M × N padding** to whole tiles, **K padding** to whole BLOCK_K × SPLIT_K steps, and **EVEN_K**.
+- **log2 M, N, K** as shape context.
+
+The new selector **knnc** scores every runnable config on the target. A config's score is its own mean log regret on the k tune shapes where that config saw
+the closest conditions, so it can pick a config that was no neighbour's winner. The dims weight and k were fit on tune shapes only, by grouped leave-one-out over
+16 settings: dims weight 0.5, k = 10. In-sample that gives mean 6.6%, median 2.5% and p95 25.6%, against knnf's 5.9%, 2.1% and 22.5%. The fit takes about 6 min and is cached in
+`data/<hw>/selector_knnc_fit.json` (snapshot without picks in `reports/snapshot/lock1755/`).
+
+**Re-measured** with all seven selectors in fresh sessions on a clean harness (commit `5424930`, `harness_dirty: false`):
+- `bench-20261019-003241-lock1755-selectors3`: cold, 86 shapes, 2,526 rows, 0 invalid, 3.4% power-capped.
+- `-selectors3-graph`: 56 shapes under 50 µs, 1,670 rows, 0 invalid, 6.1% power-capped.
+
+Tables: [`selector_baselines.md`](selector_baselines.md).
+
+**Regret vs the per-shape Triton oracle, median / p95 (mean):**
+
+| selector | held-out screen | stage 2 cold, all 86 | cold, ≥ 50 µs (30) | graph, < 50 µs (56) |
+|---|---|---|---|---|
+| knn5 | 4.7% / 25.4% (10.8%) | 2.7% / 22.6% (9.5%) | 3.9% / 65.4% | **3.7% / 22.3%** (**6.7%**) |
+| **knnf** | **4.1% / 27.3% (7.8%)** | **1.8% / 22.9% (6.5%)** | **1.9%** / 36.6% | 4.7% / 26.2% (7.3%) |
+| **knnc** | 5.3% / 29.3% (10.7%) | 4.4% / 26.7% (9.2%) | 3.8% / **31.9%** | 7.1% / 36.0% (10.5%) |
+
+Against B3+ (median t_B3+ / t_pick): ≥ 50 µs cold, knnc 0.899, knnf 0.916, knn5 0.894 and oracle 0.964. Under 50 µs graph, knnc 0.940, knnf 0.955 and knn5 0.972.
+
+- **knnc is worse than knnf almost everywhere.** Its median is higher in every column, from 1.3× on the screen to 2.4× in cold stage 2, and below 50 µs it is the worst of the three. The one gain is the ≥ 50 µs tail (p95 31.9%
+  vs 36.6%), which is about one shape out of 30, and it is still well short of the 48-config portfolio oracle (8.9%).
+- **It regresses on the shape that motivated the features.** 2×8901×9643 goes to +120% on the screen. knnc picks `bm16_bn256_bk32_w8_s4_g1_sk1`, whose record on decode shapes with
+  similar waves and K steps is good, but here it is 2.2× slower than the oracle.
+- **The cause is not the size of the candidate set.** I checked two explanations as diagnostics on held-out data; neither was used for fitting:
+  - Restricting knnc to the 48-config portfolio (25 candidates per shape) or to the 284 tune-oracle configs (144 per shape) does not help: screen p95 31% / 38%.
+  - Its picks are not over-optimistic: predicted median regret 6.2% vs actual 5.3%. Only the tail is under-predicted (mean 7.6% predicted vs 10.7% actual).
+  
+  So it is the transfer itself that fails. A config's regret on tune shapes with similar waves, K steps and padding does not predict its regret on a new shape well enough.
+  The ranking among near-equal configs depends on things these features omit, such as memory- vs compute-boundness, L2 reuse and per-warp work.
+- **knnf and knn5 reproduce across sessions.** knnf cold is 1.8% / 22.9% (6.5%) here vs 2.7% / 22.9% (6.4%) on `selectors2`, and knn5 2.7% / 22.6% vs 2.9% / 23.7%. Medians differ by under 1 point
+  and p95 by about 1 point.
+
+**The bar is unchanged:** knnf (cold ≥ 50 µs median 1.9%, p95 37%) and knn5 (graph < 50 µs median 3.7%, p95 22%). The per-candidate features stay in the code as inputs
+for a trained ranking model (next step 1 in `AGENTS.md`), which can weigh them against shape features rather than averaging neighbours. Nearest-neighbour voting over them is not enough.
+
+Reproduce: the 2026-10-18 commands with `--out-name results_lock1755_selectors3[_graph].jsonl`, then `python -m tune selectors`, which scores those files by default.
+
 ## Update 2026-10-19: selector baselines rebuilt with GPU-fill and alignment features
 
 **What changed.** The k-NN distance now uses derived shape features beyond (log2 M, log2 N, log2 K). The groups are built in `shape_features` and weighted in `embed`:

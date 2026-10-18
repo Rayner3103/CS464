@@ -46,7 +46,7 @@ suites/
 analysis/
   report.py          analyze: baseline/noise/drift tables and figures
   portfolio.py       B6 over the full space, greedy portfolio, set cover, parameter importance, held-out G5
-  selectors.py       trivial selectors (b6, nn1, knn5, rule, nn1f, knnf), picks file, held-out scoring
+  selectors.py       trivial selectors (b6, nn1, knn5, rule, nn1f, knnf, knnc), picks file, held-out scoring
   alloc_variance.py  allocation-placement noise experiment
 tests/       pytest unit tests (43 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
@@ -150,8 +150,10 @@ The screen biases the oracle low (winner's curse); stage 2 under-covers it. Repo
   held-out scoring with a learning curve.
 - `selectors`: b6, nn1 / knn5 on (log2 M, log2 N, log2 K), the hand rule `rule_config`, and **nn1f / knnf**, which add GPU-fill
   features (CTA count and wave efficiency for 6 reference tiles, K steps per split) and 8/16-alignment. Weights and k are fit by grouped
-  leave-one-out on tune shapes only (no neighbour sharing two of M, N, K). The selectors are scored against the screen oracle and the stage-2 cold
-  and graph sessions, and against B3+.
+  leave-one-out on tune shapes only (no neighbour sharing two of M, N, K). **knnc** computes the same fill and split features per
+  candidate (`candidate_features`: waves at that config's residency, last-wave efficiency, K steps per split, padding, EVEN_K) and scores
+  each config by its own regret on the k tune shapes where it saw the closest conditions (fit cached in `data/<hw>/selector_knnc_fit.json`,
+  ~6 min to refit). The selectors are scored against the screen oracle and the stage-2 cold and graph sessions, and against B3+.
 
 ## 6. Key results so far (RTX 3080, standard conditions)
 
@@ -170,7 +172,8 @@ Other findings to keep in mind:
 - Parameter importance: SPLIT_K ≫ BLOCK_M > BLOCK_K > BLOCK_N ≫ warps, stages, GROUP_M.
 - Measured roofline: 62.9 TFLOP/s fp16 tensor, 686 GB/s DRAM. Under sustained load the card power-caps (throttle 0x4).
 - **Current selector bar** (held-out): knnf at ≥ 50 µs cold (median 1.9%, p95 37%), knn5 under 50 µs graph (median 3.5%,
-  p95 21%), overall p95 ≈ 23%, mean ≈ 6%. A learned model must beat these with this same harness.
+  p95 21%), overall p95 ≈ 23%, mean ≈ 6%. A learned model must beat these with this same harness. Per-candidate k-NN (knnc) does
+  not: same per-candidate features, worse median (cold 4.4% vs knnf 1.8%); only its ≥ 50 µs tail is a little better (p95 32% vs 37%).
 
 ## 7. Rules for agents
 
@@ -231,19 +234,20 @@ python -m tune selectors       # writes selector_picks.json; then re-time picks:
 TUNE_SWEEP_DIR=$D/sweep_screen_heldout python -m tune --clock-lock 1755 benchmark \
   --shapes-file $D/sweep_screen_heldout/subset.json \
   --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20 --cache-modes cold \
-  --out-name results_lock1755_selectors2.jsonl
+  --out-name results_lock1755_selectors3.jsonl
 TUNE_SWEEP_DIR=$D/sweep_screen_heldout python -m tune --clock-lock 1755 benchmark \
   --shapes-file $D/sweep_screen_heldout/subset_lt50us.json \
   --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20 --cache-modes hot --graph-batch 50 \
-  --out-name results_lock1755_selectors2_graph.jsonl
+  --out-name results_lock1755_selectors3_graph.jsonl
 python -m tune selectors       # re-score with both stage-2 files
 ```
 
 ## 9. Open next steps
 
-1. **Learned selector v0**: rank candidate configs per shape using per-candidate features (CTA count, waves, tail-wave
-   efficiency, K steps per split, padding waste for *that* candidate's tile and split). Evaluate with `triton:picks` +
-   `tune selectors` against knnf/knn5.
+1. **Learned selector v0**: rank candidate configs per shape with a trained model over shape features plus
+   `candidate_features` (already computed per candidate). A nearest-neighbour vote over these features (knnc) is not enough:
+   similar per-candidate conditions on tune shapes do not predict a config's regret on a new shape. Evaluate with
+   `triton:picks` + `tune selectors` against knnf/knn5.
 2. **Top-k + short online search**: time the model's top 3–5 at first use to close the tail.
 3. **Joint {Triton ∪ cuBLASLt} selection**, especially under 50 µs where the families split the wins.
 4. Noise study for graph-amortized mode (second session plus a reboot) before relying on tiny-GEMM wins.
