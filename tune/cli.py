@@ -161,6 +161,14 @@ def cmd_selectors(args):
           + ", ".join(f"{n} {100 * v['all']['p95']:.1f}%" for n, v in s["screen"].items()) + f" -> {out}")
 
 
+def cmd_learned(args):
+    from analysis.learned import build
+    out, s = build(args.data, args.report, results=args.results, graph_results=args.graph_results)
+    print(f"{s['n_heldout_shapes']} held-out shapes; held-out screen median / p95 regret: "
+          + ", ".join(f"{n} {100 * v['all']['p50']:.1f}% / {100 * v['all']['p95']:.1f}%" for n, v in s["screen"].items())
+          + f" -> {out}")
+
+
 def cmd_analyze(args):
     from analysis.report import build_reports
     build_reports(args.data, args.report, args.results)
@@ -251,10 +259,19 @@ def main(argv=None):
     p.add_argument("--graph-results", default="results_lock1755_selectors3_graph.jsonl",
                    help="graph-amortized stage-2 file under --data (< 50 us shapes)")
 
+    p = sub.add_parser("learned", help="learned selectors v0 (decision tree, linear SVM, LightGBM, random forest, logistic "
+                                       "regression; cls and rank forms) on held-out shapes; writes data/<hw>/learned_picks.json")
+    p.set_defaults(fn=cmd_learned)
+    p.add_argument("--data", type=Path, default=None)
+    p.add_argument("--report", type=Path, default=Path("reports"))
+    p.add_argument("--results", default="results_lock1755_learned.jsonl", help="cold stage-2 file under --data")
+    p.add_argument("--graph-results", default="results_lock1755_learned_graph.jsonl",
+                   help="graph-amortized stage-2 file under --data (< 50 us shapes)")
+
     args = ap.parse_args(argv)
     if args.clock_lock is not None:
         os.environ["TUNE_CLOCK_LOCK"] = args.clock_lock
-    if args.cmd in ("analyze", "portfolio", "selectors"):
+    if args.cmd in ("analyze", "portfolio", "selectors", "learned"):
         args.data = args.data or default_data_dir()
     else:
         args.out = args.out or default_data_dir()
