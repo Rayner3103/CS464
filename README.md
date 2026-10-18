@@ -30,6 +30,8 @@ python -m tune drift --minutes 10                    # thermal drift
 python -m tune baseline --suite S1,S2 --which torch,triton_tutorial --cache-modes cold,hot
 python -m tune benchmark --suite S1,S2 --backends triton:handpicked --cache-modes cold,hot --budget 30m
 python -m tune analyze                               # reports/week1_results.md + reports/figures/
+python -m tune portfolio [--heldout]                 # config-space reduction from the sweep screen (G3, G5)
+python -m tune selectors                             # NN / k-NN / hand-rule selector baselines on held-out shapes
 ```
 
 `benchmark` and `baseline` append to `data/<hw_id>/results.jsonl` and can be resumed: re-running skips

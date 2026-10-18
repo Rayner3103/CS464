@@ -154,6 +154,13 @@ def cmd_portfolio(args):
           f"G5 size {s['g5_portfolio_size_p95_lt_5pct']} -> {out}")
 
 
+def cmd_selectors(args):
+    from analysis.selectors import build
+    out, s = build(args.data, args.report, results=args.results, graph_results=args.graph_results)
+    print(f"{s['n_heldout_shapes']} held-out shapes; held-out screen p95 regret: "
+          + ", ".join(f"{n} {100 * v['all']['p95']:.1f}%" for n, v in s["screen"].items()) + f" -> {out}")
+
+
 def cmd_analyze(args):
     from analysis.report import build_reports
     build_reports(args.data, args.report, args.results)
@@ -235,10 +242,19 @@ def main(argv=None):
                    help="stage-2 held-out benchmark file under --data (with --heldout); the portfolio it ran with is "
                         "read from <stem>.portfolio.json beside it if present")
 
+    p = sub.add_parser("selectors", help="trivial selector baselines (NN, k-NN, hand rule) on held-out shapes; also "
+                                         "writes data/<hw>/selector_picks.json for the triton:picks backend")
+    p.set_defaults(fn=cmd_selectors)
+    p.add_argument("--data", type=Path, default=None)
+    p.add_argument("--report", type=Path, default=Path("reports"))
+    p.add_argument("--results", default="results_lock1755_selectors.jsonl", help="cold stage-2 file under --data")
+    p.add_argument("--graph-results", default="results_lock1755_selectors_graph.jsonl",
+                   help="graph-amortized stage-2 file under --data (< 50 us shapes)")
+
     args = ap.parse_args(argv)
     if args.clock_lock is not None:
         os.environ["TUNE_CLOCK_LOCK"] = args.clock_lock
-    if args.cmd in ("analyze", "portfolio"):
+    if args.cmd in ("analyze", "portfolio", "selectors"):
         args.data = args.data or default_data_dir()
     else:
         args.out = args.out or default_data_dir()

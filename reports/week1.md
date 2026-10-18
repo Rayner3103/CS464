@@ -4,6 +4,83 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-18: trivial selector baselines on held-out shapes (plan 8.1 item 7)
+
+**What ran.** Three selectors, each mapping (M, N, K) to one Triton config. All were fit only on the 477-shape tune screen and scored on the 86 held-out shapes
+(`analysis/selectors.py`, `python -m tune selectors`):
+- **nn1**: the nearest tune shape in (log2 M, log2 N, log2 K), Euclidean distance; use that shape's fastest config.
+- **knn5**: the 5 nearest tune shapes; use the config with the lowest mean log regret over them.
+- **rule**: a hand-written rule (`rule_config`). BLOCK_M follows M and BLOCK_N follows N. Split-K doubles while the grid has fewer CTAs than the 68 SMs.
+  Warps follow the tile. I wrote it while looking only at the tune-split oracle configs (5 iterations), then froze it.
+- **b6** (best single tune config) is included as the floor.
+
+Every pick passes the pruning rules for its target shape, so a neighbour's best config is skipped when it is pruned on the target. The new backend
+`triton:picks` times the picks (`data/<hw>/selector_picks.json`; snapshot in `reports/snapshot/lock1755/selector_picks.json`).
+- **Stage 2, cold:** session `bench-20261018-230423-lock1755-selectors` (10 min, 2,375 rows, 0 invalid). It covered all 86 held-out shapes, each timed over
+  its 8 best screen tiles, every selector pick, B1, B3 (`cublaslt:16`) and B3+ (`cublaslt_deep:20`), all in one session.
+- **Stage 2, graph:** session `bench-20261018-230423-lock1755-selectors-graph` (5 min, 1,567 rows, 0 invalid). It ran the same backends, hot and CUDA-graph
+  amortized (`--graph-batch 50`), on the 56 held-out shapes whose screen oracle is under 50 µs.
+- Both rows record `harness_dirty: true`, because the `triton:picks` backend was not yet committed when they ran; it is committed with this update.
+  3.3% (cold) and 5.1% (graph) of rows hit the power cap, all on the largest shapes in each set.
+
+Tables: [`selector_baselines.md`](selector_baselines.md).
+
+**Regret vs the per-shape Triton oracle, median / p95:**
+
+| selector | held-out screen (full-space oracle) | stage 2 cold, all 86 | stage 2 cold, ≥ 50 µs (29) | stage 2 graph, < 50 µs (56) | in-sample (tune, leave-one-out), screen |
+|---|---|---|---|---|---|
+| b6 | 48.1% / 487% | 48.8% / 484% | 74.8% / 327% | 24.7% / 455% | 68.4% / 343% |
+| nn1 | 5.4% / 132% | 3.6% / 129% | 1.1% / 123% | 9.2% / 116% | 4.1% / 60% |
+| **knn5** | **4.7% / 25.4%** | **2.1% / 23.7%** | 3.1% / 69.0% | **3.6% / 21.7%** | 2.3% / 23.2% |
+| rule | 10.3% / 40.5% | 7.4% / 37.4% | 4.7% / 37.9% | 13.0% / 59.2% | 7.5% / 44.3% |
+
+On the screen, the k-NN neighbourhood size matters for the tail: k = 3 gives p95 43%, k = 5 25%, k = 10 25% (median 5.0–5.4% for all three).
+
+**Against B3+ (t_B3+ / t_pick, > 1 = the pick is faster), median [p10, p90], and shapes ahead by > 5% / behind by > 5%:**
+
+| | cold, ≥ 50 µs (29) | cold, < 50 µs (57) | graph, < 50 µs (56) |
+|---|---|---|---|
+| Triton oracle (top-8 screen tiles + picks) | 0.954 [0.83, 1.02] · 2 / 14 | 1.033 [0.83, 1.16] · 24 / 19 | 1.017 [0.77, 1.18] · 24 / 20 |
+| knn5 | 0.897 [0.64, 1.01] · 2 / 18 | 1.000 [0.74, 1.14] · 20 / 24 | 0.977 [0.65, 1.17] · 20 / 25 |
+| nn1 | 0.920 [0.51, 1.01] · 2 / 18 | 0.952 [0.52, 1.12] · 15 / 29 | 0.898 [0.47, 1.13] · 17 / 33 |
+| rule | 0.877 [0.67, 0.98] · 2 / 18 | 0.940 [0.68, 1.11] · 12 / 32 | 0.880 [0.53, 1.11] · 13 / 35 |
+| b6 | 0.566 [0.27, 0.77] · 0 / 28 | 0.821 [0.22, 1.03] · 3 / 39 | 0.800 [0.22, 1.02] · 0 / 39 |
+
+- **k-NN-5 is the baseline to beat.** It is the best on almost every column, with a held-out median regret of 2–5% and p95 of 22–25%. That is far better than any fixed
+  config (b6 median 48%), but the tail is roughly 3× worse than the 48-config portfolio oracle (8.9% p95, stage 2). A learned selector has to close the gap
+  between "pick 1 of 10,840 from the neighbours" (p95 ≈ 24%) and "best of the 48-portfolio" (≈ 9%).
+- **1-NN has a good median and a bad tail.** It is often exactly right (stage-2 median 1.1% at ≥ 50 µs), but when the neighbour's winner does not transfer it fails badly
+  (14244×16×1257: +469%, 37×922×10110: +135%). Averaging over 5 neighbours fixes most of those. nn1 and knn5 agree on only 7% of shapes.
+- **The hand rule is robust but imprecise.** Its median is 2–4× knn5's. At ≥ 50 µs its tail is better than knn5's (38% vs 69% p95; with 29 shapes, p95 is the
+  2nd-worst shape, so this is one shape's difference), and below 50 µs it is worse. Out-of-sample regret matches in-sample regret (7.5% → 7.4%), so it did not overfit the tune shapes. It also never wins by luck.
+- **The worst misses are split-K and wave-quantization decisions that (log M, log N, log K) cannot express.** 2×8901×9643 (255 µs, +95% for both knn5 and rule)
+  wants `bn64 … sk2`. A BLOCK_N = 128 tile gives 70 CTAs on 68 SMs, which is 2 waves with the second one nearly empty. 28×3030×4012 (+277% for knn5) wants split-K 4,
+  but its neighbours picked split-K 1. 68×6420×10359 wants split-K 4 as well. The obvious next features are the tile and wave counts per candidate tile
+  (ceil(M/BM)·ceil(N/BN) / SMs) and K steps per split.
+- **Against B3+, no trivial selector differentiates at ≥ 50 µs.** Even the Triton oracle is behind (median 0.954, ahead of B3+ by > 5% on 2 of 29), consistent
+  with G4 at ≥ 50 µs on the tune shapes. knn5 loses another ~6% on top (0.897). Below 50 µs, knn5 is at parity with B3+ (cold 1.000, graph 0.977) and ahead on
+  20 of 56 shapes, but B3+ is ahead on just as many.
+
+**Gate implications.** G3 holds out of sample for selection: even the simplest selector recovers most of the per-shape value (knn5 median 2–5% vs b6 48%).
+The selector problem is the tail. The bar for a learned model is set: on held-out shapes it must beat **knn5 at p95 ≈ 24% / median ≈ 2–5% regret**, and to be
+useful against cuBLAS it must pick from {Triton candidates ∪ cuBLASLt configs}, since neither family dominates.
+
+**Next steps.**
+1. Learned selector v0: rank candidate configs per shape, using shape features plus per-tile derived features (CTA count, waves, K steps per split, padding waste).
+   Evaluate it with exactly this harness (`triton:picks` + `python -m tune selectors`) against knn5.
+2. Top-k + short online search: time the selector's top 3–5 at first use. This tests whether the tail closes once the model only has to get the winner into a short list.
+3. Joint {Triton, cuBLASLt} selection at < 50 µs, where the two families split the wins.
+
+```bash
+python -m tune selectors        # writes data/<hw>/selector_picks.json and scores the screen (and stage 2 if present)
+D=data/rtx3080_sm86_68sms_10gb
+TUNE_SWEEP_DIR=$D/sweep_screen_heldout python -m tune --clock-lock 1755 benchmark --shapes-file $D/sweep_screen_heldout/subset.json \
+  --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20 --cache-modes cold --out-name results_lock1755_selectors.jsonl
+TUNE_SWEEP_DIR=$D/sweep_screen_heldout python -m tune --clock-lock 1755 benchmark --shapes-file $D/sweep_screen_heldout/subset_lt50us.json \
+  --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20 --cache-modes hot --graph-batch 50 --out-name results_lock1755_selectors_graph.jsonl
+python -m tune selectors        # re-score with both stage-2 files
+```
+
 ## Update 2026-10-16: 3× more tune shapes does not fix held-out G5; the tail is not a coverage problem
 
 **What ran.** Option 1 from the previous update: build the portfolio from more tune shapes.

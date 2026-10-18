@@ -43,7 +43,9 @@ def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False
 
     triton:sweep[:k] expands to the k fastest configs (default 8) of the stage-1 screen for this shape.
     triton:portfolio[:n] expands to the first n (default 29) members of the tune-fitted greedy portfolio
-    (TUNE_PORTFOLIO, default reports/sweep_portfolio_summary.json). triton:<config_key> takes any config key.
+    (TUNE_PORTFOLIO, default reports/sweep_portfolio_summary.json). triton:picks expands to the selector picks for
+    this shape (TUNE_PICKS, default data/<hw>/selector_picks.json; analysis/selectors.py). triton:<config_key> takes
+    any config key.
 
     cublaslt[:N] expands to cuBLASLt's top-N heuristic candidates for this shape (default 16; it often returns fewer).
     Rank 0 is B2; the per-shape best over all of them is B3.
@@ -92,6 +94,14 @@ def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False
             keys = json.loads(summary.read_text())["portfolio"][:n]
             cfgs = [parse_key(k) for k in keys]
             extra = {k: {"portfolio_rank": i} for i, k in enumerate(keys)}
+        elif which == "picks":
+            # Per-shape configs chosen by the trivial selectors (analysis/selectors.py), fit on the tune screen.
+            from tune.sweep import parse_key
+            doc = json.loads(Path(os.environ["TUNE_PICKS"]).read_text())
+            shape = f"{M}x{N}x{K}"
+            keys = doc["picks"].get(shape, [])
+            cfgs = [parse_key(k) for k in keys]
+            extra = {k: {"picked_by": sorted(n for n, by in doc["by_selector"].items() if by.get(shape) == k)} for k in keys}
         else:
             from tune.sweep import parse_key
             cfgs = [c for c in HANDPICKED.values() if c.key() == which] or [parse_key(which)]
@@ -122,6 +132,7 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
     env = write_env(out_dir, session_id=session_id, kind="benchmark")
     os.environ["TUNE_LT_SEARCH_DIR"] = str(out_dir / "lt_search")  # deep cuBLASLt search cache lives with the run
     os.environ.setdefault("TUNE_SWEEP_DIR", str(out_dir / "sweep_screen"))  # stage-1 Triton screen results
+    os.environ.setdefault("TUNE_PICKS", str(out_dir / "selector_picks.json"))  # trivial selector picks
     results = out_dir / out_name
     inflight = out_dir / "inflight.json"
     done = completed_keys(results)
