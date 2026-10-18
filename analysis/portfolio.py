@@ -322,10 +322,13 @@ def build_heldout(data: Path, report: Path, sizes=(1, 5, 10, 16, 20, 25, 29, 30,
     res = data / results
     if res.exists():
         rows2 = [json.loads(l) for l in res.read_text().splitlines() if l.strip()]
-        used = hdir / "portfolio_summary_used.json"
-        pkeys = json.loads((used if used.exists() else report / "sweep_portfolio_summary.json").read_text())["portfolio"]
+        # The portfolio summary that stage 2 actually ran with: <results stem>.portfolio.json next to the results,
+        # else the first run's copy in the held-out screen dir, else the current summary.
+        used = next((p for p in (data / f"{Path(results).stem}.portfolio.json", hdir / "portfolio_summary_used.json")
+                     if p.exists()), report / "sweep_portfolio_summary.json")
+        pkeys = json.loads(used.read_text())["portfolio"]
         n_meas = max(len({r["config_key"] for r in rows2 if r["config_key"] in pkeys}), 1)
-        s2_sizes = [n for n in (1, 5, 10, 16, 20, 25, 29) if n <= n_meas]
+        s2_sizes = [n for n in (1, 5, 10, 16, 20, 25, 29, 40, 48, 60) if n <= n_meas]
         meta, reg = stage2_regret(rows2, pkeys, s2_sizes)
         small2 = np.array([m["oracle_us"] < SMALL_US for m in meta])
         split_of = {(s["M"], s["N"], s["K"]): s["split"] for s in hshapes}

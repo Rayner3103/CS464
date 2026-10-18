@@ -145,7 +145,7 @@ def cmd_drift(args):
 def cmd_portfolio(args):
     from analysis.portfolio import build, build_heldout
     if args.heldout:
-        out, s = build_heldout(args.data, args.report)
+        out, s = build_heldout(args.data, args.report, results=args.results)
         print(f"{s['n_heldout_shapes']} held-out shapes; G5 size in-sample {s['g5_size_in_sample']}, held-out "
               f"{s['g5_size_heldout_tune_order']} (re-fit {s['g5_size_heldout_refit']}) -> {out}")
         return
@@ -231,6 +231,9 @@ def main(argv=None):
     p.add_argument("--report", type=Path, default=Path("reports"))
     p.add_argument("--heldout", action="store_true",
                    help="score the tune-fitted portfolio on data/<hw>/sweep_screen_heldout (G5 out of sample)")
+    p.add_argument("--results", default="results_lock1755_heldout.jsonl",
+                   help="stage-2 held-out benchmark file under --data (with --heldout); the portfolio it ran with is "
+                        "read from <stem>.portfolio.json beside it if present")
 
     args = ap.parse_args(argv)
     if args.clock_lock is not None:

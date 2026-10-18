@@ -4,6 +4,52 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-16: 3× more tune shapes does not fix held-out G5; the tail is not a coverage problem
+
+**What ran.** Option 1 from the previous update: build the portfolio from more tune shapes.
+- **Tune screen, all eligible shapes:** session `sweep-tune2-20261015-235431-lock1755` (`python -m tune sweep --per-suite 1000`, 4.5 h).
+  It screened every tune-split shape up to 1.2 TFLOP: **477 shapes**, the original 160 (reused from cache) plus 317 new
+  (S7 103, S2 84, S6 66, S3 36, S5 22, S4 6). It used the same space and protocol as before: 2,558,593 cells, 0 invalid, 0 crashes. The subset is in
+  `reports/snapshot/lock1755/sweep_subset_477.json`. The 160-shape summaries are kept as `*_160.json` in that directory.
+- **Stage-2 confirmation:** session `bench-20261016-042636-lock1755-heldout477` (20 min, 5,730 rows, all valid). It re-timed the 86 held-out shapes over
+  each shape's 8 best screen tiles plus the **first 60** members of the new portfolio (`triton:sweep:8,triton:portfolio:60`). The portfolio it ran with
+  is `data/<hw>/results_lock1755_heldout477.portfolio.json`. 6.5% of rows hit the power cap, on 10 shapes, mostly the largest. One of them, 4065×8842×28, is among the worst.
+
+Tables: [`sweep_portfolio.md`](sweep_portfolio.md), [`sweep_portfolio_heldout.md`](sweep_portfolio_heldout.md)
+(`python -m tune portfolio --heldout --results results_lock1755_heldout477.jsonl`).
+
+| p95 regret (mean) | 160-shape portfolio | **477-shape portfolio** |
+|---|---|---|
+| in-sample size for p95 < 5% | 29 | **48** |
+| held-out screen, 29 configs | 17.0% (4.2%) | 13.0% (3.9%) |
+| held-out screen, 60 configs | 10.3% (3.1%) | 11.2% (3.1%) |
+| held-out screen, 100 configs | 9.3% (2.4%) | 11.1% (2.5%) |
+| held-out stage 2, 29 configs | 11.0% (2.2%) | 11.4% (2.4%) |
+| held-out stage 2, 48 configs | – | **8.9% (1.8%)** |
+| held-out stage 2, 60 configs | – | 8.3% (1.5%) |
+
+Stage-2 oracles differ between the two runs: each is the fastest of that run's candidates, and the new run has 60 portfolio members instead of 29. Compare the 29-config rows only roughly.
+
+- **G5 still fails out of sample.** The best stage-2 result is 8.3% p95 with 60 configs. In-sample, 3× the shapes needs a larger portfolio for the same bar (29 → 48 configs).
+  The set cover at ε = 5% grows from 32 to 59 configs.
+- **More tune shapes barely help.** A learning curve on screen data (greedy fit on random tune subsets, mean of 5 seeds; held-out p95 at 29 / 48 / 60 configs)
+  gives 80 shapes: 15.7 / 12.5 / 12.3%, 160: 14.8 / 13.9 / 12.7%, 320: 13.9 / 12.9 / 11.3%, 477: 13.0 / 12.2 / 11.2%. A portfolio fit only on
+  the 127 S7 tune shapes (the same distribution as `heldout_random`) is no better (14.0 / 13.3 / 13.3%).
+- **This rejects the coverage explanation from the previous update.** Allowing *every* config that is the screen oracle on some tune shape (284 distinct configs)
+  still leaves held-out screen p95 at **7.7%**. The configs that win on the tail held-out shapes are not the best config on any tune shape. Only the
+  top-5 union (896 configs) gets to 4.0%. The held-out tail is idiosyncratic: many configs sit within a few % of each other, and which one wins on a given shape
+  does not repeat across neighbouring shapes.
+- **The tail is a handful of shapes.** p95 over 86 shapes is about the 5th-worst shape, and over the 30 shapes ≥ 50 µs it is the 2nd-worst. At 60 configs (stage 2) the
+  worst shapes are 93×2101×22 at +16% (5.3 µs, about one event tick), 417×512×6739 at +15% (`heldout_region`, outside the tuned K range), 37×922×10110 at +10% (region),
+  4065×8842×28 at +9% (power-capped) and 51×324×5709 at +9%. Several sit at the limit of what cold per-launch timing can resolve.
+- **The typical shape is fine.** Mean stage-2 regret is 1.5–1.8% at 48–60 configs.
+
+**Implication for the selector.** Static portfolio coverage plateaus at about 8–9% p95 out of sample whatever the number of tune shapes, so option 1 is closed.
+The remaining levers are at selection time: option 3, a short online search over the top-k predicted configs, or a larger candidate set (hundreds of configs)
+that the selector ranks rather than a fixed portfolio. The top-5 union result says such a candidate set exists; whether a model can rank it well enough is the
+next experiment. G5 as written (a static portfolio of ≤ 50 with p95 < 5%) should be reported as failed
+out of sample, with mean regret under 2%.
+
 ## Update 2026-10-15 (night): held-out G5 check; the 29-config portfolio does not generalize to p95 < 5%
 
 **What ran.** The portfolio, B6 and the set covers were fit only on the 160 tune-split screen shapes. They were then scored on shapes they never saw:
