@@ -897,6 +897,15 @@
    "delta": 0.05,
    "plain": 1
   },
+  "inner_rule": {
+   "group": "tile_split_bk",
+   "delta": 0.05,
+   "plain": 1,
+   "inner": 1,
+   "inner_group": "warps",
+   "inner_delta": 0.02,
+   "inner_pos": "before"
+  },
   "diverse_k": 3
  }
 }

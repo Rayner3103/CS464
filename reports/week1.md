@@ -4,6 +4,56 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-19 (evening): inner variety pass (warps / stages within the top tile) — fixes one shape, otherwise a tie
+
+**What changed.** `diverse_order` gained an optional inner pass. Within the top pick's (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K) group, it adds up to `inner` configs with a new
+num_warps (or warps × stages, or warps × stages × GROUP_M) value, best-scored first and within `inner_delta` of the top pick. The pass runs before or after the outer tile pass.
+**Fit on tune shapes only**, jointly with the outer rule, on the cached out-of-fold scores: 90 inner rules plus the 57 earlier ones, with "no inner pass" as a candidate.
+- Placed after the outer pass, it is a no-op at k = 3, because the outer picks fill the slots. Those rules tie outer-only exactly.
+- The best rule that spends a top-3 slot on it, `{"inner_group": "warps", "inner_delta": 0.02, "inner_pos": "before"}` on the same outer rule, is slightly *worse* at k = 2–3:
+  tune best-of-3 mean 2.84% vs 2.77%, best-of-2 3.49% vs 3.43%. It is marginally better at k = 4–5 (2.42% vs 2.45%, 2.12% vs 2.14%).
+
+So the CV-chosen rule stays **outer-only** (`Ranker.rank(order="diverse")`). The inner rule is saved as `meta["inner_rule"]` and measured as a diagnostic order (`--order inner`).
+It changes the held-out top 3 on 10 of 86 shapes, and the online top-3 choice on 5.
+
+**Re-measured** on commit `9e6e4be` (clean). Each session holds plain, outer-only and inner top-5 together with knnf / knn5:
+- `bench-20261019-173739-lock1755-topki`: cold, 2,686 rows, 0 invalid, 4.8% power-capped.
+- `-topki-graph`: 1,766 rows, 0 invalid, 9.4% power-capped.
+- `online-20261019-173739-lock1755-topki`: inner, empty Triton cache, 86 × 5, 0 invalid.
+
+The plain and outer online choices from the earlier runs are re-priced here. Tables: [`learned_topk.md`](learned_topk.md).
+
+**Online top-3 choice re-timed with the full protocol, regret vs the per-shape Triton oracle, median / p95 (mean):**
+
+| selector | cold, all 86 | cold, ≥ 50 µs (30) | graph, < 50 µs (56) |
+|---|---|---|---|
+| knnf | 2.5% / 22.3% (6.5%) | 2.2% / 36.5% (8.7%) | 4.9% / 25.8% (7.7%) |
+| plain online top-3 | 0.9% / 12.2% (3.1%) | 0.9% / 16.7% (3.8%) | 0.4% / 12.3% (2.7%) |
+| outer online top-3 (bar) | 1.1% / 9.1% (2.6%) | 1.0% / 10.0% (2.4%) | 0.2% / 9.7% (2.1%) |
+| **inner online top-3** | 1.1% / 9.1% (2.5%) | 1.0% / 10.0% (2.4%) | **0.2% / 8.2% (1.7%)** |
+| inner online top-5 | 0.8% / 8.5% (2.3%) | 0.3% / 8.1% (1.9%) | 0.1% / 7.8% (1.5%) |
+
+- **It does what it was built for, on one shape.** 381×1401×250 goes from +14.2% to +0.2% (graph), and cold the inner pick is 7.3% faster than the outer-only pick. The second pick is `bm64_bn64_bk32_w8_s2_g4_sk1`, the
+  top tile with 8 warps, which is that shape's oracle. 380×6978×216 also gains 5.6% (graph).
+- **Elsewhere it is a tie.** Beyond ε, inner beats outer-only on 1 of 86 cold shapes and 2 of 56 graph shapes, and is never slower (geomean 1.001× cold, 1.004× graph). The graph p95 drop (9.7% → 8.2%)
+  is that one shape leaving the tail. Cost is the same: k = 3 median 0.39 s, p90 0.81 s.
+- **It cannot reach 4065×8842×28** (+10.6%). There the oracle `bm64_bn128_bk16_w4_s3_g1` differs from the top pick in stages and GROUP_M at the same warp count. The CV-best inner grouping is warps-only,
+  and the stage / group variants the model ranks above it (g4, g16, g8 at s2) fill the slots. The other large misses are unchanged, and they are ranking errors no variety pass reaches:
+  320×1×79 (+22% cold / +16% graph, oracle at rank 134) and 5398×196×774 (+20%, oracle tile at rank 68).
+- **Outer-only reproduces** for its second session: online top-3 cold 1.1% / 9.1% / 2.6% vs 1.0% / 9.9% / 2.7%, graph 0.2% / 9.7% / 2.1% vs 0.2% / 9.9% / 2.1%.
+
+**Decision: the bar stays outer-only diverse top-3.** Tune CV ranks it at or above every inner rule at k = 3. Promoting the inner rule because it fixed a held-out shape would fit the rule to held-out
+data. It is safe to use, since it was never slower here, and `--order inner` stays available. A fair test of it needs new shapes.
+
+**Next:** the remaining tail is ranking error, so it needs a better model, not more variety:
+- Training data or features for N = 1 / tiny-K shapes (320×1×79).
+- A ranking objective that weights near-optimal tiles (the 5398×196×774 tile sits at rank 68 of 868).
+- Joint {Triton ∪ cuBLASLt} candidates.
+
+Reproduce: the 2026-10-19 (late night) commands with `--out-name results_lock1755_topki[_graph].jsonl`, then
+`python -m tune --clock-lock 1755 online --shapes-file $D/sweep_screen_heldout/subset.json --k 5 --order inner --fresh-cache` and
+`python -m tune topk --results results_lock1755_topki.jsonl --graph-results results_lock1755_topki_graph.jsonl`.
+
 ## Update 2026-10-19 (late night): diversified top-3 — tail p95 12.8% → 9.9% at the same cost, never worse per shape
 
 **What changed.** Plain top-k re-timed near-duplicates: the held-out top 3 covered 1.55 distinct (BLOCK_M, BLOCK_N, SPLIT_K) choices on average. `diverse_order` in `analysis/learned.py`
