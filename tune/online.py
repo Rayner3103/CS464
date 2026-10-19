@@ -1,7 +1,8 @@
 """Top-k + short online search (AGENTS.md next step 2): what the learned ranker would do at a shape's first use.
 
 Per shape: the saved lgbm_rank model (analysis.learned.Ranker, fit on the tune screen only) ranks its candidate pool;
-the top k runnable configs are compiled and validated (the correctness gate, so a broken pick is never chosen), then
+the top k runnable configs (plain score order, or --order diverse: the CV-chosen diversification rule, which spreads
+the k picks over distinct tile x BLOCK_K x split choices) are compiled and validated (the correctness gate, so a broken pick is never chosen), then
 timed with a short protocol on one input placement:
 
   * cold, per-launch: SHORT_REPS samples after a SHORT_WARMUP_MS warmup;
@@ -59,13 +60,14 @@ def choose(cands: list[dict], k: int) -> dict:
     return {"key": best["config_key"], "rank": c.index(best), "mode": "graph" if small else "cold", **cost}
 
 
-def search_shape(ranker, M: int, N: int, K: int, k: int, dtype=torch.float16) -> dict:
-    """Rank, then compile + validate + short-time the top k on one placement. Returns the per-candidate record."""
+def search_shape(ranker, M: int, N: int, K: int, k: int, dtype=torch.float16, order: str = "plain") -> dict:
+    """Rank (plain or diverse top-k, Ranker.rank), then compile + validate + short-time the top k on one placement.
+    Returns the per-candidate record."""
     from kernels.triton_matmul import TritonMatmul
     from tune.timing import benchmark
     cold_cfg, graph_cfg = short_configs()
     t0 = time.perf_counter()
-    keys = ranker.rank(M, N, K, k)
+    keys = ranker.rank(M, N, K, k, order=order)
     rank_s = time.perf_counter() - t0
     a, b, _ = placed_inputs(M, N, K, dtype, seed=0)
     ref = reference(a, b)
@@ -95,7 +97,7 @@ def search_shape(ranker, M: int, N: int, K: int, k: int, dtype=torch.float16) ->
 
 
 def run(shapes: Iterable[dict], ranker_stem: Path, out_dir: Path, *, k: int = 5, dtype: str = "fp16",
-        out_name: str = "online_lgbm_rank.jsonl", session_id: str | None = None,
+        order: str = "plain", out_name: str = "online_lgbm_rank.jsonl", session_id: str | None = None,
         log: Callable[[str], None] = print) -> Path:
     from analysis.learned import Ranker
     from tune.runner import DTYPES
@@ -106,15 +108,18 @@ def run(shapes: Iterable[dict], ranker_stem: Path, out_dir: Path, *, k: int = 5,
     path = out_dir / out_name
     done = set()
     if path.exists():
-        done = {(r["M"], r["N"], r["K"]) for r in map(json.loads, path.read_text().splitlines()) if r.get("k") == k}
+        done = {(r["M"], r["N"], r["K"]) for r in map(json.loads, path.read_text().splitlines())
+                if r.get("k") == k and r.get("order", "plain") == order}
     shapes = [s for s in shapes if (s["M"], s["N"], s["K"]) not in done]
     t0 = time.perf_counter()
     with RecordWriter(path) as w:
         for i, s in enumerate(shapes):
             M, N, K = s["M"], s["N"], s["K"]
             t = time.perf_counter()
-            r = search_shape(ranker, M, N, K, k, DTYPES[dtype])
-            row = {"M": M, "N": N, "K": K, "dtype": dtype, "k": k, "split": s.get("split"), "suite": s.get("suite"),
+            r = search_shape(ranker, M, N, K, k, DTYPES[dtype], order)
+            row = {"M": M, "N": N, "K": K, "dtype": dtype, "k": k, "order": order,
+                   "rule": ranker.meta.get("diverse_rule") if order == "diverse" else None,
+                   "split": s.get("split"), "suite": s.get("suite"),
                    "session_id": session_id, "hw_id": env["hw_id"], "driver": env["driver"], **provenance(env),
                    "ranker": str(ranker_stem), "ranker_meta": ranker.meta,
                    "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"), "wall_s": time.perf_counter() - t,

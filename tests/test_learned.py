@@ -91,11 +91,37 @@ def test_ranker_save_load_round_trip(tmp_path):
     rng = np.random.default_rng(0)
     X = rng.normal(size=(400, 35)).astype(np.float32)
     est = lgb.LGBMRegressor(n_estimators=20, num_leaves=4, verbose=-1).fit(X, X[:, 22] - X[:, 0])
-    rk = Ranker(est.booster_, pool, {"objective": "regression"}, gpu, {"note": "toy"})
+    rk = Ranker(est.booster_, pool, {"objective": "regression"}, gpu,
+                {"note": "toy", "diverse_rule": {"group": "tile_split", "delta": 10.0, "plain": 1}})
     rk.save(tmp_path / "m")
     back = Ranker.load(tmp_path / "m")
     for M, N, K in ((1, 4096, 4096), (4096, 4096, 4096), (300, 77, 9000)):
         top = rk.rank(M, N, K, 3)
         assert top == back.rank(M, N, K, 3) and set(top) <= set(pool) and len(top) <= 3
         assert np.allclose(rk.scores(M, N, K), back.scores(M, N, K))
-    assert back.meta == {"note": "toy"}
+    assert back.meta["note"] == "toy"
+    d = back.rank(4096, 4096, 4096, 3, order="diverse")
+    assert d[0] == back.rank(4096, 4096, 4096, 1)[0] and len(d) == len(set(d))
+
+
+def test_diverse_order_spreads_over_groups_within_delta_then_fills():
+    from analysis.learned import PLAIN_RULE, diverse_order
+    score = np.array([0.00, 0.01, 0.02, 0.04, 0.30, np.inf])
+    groups = np.array([0, 0, 0, 1, 2, 3])
+    assert diverse_order(score, groups, 3, PLAIN_RULE) == [0, 1, 2]
+    rule = {"group": "x", "delta": 0.05, "plain": 1}
+    assert diverse_order(score, groups, 3, rule) == [0, 3, 1]  # group 2 is 0.30 behind: filled from score order
+    assert diverse_order(score, groups, 3, dict(rule, delta=1.0)) == [0, 3, 4]
+    assert diverse_order(score, groups, 3, dict(rule, plain=2)) == [0, 1, 3]
+    assert diverse_order(score, groups, 9, dict(rule, delta=1.0)) == [0, 3, 4, 1, 2]  # never the unrunnable one
+    assert diverse_order(np.full(3, np.inf), groups[:3], 2, rule) == []
+
+
+def test_config_groups_by_tile_split():
+    from analysis.learned import config_groups
+    from tune.sweep import parse_key
+    cfgs = [parse_key(k) for k in ("bm64_bn64_bk32_w4_s3_g8_sk1", "bm64_bn64_bk64_w4_s4_g1_sk1",
+                                   "bm64_bn64_bk32_w4_s3_g8_sk2", "bm32_bn64_bk32_w4_s3_g8_sk1")]
+    g = config_groups(cfgs, "tile_split")
+    assert g[0] == g[1] and len({g[0], g[2], g[3]}) == 3
+    assert len(set(config_groups(cfgs, "tile_split_bk"))) == 4 and len(set(config_groups(cfgs, None))) == 4
