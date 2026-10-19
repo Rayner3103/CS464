@@ -393,12 +393,16 @@ class Ranker:
         return np.where(ok, pred, np.inf)
 
     def rank(self, M: int, N: int, K: int, k: int = 5, order: str = "plain") -> list[str]:
-        """Top k pool configs: plain score order, or "diverse" (the CV-chosen rule in meta["diverse_rule"],
-        `diverse_order`)."""
+        """Top k pool configs: plain score order, "diverse" (the CV-chosen rule in meta["diverse_rule"]) or "inner"
+        (the best rule that spends a slot on the top tile's warps / stages, meta["inner_rule"]; `diverse_order`)."""
         sc = self.scores(M, N, K)
-        rule = PLAIN_RULE if order == "plain" else self.meta["diverse_rule"]
+        rule = self.rule(order)
         groups = config_groups(self.cfgs, rule["group"])
-        return [self.pool_keys[j] for j in diverse_order(sc, groups, k, rule)]
+        inner = config_groups(self.cfgs, rule["inner_group"]) if rule.get("inner") else None
+        return [self.pool_keys[j] for j in diverse_order(sc, groups, k, rule, inner_groups=inner)]
+
+    def rule(self, order: str) -> dict:
+        return {"plain": PLAIN_RULE, "diverse": self.meta.get("diverse_rule"), "inner": self.meta.get("inner_rule")}[order]
 
     def save(self, stem: Path) -> Path:
         stem = Path(stem)
@@ -425,9 +429,12 @@ def train_ranker(data: Path, ctx: dict | None = None, log=print) -> tuple["Ranke
     gpu = json.loads((Path(data) / "env.json").read_text())["gpu"]
     # Diversification rule for top-k, chosen on out-of-fold tune scores only (best-of-DIVERSE_K mean regret).
     rules = fit_diverse_rule(ctx, cv_scores(ctx, data, hp, log)["S"], DIVERSE_K)
+    # inner_rule: the best rule whose inner pass takes a top-DIVERSE_K slot (inner_pos "before"); kept as a
+    # diagnostic variant whether or not it beats the chosen rule on tune CV.
+    inner = next(e["rule"] for e in rules if e["rule"].get("inner_pos") == "before")
     rk = Ranker(est.booster_, [ctx["keys"][j] for j in pool], hp, gpu,
                 {"tag": search_tag(ctx), "n_tune_shapes": len(ctx["shapes"]), "pool_top": POOL_TOP,
-                 "diverse_rule": rules[0]["rule"], "diverse_k": DIVERSE_K})
+                 "diverse_rule": rules[0]["rule"], "inner_rule": inner, "diverse_k": DIVERSE_K})
     rk.save(Path(data) / "lgbm_rank")
     return rk, {"ctx": ctx, "cols": cols, "pool": pool, "rules": rules}
 
@@ -445,6 +452,14 @@ REFERENCE = ("b6", "knn5", "knnf")
 GROUPINGS = {"tile_split": (0, 1, 6), "tile": (0, 1), "split": (6,), "tile_split_bk": (0, 1, 2, 6)}  # PARAMS index
 DIVERSE_GRID = {"group": tuple(GROUPINGS), "delta": (0.02, 0.03, 0.05, 0.1, 0.2, 0.5, float("inf")), "plain": (1, 2)}
 PLAIN_RULE = {"group": None, "delta": 0.0, "plain": TOPK}
+# Second (inner) pass: within the top pick's outer group, up to `inner` configs with a new (num_warps, num_stages
+# [, GROUP_M]) value, best-scored first and within `inner_delta` of the top pick; placed before or after the outer
+# picks. On held-out shapes plain/outer top-3 missed oracles that share the top tile x BLOCK_K x split and differ only
+# there (4065x8842x28, 381x1401x250); the rule itself is fit on tune shapes only, and inner = 0 stays a candidate.
+INNER_GROUPINGS = {"warps": (3,), "stages_warps": (3, 4), "stages_warps_group": (3, 4, 5)}
+INNER_GRID = {"group": ("tile_split_bk",), "delta": (0.03, 0.05, 0.1), "plain": (1,), "inner": (1,),
+              "inner_group": tuple(INNER_GROUPINGS), "inner_delta": (0.02, 0.05, 0.1, 0.2, float("inf")),
+              "inner_pos": ("before", "after")}
 DIVERSE_K = 3  # the rule is fit for best-of-3 (the online search's default budget)
 
 
@@ -452,8 +467,9 @@ def config_groups(cfgs: list, group: str | None) -> np.ndarray:
     """An integer group id per config for `group` (GROUPINGS name); every config its own group for None."""
     if group is None:
         return np.arange(len(cfgs))
+    idx = GROUPINGS.get(group) or INNER_GROUPINGS[group]
     t = [tuple((c.BLOCK_M, c.BLOCK_N, c.BLOCK_K, c.num_warps, c.num_stages, c.GROUP_M, c.SPLIT_K)[i]
-               for i in GROUPINGS[group]) for c in cfgs]
+               for i in idx) for c in cfgs]
     ids = {g: i for i, g in enumerate(dict.fromkeys(t))}
     return np.array([ids[g] for g in t])
 
@@ -464,21 +480,44 @@ def score_order(score: np.ndarray) -> list[int]:
     return fin[np.argsort(score[fin], kind="stable")].tolist()
 
 
-def diverse_order(score: np.ndarray, groups: np.ndarray, k: int, rule: dict, order: list[int] | None = None) -> list[int]:
+def diverse_order(score: np.ndarray, groups: np.ndarray, k: int, rule: dict, order: list[int] | None = None,
+                  inner_groups: np.ndarray | None = None) -> list[int]:
     """Indices of the k picks (into score / groups) under a diversification rule; score lower = better, inf =
-    not runnable. rule: {"group", "delta", "plain"} (PLAIN_RULE = plain top-k). order: score_order(score), if known."""
+    not runnable. rule: {"group", "delta", "plain"} (PLAIN_RULE = plain top-k), optionally with an inner pass
+    {"inner", "inner_group", "inner_delta", "inner_pos"} (inner_groups: config_groups for inner_group).
+    order: score_order(score), if known."""
     order = score_order(score) if order is None else order
     if not order:
         return []
     picked = order[:min(rule["plain"], k)]
-    if rule["group"] is not None:
+    top = order[0]
+
+    def outer():
+        if rule["group"] is None:
+            return
         seen = {groups[j] for j in picked}
-        for j in order[len(picked):]:
-            if len(picked) >= k or score[j] - score[order[0]] > rule["delta"]:
+        for j in order:
+            if len(picked) >= k or score[j] - score[top] > rule["delta"]:
                 break
-            if groups[j] not in seen:
+            if groups[j] not in seen and j not in picked:
                 picked.append(j)
                 seen.add(groups[j])
+
+    def inner():
+        n, seen = 0, {inner_groups[j] for j in picked if groups[j] == groups[top]}
+        for j in order:
+            if len(picked) >= k or n >= rule["inner"] or score[j] - score[top] > rule["inner_delta"]:
+                break
+            if groups[j] == groups[top] and inner_groups[j] not in seen and j not in picked:
+                picked.append(j)
+                seen.add(inner_groups[j])
+                n += 1
+
+    passes = [outer]
+    if rule.get("inner"):
+        passes = [inner, outer] if rule["inner_pos"] == "before" else [outer, inner]
+    for f in passes:
+        f()
     for j in order:  # fill from score order
         if len(picked) >= k:
             break
@@ -510,24 +549,28 @@ def cv_scores(ctx: dict, data: Path, hp: dict, log=print) -> dict:
 
 def best_of_k(R: np.ndarray, S: np.ndarray, groups_by_rule: dict, rule: dict, k: int, orders=None) -> np.ndarray:
     """Per shape, the screen regret of the fastest of the k configs the rule picks from scores S."""
-    g = groups_by_rule[rule["group"]]
+    g, gi = groups_by_rule[rule["group"]], groups_by_rule.get(rule.get("inner_group"))
     orders = orders or [score_order(x) for x in S]
-    return np.array([R[i, diverse_order(S[i], g, k, rule, orders[i])].min() if orders[i] else REGRET_CAP
+    return np.array([R[i, diverse_order(S[i], g, k, rule, orders[i], gi)].min() if orders[i] else REGRET_CAP
                      for i in range(len(R))])
 
 
-def fit_diverse_rule(ctx: dict, S: np.ndarray, k: int = 3, grid: dict = DIVERSE_GRID) -> list[dict]:
-    """Every diversification rule (and plain top-k) scored by best-of-k regret on the tune shapes' out-of-fold scores,
-    best (lowest capped mean) first. Ties on the mean go to the simpler rule (plain, then fewer diverse picks)."""
+def fit_diverse_rule(ctx: dict, S: np.ndarray, k: int = 3, grid: dict = DIVERSE_GRID,
+                     inner_grid: dict = INNER_GRID) -> list[dict]:
+    """Every diversification rule (plain top-k, outer-only rules, outer + inner-pass rules) scored by best-of-k regret
+    on the tune shapes' out-of-fold scores, best (lowest capped mean) first. Ties on the mean go to the simpler rule
+    (plain, then no inner pass, then fewer diverse picks)."""
     from tune.sweep import parse_key
     cfgs = [parse_key(x) for x in ctx["keys"]]
-    G = {gname: config_groups(cfgs, gname) for gname in (None, *GROUPINGS)}
-    rules = [PLAIN_RULE] + [dict(zip(grid, v)) for v in itertools.product(*grid.values())]
+    G = {gname: config_groups(cfgs, gname) for gname in (None, *GROUPINGS, *INNER_GROUPINGS)}
+    rules = ([PLAIN_RULE] + [dict(zip(grid, v)) for v in itertools.product(*grid.values())]
+             + [dict(zip(inner_grid, v)) for v in itertools.product(*inner_grid.values())])
     orders = [score_order(x) for x in S]
     out = []
     for r in rules:
         out.append({"rule": r, **{f"k{j}": _stats(best_of_k(ctx["R"], S, G, r, j, orders)) for j in sorted({1, k, TOPK})}})
-    return sorted(out, key=lambda e: (round(e[f"k{k}"]["mean"], 4), e["rule"]["group"] is not None, -e["rule"]["plain"]))
+    return sorted(out, key=lambda e: (round(e[f"k{k}"]["mean"], 4), e["rule"]["group"] is not None,
+                                      bool(e["rule"].get("inner")), -e["rule"]["plain"]))
 
 
 def build(data: Path, report: Path, results: str = "results_lock1755_learned.jsonl",
@@ -695,12 +738,13 @@ def _nanmin_cols(st: dict, names: list[str]) -> np.ndarray:
         return np.nanmin(np.stack([st[n] for n in names], axis=1), axis=1)
 
 
-VARIANTS = {"plain": "lgbm", "diverse": "lgbmd"}  # top-k order -> pick-name prefix
+VARIANTS = {"plain": "lgbm", "diverse": "lgbmd", "inner": "lgbmi"}  # top-k order -> pick-name prefix
 
 
 def build_topk(data: Path, report: Path, results: str = "results_lock1755_topk.jsonl",
                graph_results: str = "results_lock1755_topk_graph.jsonl", online: str = "online_lgbm_rank.jsonl",
-               online_diverse: str = "online_lgbm_rank_diverse.jsonl", log=print) -> tuple[Path, dict]:
+               online_diverse: str = "online_lgbm_rank_diverse.jsonl", online_inner: str = "online_lgbm_rank_inner.jsonl",
+               log=print) -> tuple[Path, dict]:
     """Train + save the ranker (with its CV-chosen diversification rule), write its plain and diverse top-TOPK picks
     per held-out shape (data/<hw>/learned_topk_picks.json, for `triton:picks`), and score best-of-k for each order:
     on the screen, with perfect (full-protocol stage-2) measurement, and with the short online search (`tune online
@@ -721,7 +765,7 @@ def build_topk(data: Path, report: Path, results: str = "results_lock1755_topk.j
     by.update({n: sel[n] for n in TOPK_REFS})
     (Path(data) / "learned_topk_picks.json").write_text(json.dumps(
         {"selectors": [n for v in VARIANTS for n in names[v]] + list(TOPK_REFS), "ranker": str(Path(data) / "lgbm_rank"),
-         "hp": rk.hp, "diverse_rule": rk.meta["diverse_rule"],
+         "hp": rk.hp, "diverse_rule": rk.meta["diverse_rule"], "inner_rule": rk.meta["inner_rule"],
          "picks": {tag(s): sorted({by[n][tag(s)] for n in by if by[n][tag(s)]}) for s in hshapes},
          "by_selector": {n: {t: k for t, k in d.items() if k} for n, d in by.items()}}, indent=1))
 
@@ -732,7 +776,9 @@ def build_topk(data: Path, report: Path, results: str = "results_lock1755_topk.j
     tiles = {v: [len({(c.BLOCK_M, c.BLOCK_N, c.SPLIT_K) for c in map(parse_key, ks[:DIVERSE_K])}) for ks in ranked[v]]
              for v in VARIANTS}
     summary = {"hp": rk.hp, "n_heldout_shapes": len(hshapes), "pool": len(rk.pool_keys),
-               "diverse_rule": rk.meta["diverse_rule"], "diverse_rule_grid_top": fit["rules"][:12],
+               "diverse_rule": rk.meta["diverse_rule"], "inner_rule": rk.meta["inner_rule"],
+               "inner_rule_cv": next(e for e in fit["rules"] if e["rule"] == rk.meta["inner_rule"]),
+               "diverse_rule_grid_top": fit["rules"][:12],
                "diverse_rule_plain": next(e for e in fit["rules"] if e["rule"]["group"] is None),
                "distinct_tile_split_in_top3": {v: float(np.mean(t)) for v, t in tiles.items()}, "screen_best_of_k": {}}
     md = ["# Learned ranker: top-k + short online search on held-out shapes (auto-generated)\n",
@@ -745,12 +791,14 @@ def build_topk(data: Path, report: Path, results: str = "results_lock1755_topk.j
           f"## Diversification rule (tune shapes only: best-of-{DIVERSE_K} screen regret on out-of-fold scores, "
           f"{N_FOLDS} grouped folds)\n",
           f"| rule | best-of-1 | best-of-{DIVERSE_K} | best-of-{TOPK} |", "|---|---|---|---|"]
-    for e in fit["rules"][:8] + [summary["diverse_rule_plain"]]:
+    for e in fit["rules"][:8] + [summary["inner_rule_cv"], summary["diverse_rule_plain"]]:
         r = e["rule"]
         md.append(f"| {'plain' if r['group'] is None else json.dumps(r)} | {ms(e['k1'])} | {ms(e[f'k{DIVERSE_K}'])} | "
                   f"{ms(e[f'k{TOPK}'])} |")
-    md.append(f"\nDistinct (BLOCK_M, BLOCK_N, SPLIT_K) among the held-out top {DIVERSE_K}: plain "
-              f"{summary['distinct_tile_split_in_top3']['plain']:.2f}, diverse {summary['distinct_tile_split_in_top3']['diverse']:.2f}.\n")
+    md.append(f"\n**inner** (diagnostic) = the best rule whose inner pass takes a top-{DIVERSE_K} slot, "
+              f"`{json.dumps(rk.meta['inner_rule'])}`; not chosen on tune CV.\n")
+    md.append(f"Distinct (BLOCK_M, BLOCK_N, SPLIT_K) among the held-out top {DIVERSE_K}: "
+              + ", ".join(f"{v} {t:.2f}" for v, t in summary["distinct_tile_split_in_top3"].items()) + ".\n")
     md += ["## Screen (regret vs the held-out screen oracle, full pruned space)\n",
            "| order | k | all | >= 50 us | < 50 us |", "|---|---|---|---|---|"]
     for v in VARIANTS:
@@ -761,9 +809,10 @@ def build_topk(data: Path, report: Path, results: str = "results_lock1755_topk.j
             md.append(f"| {v} | {k} | {ms(_stats(r))} | {ms(_stats(r[~small]))} | {ms(_stats(r[small]))} |")
     held_keys = {n: [by[n][tag(s)] for s in hshapes] for n in by}
     on_rows = {}
-    for v, fname in (("plain", online), ("diverse", online_diverse)):
+    for v, fname in (("plain", online), ("diverse", online_diverse), ("inner", online_inner)):
+        want = None if v == "plain" else rk.rule(v)
         on_rows[v] = {(r["M"], r["N"], r["K"]): r for r in _rows(Path(data) / fname)
-                      if r.get("k") == TOPK and r.get("order", "plain") == v}
+                      if r.get("k") == TOPK and r.get("order", "plain") == v and r.get("rule") == want}
         for k in range(1, TOPK + 1):  # the online choice for each k, priced below at its stage-2 time
             held_keys[f"online-{v}@{k}"] = [on_rows[v].get((s["M"], s["N"], s["K"]), {}).get("choice", {}).get(str(k), {}).get("key")
                                             for s in hshapes]
@@ -817,18 +866,20 @@ def build_topk(data: Path, report: Path, results: str = "results_lock1755_topk.j
         # The worst shapes of plain online top-3 (or plain best-of-3 without online rows), and what diverse does there.
         ref = st[f"online-plain@{DIVERSE_K}"] if on_rows["plain"] else _nanmin_cols(st, names["plain"][:DIVERSE_K])
         alt = st[f"online-diverse@{DIVERSE_K}"] if on_rows["diverse"] else _nanmin_cols(st, names["diverse"][:DIVERSE_K])
-        rr, ra = ref / st["oracle"], alt / st["oracle"]
+        inn = st[f"online-inner@{DIVERSE_K}"] if on_rows["inner"] else _nanmin_cols(st, names["inner"][:DIVERSE_K])
+        rr, ra, ri = ref / st["oracle"], alt / st["oracle"], inn / st["oracle"]
         worst = [i for i in np.argsort(-np.where(np.isfinite(rr), rr, -1))[:8]]
         res["worst"] = [{"shape": tag(hshapes[i]), "oracle_us": float(st["oracle"][i]), "plain": float(rr[i] - 1),
-                         "diverse": float(ra[i] - 1), "plain_top3": ranked["plain"][i][:DIVERSE_K],
-                         "diverse_top3": ranked["diverse"][i][:DIVERSE_K]} for i in worst]
+                         "diverse": float(ra[i] - 1), "inner": float(ri[i] - 1), "plain_top3": ranked["plain"][i][:DIVERSE_K],
+                         "diverse_top3": ranked["diverse"][i][:DIVERSE_K], "inner_top3": ranked["inner"][i][:DIVERSE_K]}
+                        for i in worst]
         md.append(f"\nWorst shapes of plain top-{DIVERSE_K} ({'online' if on_rows['plain'] else 'full-protocol'}) and the "
                   f"diverse top-{DIVERSE_K} there:\n")
-        md.append(f"| shape | oracle us | plain | diverse | diverse top-{DIVERSE_K} |")
-        md.append("|---|---|---|---|---|")
+        md.append(f"| shape | oracle us | plain | diverse | inner | inner top-{DIVERSE_K} |")
+        md.append("|---|---|---|---|---|---|")
         for w in res["worst"]:
-            md.append(f"| {w['shape']} | {w['oracle_us']:.1f} | {pct(w['plain'])} | {pct(w['diverse'])} | "
-                      + ", ".join(f"`{x}`" for x in w["diverse_top3"]) + " |")
+            md.append(f"| {w['shape']} | {w['oracle_us']:.1f} | {pct(w['plain'])} | {pct(w['diverse'])} | {pct(w['inner'])} | "
+                      + ", ".join(f"`{x}`" for x in w["inner_top3"]) + " |")
         summary[f"stage2_{label}"] = res
     for v in VARIANTS:
         if not on_rows[v]:

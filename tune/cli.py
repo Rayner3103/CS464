@@ -172,7 +172,7 @@ def cmd_learned(args):
 def cmd_topk(args):
     from analysis.learned import build_topk
     out, s = build_topk(args.data, args.report, results=args.results, graph_results=args.graph_results,
-                        online=args.online, online_diverse=args.online_diverse)
+                        online=args.online, online_diverse=args.online_diverse, online_inner=args.online_inner)
     print(f"diverse rule {s['diverse_rule']}; held-out screen best-of-k median / p95: " + "; ".join(
         f"{o} " + ", ".join(f"k={k} {100 * v['p50']:.1f}% / {100 * v['p95']:.1f}%" for k, v in sc.items())
         for o, sc in s["screen_best_of_k"].items()) + f" -> {out}")
@@ -299,6 +299,7 @@ def main(argv=None):
     p.add_argument("--graph-results", default="results_lock1755_topk_graph.jsonl", help="graph stage-2 file (< 50 us)")
     p.add_argument("--online", default="online_lgbm_rank.jsonl", help="`tune online` output under --data")
     p.add_argument("--online-diverse", default="online_lgbm_rank_diverse.jsonl", help="`tune online --order diverse` output")
+    p.add_argument("--online-inner", default="online_lgbm_rank_inner.jsonl", help="`tune online --order inner` output")
     p = add("online", cmd_online, help="top-k + short online search with the saved learned ranker")
     p.add_argument("--suite", default="S1,S2")
     p.add_argument("--shapes-file", default=None)
@@ -306,8 +307,9 @@ def main(argv=None):
     p.add_argument("--k", type=int, default=5, help="candidates compiled and timed per shape")
     p.add_argument("--dtype", default="fp16")
     p.add_argument("--session", default=None)
-    p.add_argument("--order", choices=["plain", "diverse"], default="plain",
-                   help="top-k order: score order, or the ranker's CV-chosen diversification rule")
+    p.add_argument("--order", choices=["plain", "diverse", "inner"], default="plain",
+                   help="top-k order: score order, the ranker's CV-chosen diversification rule, or the diagnostic "
+                        "rule that also varies warps / stages of the top tile")
     p.add_argument("--out-name", default=None, help="default online_lgbm_rank[_diverse].jsonl")
     p.add_argument("--fresh-cache", action="store_true", help="compile into an empty TRITON_CACHE_DIR under --out")
 

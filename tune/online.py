@@ -1,8 +1,9 @@
 """Top-k + short online search (AGENTS.md next step 2): what the learned ranker would do at a shape's first use.
 
 Per shape: the saved lgbm_rank model (analysis.learned.Ranker, fit on the tune screen only) ranks its candidate pool;
-the top k runnable configs (plain score order, or --order diverse: the CV-chosen diversification rule, which spreads
-the k picks over distinct tile x BLOCK_K x split choices) are compiled and validated (the correctness gate, so a broken pick is never chosen), then
+the top k runnable configs (plain score order; --order diverse: the CV-chosen diversification rule, which spreads
+the k picks over distinct tile x BLOCK_K x split choices; --order inner: the diagnostic rule that also spends a slot on
+the top tile's warps / stages) are compiled and validated (the correctness gate, so a broken pick is never chosen), then
 timed with a short protocol on one input placement:
 
   * cold, per-launch: SHORT_REPS samples after a SHORT_WARMUP_MS warmup;
@@ -108,8 +109,9 @@ def run(shapes: Iterable[dict], ranker_stem: Path, out_dir: Path, *, k: int = 5,
     path = out_dir / out_name
     done = set()
     if path.exists():
+        rule = None if order == "plain" else ranker.rule(order)
         done = {(r["M"], r["N"], r["K"]) for r in map(json.loads, path.read_text().splitlines())
-                if r.get("k") == k and r.get("order", "plain") == order}
+                if r.get("k") == k and r.get("order", "plain") == order and r.get("rule") == rule}
     shapes = [s for s in shapes if (s["M"], s["N"], s["K"]) not in done]
     t0 = time.perf_counter()
     with RecordWriter(path) as w:
@@ -118,7 +120,7 @@ def run(shapes: Iterable[dict], ranker_stem: Path, out_dir: Path, *, k: int = 5,
             t = time.perf_counter()
             r = search_shape(ranker, M, N, K, k, DTYPES[dtype], order)
             row = {"M": M, "N": N, "K": K, "dtype": dtype, "k": k, "order": order,
-                   "rule": ranker.meta.get("diverse_rule") if order == "diverse" else None,
+                   "rule": None if order == "plain" else ranker.rule(order),
                    "split": s.get("split"), "suite": s.get("suite"),
                    "session_id": session_id, "hw_id": env["hw_id"], "driver": env["driver"], **provenance(env),
                    "ranker": str(ranker_stem), "ranker_meta": ranker.meta,

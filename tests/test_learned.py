@@ -125,3 +125,19 @@ def test_config_groups_by_tile_split():
     g = config_groups(cfgs, "tile_split")
     assert g[0] == g[1] and len({g[0], g[2], g[3]}) == 3
     assert len(set(config_groups(cfgs, "tile_split_bk"))) == 4 and len(set(config_groups(cfgs, None))) == 4
+
+
+def test_diverse_order_inner_pass_varies_warps_within_the_top_group():
+    from analysis.learned import diverse_order
+    score = np.array([0.00, 0.01, 0.015, 0.03, 0.04])
+    outer = np.array([0, 0, 0, 1, 2])      # configs 0-2 share the top tile x BLOCK_K x split
+    inner = np.array([4, 4, 8, 4, 4])      # num_warps: config 2 is the top tile with 8 warps
+    base = {"group": "x", "delta": 0.05, "plain": 1}
+    assert diverse_order(score, outer, 3, base) == [0, 3, 4]
+    before = dict(base, inner=1, inner_group="warps", inner_delta=0.02, inner_pos="before")
+    assert diverse_order(score, outer, 3, before, inner_groups=inner) == [0, 2, 3]
+    after = dict(before, inner_pos="after")
+    assert diverse_order(score, outer, 3, after, inner_groups=inner) == [0, 3, 4]  # outer fills k first
+    assert diverse_order(score, outer, 4, after, inner_groups=inner) == [0, 3, 4, 2]
+    tight = dict(before, inner_delta=0.01)
+    assert diverse_order(score, outer, 3, tight, inner_groups=inner) == [0, 3, 4]  # 8-warp variant too far behind
