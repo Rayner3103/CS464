@@ -891,6 +891,12 @@
  "meta": {
   "tag": "49bc5a031d7d8be267f76d5731d7ee64894c2195",
   "n_tune_shapes": 477,
-  "pool_top": 5
+  "pool_top": 5,
+  "diverse_rule": {
+   "group": "tile_split_bk",
+   "delta": 0.05,
+   "plain": 1
+  },
+  "diverse_k": 3
  }
 }

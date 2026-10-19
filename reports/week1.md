@@ -4,6 +4,73 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-19 (late night): diversified top-3 — tail p95 12.8% → 9.9% at the same cost, never worse per shape
+
+**What changed.** Plain top-k re-timed near-duplicates: the held-out top 3 covered 1.55 distinct (BLOCK_M, BLOCK_N, SPLIT_K) choices on average. `diverse_order` in `analysis/learned.py`
+keeps the top-1 pick. It then takes the best-scored config of each new group, as long as its predicted log regret is within δ of the top pick, and fills any remaining slots in score order.
+The groups are (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K), and the result covers 2.23 distinct tile × split choices in the top 3. **Fit on tune shapes only.** I computed out-of-fold lgbm_rank scores
+for all 477 tune shapes on the search's 20 grouped folds (cached in `data/<hw>/lgbm_rank_cv_scores.npz`). Then I scored 57 rules (4 groupings × δ ∈ {0.02 … ∞} × 1–2 plain picks, plus plain) by best-of-3 screen regret.
+
+The winner is `{"group": "tile_split_bk", "delta": 0.05, "plain": 1}`, with an interior δ. Tune CV best-of-3 goes from 1.5% / 12.0% / 3.3% to 1.2% / 10.1% / 2.8% (median / p95 / mean). The rule is saved in the
+ranker's metadata and used by `Ranker.rank(order="diverse")` and `tune online --order diverse`. The plain picks are unchanged and identical to the previous sessions'.
+
+**Re-measured** in fresh sessions on a clean harness (commit `b56c906`). Each session times the plain and diverse top-5 together with knnf / knn5, so they share one oracle and B3+:
+- `bench-20261019-112027-lock1755-topkd`: cold, 86 shapes, 2,683 rows, 0 invalid, 5.3% power-capped.
+- `-topkd-graph`: 56 shapes, 1,765 rows, 0 invalid, 8.3% power-capped.
+- `online-20261019-112027-lock1755-topkd`: diverse, empty Triton cache, 86 × 5 candidates, 0 invalid.
+
+The plain online choices from `online-20261019-083637` are re-priced in these sessions. Tables: [`learned_topk.md`](learned_topk.md).
+
+**Online top-k choice re-timed with the full protocol, regret vs the per-shape Triton oracle, median / p95 (mean):**
+
+| selector | cold, all 86 | cold, ≥ 50 µs (30) | graph, < 50 µs (56) | vs B3+, cold all / graph |
+|---|---|---|---|---|
+| knnf | 2.7% / 22.8% (6.5%) | 2.5% / 36.4% (8.6%) | 4.2% / 26.5% (7.7%) | 0.960 / 0.949 |
+| top-1 (no search) | 1.9% / 18.1% (4.1%) | 1.9% / 18.4% (5.0%) | 2.6% / 13.6% (4.4%) | 0.964 / 0.994 |
+| plain online top-3 | 1.1% / 12.8% (3.1%) | 1.2% / 15.8% (3.7%) | 0.5% / 12.2% (2.7%) | 0.973 / 1.005 |
+| **diverse online top-3** | **1.0% / 9.9% (2.7%)** | **0.9% / 11.1% (2.5%)** | **0.2% / 9.9% (2.1%)** | 0.982 / 1.011 |
+| diverse online top-5 | 0.8% / 9.3% (2.5%) | 0.5% / 8.3% (1.9%) | 0.2% / 8.1% (1.9%) | 0.987 / 1.011 |
+| diverse best-of-3, full-protocol timing | 0.9% / 9.3% (2.4%) | 0.9% / 11.1% (2.4%) | 0.2% / 9.8% (2.0%) | 0.983 / 1.011 |
+
+- **Diversity strictly helps the tail.**
+  - Against plain top-3, p95 drops from 12.8% to 9.9% cold, from 15.8% to 11.1% at ≥ 50 µs and from 12.2% to 9.9% under 50 µs (graph). The ≥ 50 µs mean drops from 3.7% to 2.5%.
+  - Shape by shape, beyond ε, diverse is faster on 5 of 86 cold shapes and 2 of 56 graph shapes, and **never slower**. The rest tie (geomean 1.003× / 1.006×).
+  - The cold < 50 µs median goes from 1.1% to 1.3%, which is within the event tick. The graph protocol for that regime improves.
+- **Unlike plain, a larger k still pays.** Diverse top-5 reaches an ≥ 50 µs p95 of 8.3%, against plain top-5's 15.8%. That is now below the 48-config portfolio oracle's held-out p95 (~8.9%).
+- **The cost is the same.** k = 3 takes a median 0.39 s per shape (p90 0.86 s), against 0.40 s for plain. Diverse picks are no harder to compile.
+- **Fixed** (plain → diverse top-3):
+  - 14244×16×1257: 18.2% → 4.6%.
+  - 277×3×161: 12.8% → 0% (graph).
+  - 1316×272×100: 11.7% → 0% (graph).
+  - 417×512×6739: 12.9% → 9.5%.
+  - 51×324×5709: 10.2% → 7.4% (graph).
+- **Not fixed, and why.** These are ranker errors that no diversification within δ reaches:
+  - **320×1×79** (+21% cold, +16% graph): the oracle `bm16_bn32_bk128_w2_s5` sits at rank 134, predicted 0.66 log regret behind the top. The model is simply wrong on this tiny-K, N = 1 decode-like shape.
+  - **5398×196×774** (+20%): the oracle's tile (64×128, BLOCK_K 16) sits at rank 68, 0.10 behind, outside δ = 0.05.
+  - **4065×8842×28** (+12%) and **381×1401×250** (+13–14%): the oracle shares the top pick's tile × BLOCK_K × split and differs only in num_stages / GROUP_M or num_warps (ranks 7–8). The grouping deliberately collapses those.
+- **Against B3+:** cold all moves from 0.973 to 0.982. Under 50 µs graph it moves from 1.005 to 1.011, so the searched Triton pick is now marginally ahead of cuBLASLt's searched best at the median. G4 at ≥ 50 µs still fails (Triton oracle 0.96).
+
+**New bar: diverse online top-3.** Cold all: 1.0% / 9.9% (2.7%). ≥ 50 µs: 0.9% / 11.1% (2.5%). Graph < 50 µs: 0.2% / 9.9% (2.1%). Cost: ~0.4 s first use per shape.
+
+**Next:** the remaining tail needs a better ranker, not a wider search:
+- An inner diversity pass over stages / warps for the top group, which would catch 4065×8842×28 and 381×1401×250.
+- Training targets or features for N = 1 / tiny-K shapes (320×1×79).
+- Joint {Triton ∪ cuBLASLt} candidates, now that Triton matches B3+ under 50 µs.
+
+Reproduce:
+```bash
+python -m tune topk               # train, fit the diversification rule (tune CV), write plain + diverse picks
+D=data/rtx3080_sm86_68sms_10gb
+export TUNE_SWEEP_DIR=$D/sweep_screen_heldout TUNE_PICKS=$D/learned_topk_picks.json
+python -m tune --clock-lock 1755 benchmark --shapes-file $D/sweep_screen_heldout/subset.json \
+  --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20 --cache-modes cold --out-name results_lock1755_topkd.jsonl
+python -m tune --clock-lock 1755 benchmark --shapes-file $D/sweep_screen_heldout/subset_lt50us.json \
+  --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20 --cache-modes hot --graph-batch 50 \
+  --out-name results_lock1755_topkd_graph.jsonl
+python -m tune --clock-lock 1755 online --shapes-file $D/sweep_screen_heldout/subset.json --k 5 --order diverse --fresh-cache
+python -m tune topk --results results_lock1755_topkd.jsonl --graph-results results_lock1755_topkd_graph.jsonl
+```
+
 ## Update 2026-10-19 (night): lgbm_rank top-k + short online search — top-3 cuts p95 regret by a third for ~0.4 s per shape
 
 **What ran.** `python -m tune topk` refits lgbm_rank on all 477 tune shapes, using the hyperparameters already chosen by tune CV. It saves the model as a standalone `analysis.learned.Ranker` in
