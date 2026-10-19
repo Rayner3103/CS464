@@ -31,6 +31,7 @@ tune/        harness package and CLI (python -m tune ...)
   sweep.py       stage-1 screen of the full pruned Triton space (subprocess per shape, parallel compile)
   noise.py       noise-floor study and thermal-drift run
   profile.py     records the device kernel names that vendor backends launch
+  online.py      top-k + short online search with the saved Ranker (compile, validate, short-time, pick)
 kernels/
   triton_matmul.py  parameterized Triton GEMM (MatmulConfig, EVEN_K specialization, deterministic split-K)
   config_space.py   SPACE (19,200 configs), static + shape pruning rules, HANDPICKED configs
@@ -47,9 +48,10 @@ analysis/
   report.py          analyze: baseline/noise/drift tables and figures
   portfolio.py       B6 over the full space, greedy portfolio, set cover, parameter importance, held-out G5
   selectors.py       trivial selectors (b6, nn1, knn5, rule, nn1f, knnf, knnc), picks file, held-out scoring
-  learned.py         learned selectors v0: DT, linear SVM, LightGBM, RF, logistic regression; cls and rank forms; grouped CV
+  learned.py         learned selectors v0: DT, linear SVM, LightGBM, RF, logistic regression; cls and rank forms; grouped CV;
+                     Ranker (saved lgbm_rank), top-k scoring (build_topk)
   alloc_variance.py  allocation-placement noise experiment
-tests/       pytest unit tests (50 tests; most need a CUDA GPU)
+tests/       pytest unit tests (52 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)
@@ -85,6 +87,8 @@ Measuring commands pin the process to one CPU core and write under `data/<hw_id>
 | `portfolio [--heldout --results ...]` | B6 over the full space, greedy portfolio curve, set cover, parameter importance; `--heldout` scores the tune-fitted portfolio on held-out shapes | `reports/sweep_portfolio[_heldout].md` + summary JSON |
 | `selectors [--results ... --graph-results ...]` | Fit trivial selectors on the tune screen, write picks, score on held-out shapes (screen + stage 2) | `data/<hw>/selector_picks.json`, `reports/selector_baselines.md` |
 | `learned [--results ... --graph-results ...]` | Grouped-CV grid search (cached, ~2 h first run) and held-out scoring of the 10 learned selectors; reads `selector_picks.json` for b6/knn5/knnf | `data/<hw>/learned_picks.json`, `learned_search.json`, `reports/learned_selectors.md` |
+| `topk [--results ... --graph-results ... --online ...]` | Refit lgbm_rank on all tune shapes, save `data/<hw>/lgbm_rank.txt/.json`, write top-5 picks per held-out shape, score best-of-k and the online search | `data/<hw>/learned_topk_picks.json`, `reports/learned_topk.md` |
+| `online --shapes-file ... --k 5 --fresh-cache` | First-use search: rank, compile + validate + short-time the top k (empty Triton cache), keep the fastest; choices for every k' <= k stored | `online_lgbm_rank.jsonl` |
 
 ### Backend spec strings (`--backends`, comma-separated; `runner.candidates_for`)
 
@@ -173,10 +177,11 @@ Other findings to keep in mind:
 - Losses ≥ 50 µs are kernel-level: unaligned strides (no 16-byte vector loads) and split-K reduction cost on tiny M, N. Better selection cannot fix them.
 - Parameter importance: SPLIT_K ≫ BLOCK_M > BLOCK_K > BLOCK_N ≫ warps, stages, GROUP_M.
 - Measured roofline: 62.9 TFLOP/s fp16 tensor, 686 GB/s DRAM. Under sustained load the card power-caps (throttle 0x4).
-- **Current selector bar: lgbm_rank** (`analysis/learned.py`; held-out sessions `learned` / `learned-graph`). This is a LightGBM regressor of log regret per
-  (shape, candidate) over each tune shape's top-5 pool, with shape features + config params + `candidate_features`. Cold, all shapes: median 1.4%, p95 18.3%, mean 4.1%.
-  Cold ≥ 50 µs: 1.8%, p95 19%. Graph < 50 µs: 2.4%, p95 13.5%, mean 4.3%. In the same sessions knnf had cold 2.3% / 23% / 6.6% (≥ 50 µs p95 36%) and knn5 had graph 3.7% / 22% / 6.8%.
-  rf_rank is a close second. Shape → config classifiers (cls form) and every linear model are worse than k-NN. Against B3+ nothing changes: G4 still fails at ≥ 50 µs.
+- **Current selector bar: lgbm online top-3** (`tune online`, sessions `topk` / `topk-graph` / `online-…-topk`). lgbm_rank (`analysis/learned.py`) is a LightGBM regressor of log regret per
+  (shape, candidate) over each tune shape's top-5 pool, using shape features + config params + `candidate_features`. It ranks the shape; the top 3 are compiled, validated and short-timed (graph when < 50 µs), and the
+  fastest is kept. Cold all: median 0.8%, p95 12.2%, mean 2.9%. ≥ 50 µs: 1.1%, p95 16.5%. Graph < 50 µs: 0.3%, p95 12.2%, mean 2.7%. First-use cost is ~0.4–0.5 s per shape, nearly all of it JIT compile.
+  Without search (top-1): cold 2.0% / 18.3% / 4.1%, graph 2.3% / 13.5% / 4.4%. Same sessions, knnf cold 2.5% / 22% / 6.6%, knn5 graph 3.8% / 22% / 6.9%. k = 5 barely helps the tail (top 5 average
+  1.9 distinct tile × split choices). Shape → config classifiers and every linear model are worse than k-NN. Against B3+: ≈ 1.00 under 50 µs graph, and G4 still fails at ≥ 50 µs.
 
 ## 7. Rules for agents
 
@@ -248,7 +253,7 @@ python -m tune selectors       # re-score with both stage-2 files
 ## 9. Open next steps
 
 1. **Learned selector v0: done** (lgbm_rank, see §6 and `reports/week1.md` 2026-10-19 late). Next: lambdarank / regression blends, a larger candidate pool.
-2. **Top-k + short online search**: time lgbm_rank's top 3–5 at first use to close the tail (worst stage-2 shape is still +29%).
+2. **Top-k + short online search: done** (`tune online`, top-3). Next: a diversified top-k (best per distinct tile × split) for the remaining +16–23% shapes.
 3. **Joint {Triton ∪ cuBLASLt} selection**, especially under 50 µs where the families split the wins.
 4. Noise study for graph-amortized mode (second session plus a reboot) before relying on tiny-GEMM wins.
 5. Kernel-level fixes if differentiation matters: an aligned-copy or padded path for unaligned strides, and a fused or atomic split-K reduction.

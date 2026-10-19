@@ -4,6 +4,77 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-19 (night): lgbm_rank top-k + short online search — top-3 cuts p95 regret by a third for ~0.4 s per shape
+
+**What ran.** `python -m tune topk` refits lgbm_rank on all 477 tune shapes, using the hyperparameters already chosen by tune CV. It saves the model as a standalone `analysis.learned.Ranker` in
+`data/<hw>/lgbm_rank.txt/.json`: a LightGBM booster, an 868-config pool and the GPU numbers the features need. The `Ranker` ranks any (M, N, K) in a median 92 ms. On all 86 held-out shapes its top 5
+match the fitted model exactly, and the build fails otherwise. The top 5 per held-out shape went into `learned_topk_picks.json` for `triton:picks`.
+
+The new `python -m tune online` (`tune/online.py`) is the first-use search. It ranks the shape, then compiles and validates the top k from an **empty Triton cache** (`--fresh-cache`). It times
+each candidate with 10 cold samples on one placement, re-times them hot with CUDA graphs (20 × 5) when the fastest is under 50 µs, and keeps the fastest.
+One k = 5 run stores every candidate's short times and costs, so the choice and cost for every k ≤ 5 are recomputed offline. Each choice is then priced at its full-protocol stage-2 time.
+
+All runs used commit `a24d834`, `harness_dirty: false`, clock locked at 1755 MHz:
+- `bench-20261019-083637-lock1755-topk`: cold, 86 shapes, 2,561 rows, 0 invalid, 4.7% power-capped.
+- `-topk-graph`: graph-amortized, 56 shapes under 50 µs, 1,685 rows, 0 invalid, 7.3% power-capped.
+- `online-20261019-083637-lock1755-topk`: 86 shapes × 5 candidates, 0 invalid.
+
+Tables: [`learned_topk.md`](learned_topk.md).
+
+**Regret vs the per-shape Triton oracle, median / p95 (mean).** The online rows are what the short search actually picked, re-timed with the full protocol:
+
+| selector | cold, all 86 | cold, ≥ 50 µs (30) | graph, < 50 µs (56) | vs B3+, cold all / graph |
+|---|---|---|---|---|
+| knnf | 2.5% / 22.1% (6.6%) | 2.4% / 36.7% | 4.7% / 26.2% (7.6%) | 0.955 / 0.953 |
+| knn5 | 2.5% / 23.9% (9.4%) | 4.2% / 65.1% | 3.8% / 21.8% (6.9%) | 0.964 / 0.973 |
+| lgbm top-1 (no search) | 2.0% / 18.3% (4.1%) | 2.2% / 19.1% | 2.3% / 13.5% (4.4%) | 0.968 / 0.993 |
+| lgbm online top-2 | 1.2% / 12.5% (3.3%) | 2.0% / 18.3% | 0.4% / 12.2% (2.9%) | 0.971 / 1.002 |
+| **lgbm online top-3** | **0.8% / 12.2% (2.9%)** | **1.1% / 16.5% (3.8%)** | **0.3% / 12.2% (2.7%)** | 0.973 / 1.002 |
+| lgbm online top-5 | 0.7% / 11.7% (2.8%) | 1.1% / 16.5% (3.3%) | 0.1% / 12.1% (2.2%) | 0.990 / 1.004 |
+| lgbm best-of-5, full-protocol timing | 0.1% / 11.2% (2.3%) | 0.7% / 16.4% (3.1%) | 0.0% / 11.7% (2.2%) | 0.990 / 1.004 |
+
+**First-use cost per shape (wall clock, empty Triton cache):**
+
+| k | compile + validate s, median / p90 | short timing s, median | total s, median / p90 |
+|---|---|---|---|
+| 1 | 0.14 / 0.29 | 0.01 | 0.16 / 0.33 |
+| 3 | 0.37 / 0.70 | 0.02 | 0.40 / 0.76 |
+| 5 | 0.61 / 1.18 | 0.04 | 0.66 / 1.28 |
+
+- **Top-3 is the sweet spot.** Going from k = 1 to k = 3:
+  - Cold mean regret drops from 4.1% to 2.9% and p95 from 18.3% to 12.2%. At ≥ 50 µs the median drops from 2.2% to 1.1%. Under 50 µs (graph) the median drops from 2.3% to 0.3% and p95 from 13.5% to 12.2%.
+  - Top-3 beats top-1 by more than 2% on 17 of 86 cold shapes and 12 of 56 graph shapes.
+  - k = 4–5 leaves p95 almost unchanged (11.7–12.1%) while costing more.
+- **The short protocol is good enough.** Online top-k lands within 0.1–0.7 points (median and mean) of choosing with full-protocol times, so 10 samples per candidate are enough to rank the top k.
+  Graph mode triggered on exactly the 56 shapes under 50 µs.
+- **Cost is dominated by compilation, and it is small.** A config never compiled before costs a median 0.16 s (p90 0.33 s, max 0.81 s including the ~0.8 s one-time JIT startup). Timing costs
+  hundredths of a second. The table's medians are measured in one process, where 186 of 430 candidates reused a kernel compiled for an earlier shape (~0 s). A cold process pays about 3 × 0.16 ≈ 0.5 s
+  (median) for k = 3. That is once per new shape, against kernels of 2 µs to 12 ms.
+- **The remaining tail is ranker error, not search width.** The worst shapes are the same at k = 1 and k = 5: 14244×16×1257 at +23%, 5398×196×774 at +20%, 320×1×79 at +16–18%. On average the top 5 cover
+  only 1.9 distinct (BLOCK_M, BLOCK_N, SPLIT_K) tiles, and on 30 of 86 shapes all five share one tile and differ only in stages, group or BLOCK_K. A wider k mostly re-times near-duplicates.
+- **Against B3+:** online top-3 moves from 0.968 to 0.973 cold (all shapes) and from 0.993 to 1.002 under 50 µs graph. Below 50 µs the searched Triton pick now ties cuBLASLt's searched best at the median.
+  At ≥ 50 µs G4 still fails.
+- knnf / knn5 reproduce again (knnf cold 2.5% / 22.1% / 6.6%; knn5 graph 3.8% / 21.8% / 6.9%).
+
+**New bar: lgbm online top-3.** Cold all: 0.8% / 12.2% (2.9%). ≥ 50 µs: 1.1% / 16.5%. Graph < 50 µs: 0.3% / 12.2% (2.7%). Cost: ~0.4–0.5 s first use per shape.
+
+**Next:** a **diversified top-k** (best-predicted config per distinct tile × split, then by score) to attack the tail that a wider plain top-k cannot reach. Then joint
+{Triton ∪ cuBLASLt} candidates in the same search, since under 50 µs the margin over B3+ is now about zero at the median.
+
+Reproduce:
+```bash
+python -m tune topk               # train + save data/<hw>/lgbm_rank.*, write learned_topk_picks.json
+D=data/rtx3080_sm86_68sms_10gb
+export TUNE_SWEEP_DIR=$D/sweep_screen_heldout TUNE_PICKS=$D/learned_topk_picks.json
+python -m tune --clock-lock 1755 benchmark --shapes-file $D/sweep_screen_heldout/subset.json \
+  --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20 --cache-modes cold --out-name results_lock1755_topk.jsonl
+python -m tune --clock-lock 1755 benchmark --shapes-file $D/sweep_screen_heldout/subset_lt50us.json \
+  --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20 --cache-modes hot --graph-batch 50 \
+  --out-name results_lock1755_topk_graph.jsonl
+python -m tune --clock-lock 1755 online --shapes-file $D/sweep_screen_heldout/subset.json --k 5 --fresh-cache
+python -m tune topk               # re-score with the stage-2 and online files
+```
+
 ## Update 2026-10-19 (late): learned selectors v0 — per-candidate LightGBM sets a new bar
 
 **What ran.** `analysis/learned.py` (`python -m tune learned`) fits five model families in two forms, on the tune screen only:
