@@ -169,6 +169,27 @@ def cmd_learned(args):
           + f" -> {out}")
 
 
+def cmd_topk(args):
+    from analysis.learned import build_topk
+    out, s = build_topk(args.data, args.report, results=args.results, graph_results=args.graph_results,
+                        online=args.online)
+    sc = s["screen_best_of_k"]
+    print("held-out screen best-of-k median / p95: " + ", ".join(f"k={k} {100 * v['p50']:.1f}% / {100 * v['p95']:.1f}%"
+                                                                 for k, v in sc.items()) + f" -> {out}")
+
+
+def cmd_online(args):
+    if args.fresh_cache:
+        # Before any Triton compile in this process: compile cost must be a first use, not a cache hit.
+        cache = args.out / "online_triton_cache" / time.strftime("%Y%m%d-%H%M%S")
+        cache.mkdir(parents=True, exist_ok=True)
+        os.environ["TRITON_CACHE_DIR"] = str(cache)
+    from tune.online import run
+    path = run(_shapes(args.suite, args.shapes_file), Path(args.ranker or args.out / "lgbm_rank"), args.out, k=args.k,
+               dtype=args.dtype, out_name=args.out_name, session_id=args.session)
+    print(f"online -> {path}")
+
+
 def cmd_analyze(args):
     from analysis.report import build_reports
     build_reports(args.data, args.report, args.results)
@@ -268,10 +289,28 @@ def main(argv=None):
     p.add_argument("--graph-results", default="results_lock1755_learned_graph.jsonl",
                    help="graph-amortized stage-2 file under --data (< 50 us shapes)")
 
+    p = sub.add_parser("topk", help="refit lgbm_rank on all tune shapes, save it (data/<hw>/lgbm_rank.*), write its top-5 "
+                                    "picks per held-out shape (learned_topk_picks.json) and score best-of-k / online search")
+    p.set_defaults(fn=cmd_topk)
+    p.add_argument("--data", type=Path, default=None)
+    p.add_argument("--report", type=Path, default=Path("reports"))
+    p.add_argument("--results", default="results_lock1755_topk.jsonl", help="cold stage-2 file under --data")
+    p.add_argument("--graph-results", default="results_lock1755_topk_graph.jsonl", help="graph stage-2 file (< 50 us)")
+    p.add_argument("--online", default="online_lgbm_rank.jsonl", help="`tune online` output under --data")
+    p = add("online", cmd_online, help="top-k + short online search with the saved learned ranker")
+    p.add_argument("--suite", default="S1,S2")
+    p.add_argument("--shapes-file", default=None)
+    p.add_argument("--ranker", default=None, help="model stem; default data/<hw>/lgbm_rank")
+    p.add_argument("--k", type=int, default=5, help="candidates compiled and timed per shape")
+    p.add_argument("--dtype", default="fp16")
+    p.add_argument("--session", default=None)
+    p.add_argument("--out-name", default="online_lgbm_rank.jsonl")
+    p.add_argument("--fresh-cache", action="store_true", help="compile into an empty TRITON_CACHE_DIR under --out")
+
     args = ap.parse_args(argv)
     if args.clock_lock is not None:
         os.environ["TUNE_CLOCK_LOCK"] = args.clock_lock
-    if args.cmd in ("analyze", "portfolio", "selectors", "learned"):
+    if args.cmd in ("analyze", "portfolio", "selectors", "learned", "topk"):
         args.data = args.data or default_data_dir()
     else:
         args.out = args.out or default_data_dir()

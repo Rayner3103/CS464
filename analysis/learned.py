@@ -188,10 +188,11 @@ def rank_targets(R: np.ndarray, model: str, hp: dict) -> np.ndarray:
 
 def fit_predict_rank(model: str, hp: dict, Xs: np.ndarray, Pc: np.ndarray, Fc: np.ndarray, R: np.ndarray,
                      train: np.ndarray, Xt: np.ndarray, Fct: np.ndarray, ok_t: np.ndarray, fallback: int,
-                     full: bool = False):
+                     full: bool = False, topk: int = 1):
     """Fit per-candidate rows of shapes `train` over their top-POOL_TOP pool; pick the best-predicted runnable pool
     member per target (Fct: target candidate features [target, config, feature]). full: also return the pool
-    (config columns) and the fitted estimator."""
+    (config columns) and the fitted estimator. topk > 1: return [target, topk] columns, best first (-1 past the
+    last runnable pool member)."""
     pool = np.unique(np.argsort(R[train], axis=1, kind="stable")[:, :POOL_TOP])
     Rt = R[np.ix_(train, pool)]
     si, cj = np.nonzero(np.isfinite(Rt))  # timed cells only (pruned / invalid have no time)
@@ -214,7 +215,11 @@ def fit_predict_rank(model: str, hp: dict, Xs: np.ndarray, Pc: np.ndarray, Fc: n
     else:
         s = est.predict(Xq)
     S = np.where(ok_t[:, pool], s.reshape(len(Xt), len(pool)), np.inf)
-    pick = np.where(np.isfinite(S.min(axis=1)), pool[S.argmin(axis=1)], fallback)
+    if topk > 1:
+        order = np.argsort(S, axis=1, kind="stable")[:, :topk]
+        pick = np.where(np.isfinite(np.take_along_axis(S, order, axis=1)), pool[order], -1)
+    else:
+        pick = np.where(np.isfinite(S.min(axis=1)), pool[S.argmin(axis=1)], fallback)
     return (pick, pool, est) if full else pick
 
 
@@ -361,6 +366,63 @@ def search_cached(ctx: dict, data: Path, log=print) -> dict:
     return doc["search"]
 
 
+class Ranker:
+    """The rank-form LightGBM selector as a standalone object: its booster plus the candidate pool (config keys) and
+    the GPU numbers the features need, so it can rank configs for any (M, N, K) without the screen. Saved as
+    <stem>.txt (LightGBM model text) + <stem>.json (pool, hyperparameters, gpu, training-set tag)."""
+
+    def __init__(self, booster, pool_keys: list[str], hp: dict, gpu: dict, meta: dict | None = None):
+        from tune.sweep import parse_key
+        self.booster, self.pool_keys, self.hp, self.gpu, self.meta = booster, list(pool_keys), hp, gpu, meta or {}
+        self.cfgs = [parse_key(k) for k in self.pool_keys]
+        self.Pc = config_params(self.cfgs)
+        from kernels.config_space import HwLimits
+        self.hw = HwLimits(gpu["smem_per_block_optin_bytes"], gpu["regs_per_sm"], gpu["sm_count"])
+
+    def scores(self, M: int, N: int, K: int) -> np.ndarray:
+        """Predicted log regret per pool member (lower is better; inf where the pruning rules reject it)."""
+        s = [{"M": M, "N": N, "K": K}]
+        X = pair_rows(shape_matrix(s, self.gpu["sm_count"]), self.Pc, candidate_features(s, self.cfgs, self.gpu),
+                      np.zeros(len(self.cfgs), int), np.arange(len(self.cfgs)))
+        pred = self.booster.predict(X)
+        pred = -pred if self.hp.get("objective") == "lambdarank" else pred
+        ok = np.array([runnable(c, M, N, K, self.hw) for c in self.cfgs])
+        return np.where(ok, pred, np.inf)
+
+    def rank(self, M: int, N: int, K: int, k: int = 5) -> list[str]:
+        sc = self.scores(M, N, K)
+        return [self.pool_keys[j] for j in np.argsort(sc, kind="stable")[:k] if np.isfinite(sc[j])]
+
+    def save(self, stem: Path) -> Path:
+        stem = Path(stem)
+        self.booster.save_model(str(stem.with_suffix(".txt")))
+        stem.with_suffix(".json").write_text(json.dumps(
+            {"pool": self.pool_keys, "hp": self.hp, "gpu": self.gpu, "meta": self.meta}, indent=1))
+        return stem.with_suffix(".json")
+
+    @classmethod
+    def load(cls, stem: Path) -> "Ranker":
+        import lightgbm as lgb
+        stem = Path(stem)
+        d = json.loads(stem.with_suffix(".json").read_text())
+        return cls(lgb.Booster(model_file=str(stem.with_suffix(".txt"))), d["pool"], d["hp"], d["gpu"], d["meta"])
+
+
+def train_ranker(data: Path, ctx: dict | None = None, log=print) -> tuple["Ranker", dict]:
+    """Refit lgbm_rank on every tune shape with its CV-chosen hyperparameters; save it as data/<hw>/lgbm_rank.*"""
+    ctx = ctx or context(data)
+    S = search_cached(ctx, data, log)
+    hp = S["lgbm_rank"]["grid"][0]["hp"]
+    cols, pool, est = fit_predict_rank("lgbm", hp, ctx["Xs"], ctx["Pc"], ctx["Fc"], ctx["R"], np.arange(len(ctx["R"])),
+                                       ctx["Xh"], ctx["Fch"], ctx["okh"], ctx["b6"], full=True, topk=TOPK)
+    gpu = json.loads((Path(data) / "env.json").read_text())["gpu"]
+    rk = Ranker(est.booster_, [ctx["keys"][j] for j in pool], hp, gpu,
+                {"tag": search_tag(ctx), "n_tune_shapes": len(ctx["shapes"]), "pool_top": POOL_TOP})
+    rk.save(Path(data) / "lgbm_rank")
+    return rk, {"ctx": ctx, "cols": cols, "pool": pool}
+
+
+TOPK = 5
 REFERENCE = ("b6", "knn5", "knnf")
 
 
@@ -515,3 +577,137 @@ def build(data: Path, report: Path, results: str = "results_lock1755_learned.jso
     out = Path(report) / "learned_selectors.md"
     out.write_text("\n".join(md) + "\n")
     return out, summary
+
+
+# ---------------------------------------------------------------- top-k + short online search (lgbm_rank)
+
+TOPK_REFS = ("knn5", "knnf")
+
+
+def _nanmin_cols(st: dict, names: list[str]) -> np.ndarray:
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return np.nanmin(np.stack([st[n] for n in names], axis=1), axis=1)
+
+
+def build_topk(data: Path, report: Path, results: str = "results_lock1755_topk.jsonl",
+               graph_results: str = "results_lock1755_topk_graph.jsonl", online: str = "online_lgbm_rank.jsonl",
+               log=print) -> tuple[Path, dict]:
+    """Train + save the ranker, write its top-TOPK picks per held-out shape (data/<hw>/learned_topk_picks.json, for
+    `triton:picks`), and score best-of-k: on the screen, with perfect (full-protocol stage-2) measurement, and with
+    the short online search (`tune online`) whose choice is then priced at its stage-2 time."""
+    rk, fit = train_ranker(data, log=log)
+    ctx, cols = fit["ctx"], fit["cols"]
+    keys, hshapes, Rh = ctx["keys"], ctx["hshapes"], ctx["Rh"]
+    tag = lambda s: f"{s['M']}x{s['N']}x{s['K']}"
+    standalone = [rk.rank(s["M"], s["N"], s["K"], TOPK) for s in hshapes]
+    mismatch = sum(a != [keys[j] for j in c if j >= 0] for a, c in zip(standalone, cols))
+    if mismatch:
+        raise RuntimeError(f"saved Ranker disagrees with the fitted model on {mismatch} held-out shapes")
+    sel = json.loads((Path(data) / "selector_picks.json").read_text())["by_selector"]
+    rank_names = [f"lgbm@{r}" for r in range(1, TOPK + 1)]
+    by = {n: {tag(s): (keys[cols[i, r]] if cols[i, r] >= 0 else None) for i, s in enumerate(hshapes)}
+          for r, n in enumerate(rank_names)}
+    by.update({n: sel[n] for n in TOPK_REFS})
+    (Path(data) / "learned_topk_picks.json").write_text(json.dumps(
+        {"selectors": rank_names + list(TOPK_REFS), "ranker": str(Path(data) / "lgbm_rank"), "hp": rk.hp,
+         "picks": {tag(s): sorted({by[n][tag(s)] for n in by if by[n][tag(s)]}) for s in hshapes},
+         "by_selector": {n: {t: k for t, k in d.items() if k} for n, d in by.items()}}, indent=1))
+
+    small = ctx["hT"].min(axis=1) < SMALL_US
+    pct = lambda x: f"{100 * x:.1f}%"
+    ms = lambda d: f"{pct(d['p50'])} / {pct(d['p95'])} ({pct(d['mean'])})" if d.get("n") else "-"
+    rows_i = np.arange(len(hshapes))
+    Rk = np.where(cols >= 0, Rh[rows_i[:, None], np.maximum(cols, 0)], np.inf)
+    summary = {"hp": rk.hp, "n_heldout_shapes": len(hshapes), "pool": len(rk.pool_keys),
+               "screen_best_of_k": {k: _stats(Rk[:, :k].min(axis=1)) for k in range(1, TOPK + 1)},
+               "screen_rank_hits": {r: int((Rk[:, r] <= Rk.min(axis=1)).sum()) for r in range(TOPK)}}
+    md = ["# Learned ranker: top-k + short online search on held-out shapes (auto-generated)\n",
+          f"lgbm_rank (`{json.dumps(rk.hp)}`) refit on all {len(ctx['shapes'])} tune shapes and saved as "
+          f"`data/<hw>/lgbm_rank.txt/.json` (pool of {len(rk.pool_keys)} configs). Per held-out shape its top {TOPK} runnable "
+          "configs are ranked; best-of-k = the fastest of the first k. Regret = t / oracle - 1, median / p95 (mean).\n",
+          "## Screen (regret vs the held-out screen oracle, full pruned space)\n",
+          "| k | all | >= 50 us | < 50 us |", "|---|---|---|---|"]
+    for k in range(1, TOPK + 1):
+        r = Rk[:, :k].min(axis=1)
+        md.append(f"| {k} | {ms(_stats(r))} | {ms(_stats(r[~small]))} | {ms(_stats(r[small]))} |")
+    held_keys = {n: [by[n][tag(s)] for s in hshapes] for n in by}
+    on_rows = {(r["M"], r["N"], r["K"]): r for r in _rows(Path(data) / online) if r.get("k") == TOPK}
+    for k in range(1, TOPK + 1):  # the online choice for each k, priced below at its stage-2 time
+        held_keys[f"online@{k}"] = [on_rows.get((s["M"], s["N"], s["K"]), {}).get("choice", {}).get(str(k), {}).get("key")
+                                    for s in hshapes]
+    if on_rows:
+        md.append(f"\nOnline search rows: {len(on_rows)} shapes from `{online}`.\n")
+    for label, fname in (("cold", results), ("graph", graph_results)):
+        rows = _rows(Path(data) / fname)
+        if not rows:
+            md.append(f"\n## Stage 2 ({label}): `{fname}` not found\n")
+            continue
+        st = stage2(rows, hshapes, held_keys)
+        have = np.isfinite(st["oracle"])
+        small2 = st["oracle"] < SMALL_US
+        g2 = ({"all": have, f">= {SMALL_US:.0f} us": have & ~small2, f"< {SMALL_US:.0f} us": have & small2}
+              if label == "cold" else {"all (< 50 us shapes)": have})
+        res = {"results": fname, "n_shapes": int(have.sum()), "n_rows": len(rows),
+               "n_invalid_rows": sum(not r.get("valid") for r in rows),
+               "power_capped_rows": sum(bool(int(r.get("throttle_reasons") or 0) & 0x4) for r in rows),
+               "session_ids": sorted({r["session_id"] for r in rows}),
+               "harness": sorted({(r.get("harness_commit") or "")[:7] + ("-dirty" if r.get("harness_dirty") else "") for r in rows}),
+               "perfect": {}, "online": {}, "refs": {}, "vs_b3plus": {}}
+        md.append(f"\n## Stage 2 ({label}): `{fname}`\n")
+        md.append(f"{res['n_shapes']} shapes, {res['n_rows']} rows, {res['n_invalid_rows']} invalid, "
+                  f"{res['power_capped_rows']} power-capped; sessions {', '.join(res['session_ids'])} "
+                  f"(harness {', '.join(res['harness'])}). Oracle = fastest Triton row (screen top-8 + every pick).\n")
+        md.append("| selector | " + " | ".join(f"{g} (n={int(m.sum())})" for g, m in g2.items()) + " | vs B3+ median [p10, p90] |")
+        md.append("|---|" + "---|" * (len(g2) + 1))
+        lines = []
+        for n in TOPK_REFS:
+            res["refs"][n] = {g: _stats(st[n][m] / st["oracle"][m]) for g, m in g2.items()}
+            lines.append((n, st[n], res["refs"][n]))
+        for k in range(1, TOPK + 1):
+            t = _nanmin_cols(st, rank_names[:k])
+            res["perfect"][k] = {g: _stats(t[m] / st["oracle"][m]) for g, m in g2.items()}
+            lines.append((f"lgbm best-of-{k}, full-protocol timing", t, res["perfect"][k]))
+        if on_rows:
+            for k in range(1, TOPK + 1):
+                t = st[f"online@{k}"]
+                res["online"][k] = {g: _stats(t[m & np.isfinite(t)] / st["oracle"][m & np.isfinite(t)]) for g, m in g2.items()}
+                res["online"][k]["missing"] = int((have & ~np.isfinite(t)).sum())
+                lines.append((f"lgbm online top-{k} (short timing picks)", t, res["online"][k]))
+        for name, t, d in lines:
+            v = _vs_bar(t[have], st["b3plus"][have])
+            res["vs_b3plus"][name] = v
+            md.append(f"| {name} | " + " | ".join(ms(d[g]) for g in g2)
+                      + (f" | {v['median']:.3f} [{v['p10']:.2f}, {v['p90']:.2f}] |" if v["n"] else " | - |"))
+        summary[f"stage2_{label}"] = res
+    if on_rows:
+        md.append("\n## Online search cost per shape (wall clock, empty Triton cache)\n")
+        md.append("Compile = first call + correctness check per candidate (JIT); timing = short protocol "
+                  f"({_short_desc()}).\n")
+        md.append("| k | compile s median / p90 | timing s median / p90 | total s median / p90 / sum over shapes | picked rank (0-based) counts |")
+        md.append("|---|---|---|---|---|")
+        cost = {}
+        for k in range(1, TOPK + 1):
+            ch = [r["choice"][str(k)] for r in on_rows.values()]
+            c, tm = np.array([x["compile_s"] for x in ch]), np.array([x["time_s"] for x in ch])
+            q = lambda x: f"{np.median(x):.2f} / {np.percentile(x, 90):.2f}"
+            ranks = np.bincount([x["rank"] for x in ch if x.get("rank") is not None], minlength=k).tolist()
+            cost[k] = {"compile_s_median": float(np.median(c)), "time_s_median": float(np.median(tm)),
+                       "total_s_sum": float((c + tm).sum()), "picked_rank_counts": ranks}
+            md.append(f"| {k} | {q(c)} | {q(tm)} | {q(c + tm)} / {(c + tm).sum():.0f} | {ranks} |")
+        summary["online_cost"] = cost
+        caches = sorted({str(r.get("triton_cache_dir")) for r in on_rows.values()})
+        md.append(f"\nTriton cache dir(s): {', '.join(f'`{c}`' for c in caches)}. Ranking itself: median "
+                  f"{1e3 * np.median([r['rank_s'] for r in on_rows.values()]):.0f} ms per shape.")
+    Path(report).mkdir(parents=True, exist_ok=True)
+    (Path(report) / "learned_topk_summary.json").write_text(json.dumps(summary, indent=1, default=str))
+    out = Path(report) / "learned_topk.md"
+    out.write_text("\n".join(md) + "\n")
+    return out, summary
+
+
+def _short_desc() -> str:
+    from tune import online as o
+    return (f"{o.SHORT_REPS} cold samples after {o.SHORT_WARMUP_MS:g} ms warmup, one placement; graph-amortized "
+            f"{o.GRAPH_BATCH} x {o.GRAPH_REPS} hot when the fastest is < {o.SMALL_US:g} us")

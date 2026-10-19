@@ -64,3 +64,38 @@ def test_fit_predict_rank_picks_from_runnable_pool():
                       ("lgbm", {"objective": "lambdarank", "num_leaves": 4, "n_estimators": 20})):
         pick, pool, _ = fit_predict_rank(model, hp, Xs, Pc, Fc, R, train, Xs[30:], Fc[30:], ok, fallback=0, full=True)
         assert set(pick) <= set(pool) and not (pick == 1).any()
+
+
+def test_online_choose_uses_graph_times_below_50us_and_sums_cost():
+    from tune.online import choose
+    c = [{"config_key": "a", "valid": True, "compile_s": 1.0, "time_s": 0.1, "cold_us": 20.0, "graph_us": 9.0},
+         {"config_key": "b", "valid": False, "compile_s": 0.5},
+         {"config_key": "c", "valid": True, "compile_s": 2.0, "time_s": 0.2, "cold_us": 19.0, "graph_us": 10.0}]
+    one = choose(c, 1)
+    assert one["key"] == "a" and one["mode"] == "graph" and one["compile_s"] == 1.0
+    three = choose(c, 3)
+    assert three["key"] == "a" and three["rank"] == 0  # graph time decides: 9 < 10 although c is faster cold
+    assert abs(three["compile_s"] - 3.5) < 1e-12 and abs(three["time_s"] - 0.3) < 1e-12
+    big = [dict(x, cold_us=x["cold_us"] * 10) for x in c if x["valid"]]
+    assert choose(big, 2)["key"] == "c" and choose(big, 2)["mode"] == "cold"
+    assert choose(c[1:2], 1)["key"] is None
+
+
+def test_ranker_save_load_round_trip(tmp_path):
+    import lightgbm as lgb
+    from analysis.learned import Ranker
+    gpu = {"smem_per_block_optin_bytes": 101376, "regs_per_sm": 65536, "sm_count": 68, "smem_per_sm_bytes": 102400,
+           "max_threads_per_sm": 1536}
+    pool = ["bm16_bn64_bk64_w4_s3_g1_sk1", "bm64_bn64_bk32_w4_s3_g8_sk1", "bm128_bn128_bk32_w8_s3_g8_sk1",
+            "bm32_bn64_bk64_w4_s4_g1_sk4"]
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(400, 35)).astype(np.float32)
+    est = lgb.LGBMRegressor(n_estimators=20, num_leaves=4, verbose=-1).fit(X, X[:, 22] - X[:, 0])
+    rk = Ranker(est.booster_, pool, {"objective": "regression"}, gpu, {"note": "toy"})
+    rk.save(tmp_path / "m")
+    back = Ranker.load(tmp_path / "m")
+    for M, N, K in ((1, 4096, 4096), (4096, 4096, 4096), (300, 77, 9000)):
+        top = rk.rank(M, N, K, 3)
+        assert top == back.rank(M, N, K, 3) and set(top) <= set(pool) and len(top) <= 3
+        assert np.allclose(rk.scores(M, N, K), back.scores(M, N, K))
+    assert back.meta == {"note": "toy"}
