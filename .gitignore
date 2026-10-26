@@ -4,3 +4,5 @@ __pycache__/
 .pytest_cache/
 # Benchmark outputs are large and machine-specific; keep only env.json + summaries in reports/
 data/
+pipeline/runs/
+pipeline/.lock
