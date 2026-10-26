@@ -4,6 +4,28 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-10-27: fp16-accumulation test was seed-dependent (found on an RTX 2060 test run)
+
+**What ran.** A `pytest` run on an RTX 2060 (sm_75) gave 94 passed, 2 failed. No benchmark rows were produced, so no session ids apply.
+- `test_detects_fp16_accumulation` failed: the fake fp16-accumulating kernel (K = 8192) passed the correctness gate. Not a 2060 bug. Re-run on the RTX 3080 over 20 seeds,
+  the gate rejects that kernel on only **9 of 20** seeds (a correct fp32-accumulate kernel is accepted 20 of 20). The test used seed 0, which happens to be a rejecting seed on the 3080.
+  A different GPU can draw different inputs from the same seed (PyTorch's CUDA `randn` layout depends on the SM count; not verified on the 2060).
+- `test_handpicked_correct[shape0-large_square]` failed with `ptxas failed with error code -1` and an empty stderr at shape (1, 1, 1), config 128x256x32 / 8 warps for `sm_75`.
+  The PTX in the log compiles cleanly with Triton's ptxas for `sm_75` on the 3080 machine (exit 0), and the same config passed on other shapes, so this looks like a killed process
+  (memory or limits) on the 2060 machine. **Unresolved:** not reproduced, not fixed.
+
+**What the gate does and does not catch.** RMS error against the fp32 reference, fp16-accumulate over fp32-accumulate, on the same inputs: about 11x at K = 8192, 15-16x at K = 16384,
+about 32x at K = 65536. The gate's relative tolerance (1e-2 of |ref|) is roughly 20x above a correct kernel's error, so a kernel that accumulates in fp16 can slip through at short K.
+Nonzero-mean inputs did not help (mean 1: rejected 5 of 20 at K = 8192, 0 of 20 at K = 2048).
+
+**Change.** `tests/test_correctness.py`: the gate test now uses K = 16384 (rejected 20 of 20 seeds on the 3080), and a new test compares the RMS errors directly (`bad > 5 x good`,
+seed- and architecture-independent). Gate tolerances are unchanged, so no gate in the plan moved and no earlier result is affected. Full suite on the 3080: 97 passed.
+
+**Next steps.** Re-run `pytest tests/test_correctness.py` on the 2060 to confirm both new tests pass there. Repeat the `large_square` (1, 1, 1) test several times and check `dmesg` for an OOM kill.
+Consider pruning or skipping the 128x256 tile on sm_75, where it compiles to a very large unrolled kernel.
+
+Reproduce: `python -m pytest -q tests/test_correctness.py`.
+
 ## Update 2026-10-19 (evening): inner variety pass (warps / stages within the top tile) — fixes one shape, otherwise a tie
 
 **What changed.** `diverse_order` gained an optional inner pass. Within the top pick's (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K) group, it adds up to `inner` configs with a new
