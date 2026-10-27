@@ -91,10 +91,15 @@ Measuring commands pin the process to one CPU core and write under `data/<hw_id>
 | `topk [--results ... --graph-results ... --online ...]` | Refit lgbm_rank on all tune shapes, save `data/<hw>/lgbm_rank.txt/.json`, write top-5 picks per held-out shape, score best-of-k and the online search | `data/<hw>/learned_topk_picks.json`, `reports/learned_topk.md` |
 | `online --shapes-file ... --k 5 [--order diverse\|inner] --fresh-cache` | First-use search: rank (plain or diversified top-k), compile + validate + short-time the top k (empty Triton cache), keep the fastest; choices for every k' <= k stored | `online_lgbm_rank[_diverse].jsonl` |
 
-Not part of `python -m tune`: `python -m analysis.zero_shot run --ranker <dir>/lgbm_rank --fresh-cache` runs the saved ranker (variants `as_is` with the
-source GPU's numbers and `native` with this device's) with diversified top-3 + the short online search on the held-out shapes of the GPU it runs on, and
-`... score` compares the picks with that GPU's `sweep_screen_heldout` oracle (`reports/zero_shot_<hw_id>.md`). It needs the screen from `tune sweep --split heldout`
-on the same GPU first. Same GPU job hygiene as everything else (section 7).
+Not part of `python -m tune`: `python -m analysis.zero_shot` runs the saved ranker on another GPU with no refit (variants `as_is` with the source GPU's numbers and
+`native` with this device's; diversified top-3 + the short online search) and scores it against that GPU's own held-out screen (`reports/zero_shot_<hw_id>.md`).
+Runbook (full version and how to read the report in the module docstring), same GPU job hygiene as section 7:
+1. Copy `lgbm_rank.txt` and `lgbm_rank.json` from the source GPU's `data/<hw>/` by hand (`data/` is gitignored; the model is ~35 MB). Match `requirements.txt` versions.
+2. Pick an SM clock lock the target GPU holds under load and use it for every command (`--clock-lock X`); only compare sessions with the same lock and driver.
+3. The oracle: `python -m tune --clock-lock X sweep --split heldout --per-suite 1000` (the same 86 shapes as the 3080 run; ~1.3 h there).
+4. `python -m analysis.zero_shot --clock-lock X run --ranker <dir>/lgbm_rank --fresh-cache`, then `python -m analysis.zero_shot --clock-lock X score`
+   (`--clock-lock` goes before the subcommand; `run` resumes; never overlap it with the sweep).
+5. Add a dated update to `reports/week1.md` with the table.
 
 ### Backend spec strings (`--backends`, comma-separated; `runner.candidates_for`)
 

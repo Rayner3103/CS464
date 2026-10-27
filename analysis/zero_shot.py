@@ -13,11 +13,26 @@ Two variants separate what the model gets wrong from what the features get wrong
 Both use the diversified top-k (`order="diverse"`, the saved CV-chosen rule) with the short online search, and store the
 choice for every k' <= k, so top-1 (no online search) and best-of-k come from one run.
 
-Runbook on the target machine (GPU idle, standard conditions, see AGENTS.md section 7):
-  1. screen the held-out shapes there (the oracle; hours):   python -m tune --clock-lock MHZ sweep --split heldout
-  2. copy the source model next to this machine's data:      data/<src_hw>/lgbm_rank.{txt,json} -> any directory
-  3. python -m analysis.zero_shot run   --ranker <dir>/lgbm_rank --fresh-cache
-  4. python -m analysis.zero_shot score
+Runbook on the target machine (e.g. an RTX 2060; GPU idle, one GPU job at a time, AGENTS.md section 7):
+  0. check out the commit with this module (the saved model is NOT in git: data/ is gitignored, lgbm_rank.txt is ~35 MB, so
+     copy data/<src_hw>/lgbm_rank.txt and lgbm_rank.json to this machine by hand); pip versions must match requirements.txt
+  1. pytest -q tests/test_correctness.py tests/test_zero_shot.py     and     python -m tune env
+  2. lock the SM clock to a value this GPU holds under load (sudo nvidia-smi -lgc X,X) and use the same X everywhere below;
+     the 3080's 1755 MHz does not apply, and numbers are only comparable at equal lock state and driver
+  3. the oracle, this GPU's own screen of the held-out shapes (hours; ~1.3 h on the 3080, expect longer on a 2060):
+        python -m tune --clock-lock X sweep --split heldout --per-suite 1000
+     --per-suite 1000 gives the same 86 shapes as the 3080 run (the default of 24 per suite is a smaller subset)
+  4. python -m analysis.zero_shot --clock-lock X run --ranker <dir>/lgbm_rank --fresh-cache
+     (--clock-lock goes before the subcommand; only start this after step 3 has finished: never two GPU jobs at once)
+  5. python -m analysis.zero_shot --clock-lock X score          -> reports/zero_shot_<hw_id>.md (+ _summary.json)
+
+Reading the report: online-3 and best-of-3 of `native` vs `as_is` (the gap is what the source GPU's numbers in the features
+cost); the 3080 reference rows at the bottom; the `fixed` row (if the ranker barely beats one reused config the transfer is
+weak); and the no-pick / unscored counts and invalid picks per shape (a high rate for as_is means the source GPU's limits
+produce configs this GPU cannot compile). Caveats: the `native` pruner assumes Ampere-style stage buffers, so on Turing it
+may drop tiles that would run (conservative, a lower bound); 6 GB cards record a too-large shape as a failed shape; a hard
+CUDA fault poisons the process, so rerun `run` (it resumes). Afterwards add a dated update to reports/week1.md (AGENTS.md
+section 7) with the session ids, row counts and the table.
 
 `run` is resumable. Scoring needs no GPU: pass --data to score on another machine. Never fit anything on these shapes.
 """
