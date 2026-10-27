@@ -51,7 +51,8 @@ analysis/
   learned.py         learned selectors v0: DT, linear SVM, LightGBM, RF, logistic regression; cls and rank forms; grouped CV;
                      Ranker (saved lgbm_rank), top-k scoring (build_topk)
   alloc_variance.py  allocation-placement noise experiment
-tests/       pytest unit tests (55 tests; most need a CUDA GPU)
+  zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`)
+tests/       pytest unit tests (102 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)
@@ -89,6 +90,11 @@ Measuring commands pin the process to one CPU core and write under `data/<hw_id>
 | `learned [--results ... --graph-results ...]` | Grouped-CV grid search (cached, ~2 h first run) and held-out scoring of the 10 learned selectors; reads `selector_picks.json` for b6/knn5/knnf | `data/<hw>/learned_picks.json`, `learned_search.json`, `reports/learned_selectors.md` |
 | `topk [--results ... --graph-results ... --online ...]` | Refit lgbm_rank on all tune shapes, save `data/<hw>/lgbm_rank.txt/.json`, write top-5 picks per held-out shape, score best-of-k and the online search | `data/<hw>/learned_topk_picks.json`, `reports/learned_topk.md` |
 | `online --shapes-file ... --k 5 [--order diverse\|inner] --fresh-cache` | First-use search: rank (plain or diversified top-k), compile + validate + short-time the top k (empty Triton cache), keep the fastest; choices for every k' <= k stored | `online_lgbm_rank[_diverse].jsonl` |
+
+Not part of `python -m tune`: `python -m analysis.zero_shot run --ranker <dir>/lgbm_rank --fresh-cache` runs the saved ranker (variants `as_is` with the
+source GPU's numbers and `native` with this device's) with diversified top-3 + the short online search on the held-out shapes of the GPU it runs on, and
+`... score` compares the picks with that GPU's `sweep_screen_heldout` oracle (`reports/zero_shot_<hw_id>.md`). It needs the screen from `tune sweep --split heldout`
+on the same GPU first. Same GPU job hygiene as everything else (section 7).
 
 ### Backend spec strings (`--backends`, comma-separated; `runner.candidates_for`)
 
