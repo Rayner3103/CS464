@@ -147,9 +147,13 @@ def score_rows(screen: dict, rows: list[dict], k: int, fixed: str | None = None)
     quality, free of online-timing noise); online-k' = what the short search actually chose."""
     out: dict[str, list] = {}
     meta = []   # (shape oracle us) for the regime split, aligned with every list
+    n_skipped = 0
     for r in rows:
         t = screen.get((r["M"], r["N"], r["K"]))
         if not t:
+            continue
+        if r.get("skipped"):  # tensors did not fit in VRAM (tune.online.search_shape): not scorable, not a bad pick
+            n_skipped += 1
             continue
         meta.append(min(t.values()))
         cands = r["candidates"]
@@ -161,9 +165,10 @@ def score_rows(screen: dict, rows: list[dict], k: int, fixed: str | None = None)
             out.setdefault(f"online-{j}", []).append(regret(t, r["choice"][str(j)]["key"]))
         out["invalid_picks"] = out.get("invalid_picks", []) + [sum(not c["valid"] for c in cands[:k])]
     if fixed is not None:
-        shapes = [(r["M"], r["N"], r["K"]) for r in rows if screen.get((r["M"], r["N"], r["K"]))]
+        shapes = [(r["M"], r["N"], r["K"]) for r in rows if screen.get((r["M"], r["N"], r["K"])) and not r.get("skipped")]
         out["fixed"] = [regret(screen[s], fixed) for s in shapes]
     out["_oracle_us"] = meta
+    out["_skipped"] = n_skipped
     return out
 
 
@@ -199,10 +204,11 @@ def build(data: Path, report: Path, *, screen_name: str = "sweep_screen_heldout"
         rows = [r for r in rows if r.get("k") == k]
         sc = score_rows(screen, rows, k, fixed)
         oracle = np.array(sc.pop("_oracle_us"))
+        n_skipped = sc.pop("_skipped")
         inv = sc.pop("invalid_picks", [])
         masks = {"all": None, ">= 50 us": oracle >= SMALL_US, "< 50 us": oracle < SMALL_US}
         summary["variants"][v] = {
-            "n_shapes": len(oracle), "invalid_picks_per_shape_mean": float(np.mean(inv)) if inv else None,
+            "n_shapes": len(oracle), "n_skipped_oom": n_skipped, "invalid_picks_per_shape_mean": float(np.mean(inv)) if inv else None,
             "scores": {name: {g: summarize(vals, m) for g, m in masks.items()} for name, vals in sc.items()}}
     lines = [f"# Zero-shot selector transfer: `{data.name}`", "",
              f"Source model: lgbm_rank fit on another GPU, no refit. Oracle: this GPU's held-out screen "
@@ -212,7 +218,8 @@ def build(data: Path, report: Path, *, screen_name: str = "sweep_screen_heldout"
     for v, d in summary["variants"].items():
         inv = d["invalid_picks_per_shape_mean"]
         lines += [f"## Variant `{v}` ({d['n_shapes']} shapes, {'n/a' if inv is None else f'{inv:.2f}'} invalid picks per shape "
-                  f"out of {k})", "", "| pick | all | >= 50 us | < 50 us | within 2% | no pick | unscored |", "|---|---|---|---|---|---|---|"]
+                  f"out of {k}"
+                  + (f"; {d['n_skipped_oom']} shapes skipped, out of VRAM" if d["n_skipped_oom"] else "") + ")", "", "| pick | all | >= 50 us | < 50 us | within 2% | no pick | unscored |", "|---|---|---|---|---|---|---|"]
         for name, g in d["scores"].items():
             lines.append(f"| {name} | {fmt(g['all'])} | {fmt(g['>= 50 us'])} | {fmt(g['< 50 us'])} | "
                          f"{100 * g['all'].get('within_eps', 0):.0f}% | {g['all'].get('no_pick', 0)} | {g['all'].get('unscored', 0)} |")

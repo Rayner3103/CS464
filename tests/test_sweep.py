@@ -50,3 +50,47 @@ def test_top_configs_and_torn_partial(tmp_path):
     p = tmp_path / "x.partial.jsonl"
     p.write_text(json.dumps(rows[0]) + "\n" + '{"key": "bm1')
     assert [r["key"] for r in read_partial(p)] == [keys[0]]
+
+
+def test_workers_for_is_capped_by_the_scarcest_resource():
+    from tune.sweep import workers_for
+    assert workers_for(10, 12, 60.0, 10000.0) == (10, "")
+    n, why = workers_for(10, 12, 16.0, 5000.0)             # 16 GB machine: (16 - 3) / 1 GiB = 13, VRAM (5000 - 768) / 450 = 9
+    assert n == 9 and "VRAM" in why
+    n, why = workers_for(0, 12, 8.0, 5000.0)               # auto = 10, but 8 GiB free leaves room for 5
+    assert n == 5 and "host RAM" in why
+    assert workers_for(10, 4, None, None)[0] == 4          # unknown memory is not a limit; CPUs still are
+    assert workers_for(10, 12, 2.0, 100.0)[0] == 1         # never below one worker
+
+
+def test_shape_vram_bytes_counts_fp32_reference():
+    from tune.sweep import shape_vram_bytes
+    M = N = K = 1024
+    assert shape_vram_bytes(M, N, K) == 2 * 3 * 2**20 + 4 * 2 * 2**20 + 4 * 2**20 + 576 * 2**20
+
+
+def test_prewarm_halves_the_pool_when_workers_die_and_keeps_finished_chunks():
+    from kernels.triton_matmul import MatmulConfig
+    from tune.sweep import prewarm
+    cfgs = [MatmulConfig(16, 16, 16, num_warps=2, num_stages=2, GROUP_M=1, SPLIT_K=1 + i % 2) for i in range(8)]
+    calls = []
+
+    def pool(chunks, workers):
+        calls.append((workers, sorted(chunks)))
+        if workers > 2:                                    # pool broken after finishing the first two chunks only
+            return {i: {f"c{i}": (0.0, None)} for i in sorted(chunks)[:2]}
+        return {i: {f"c{i}": (0.0, None)} for i in chunks}
+
+    res = prewarm(cfgs, 64, 64, 64, workers=8, pool=pool, log=lambda *_: None)
+    assert [w for w, _ in calls] == [8, 4, 2]
+    assert len(set(calls[1][1]) & set(calls[0][1][:2])) == 0   # finished chunks are not redone
+    assert len(res) == 32                                      # 8 workers x 4 chunks, each reported once
+
+
+def test_prewarm_gives_up_at_one_worker_instead_of_raising():
+    from kernels.triton_matmul import MatmulConfig
+    from tune.sweep import prewarm
+    cfgs = [MatmulConfig(16, 16, 16, num_warps=2, num_stages=2, GROUP_M=1, SPLIT_K=1)]
+    logs = []
+    assert prewarm(cfgs, 64, 64, 64, workers=2, pool=lambda c, w: {}, log=logs.append) == {}
+    assert any("lazily" in m for m in logs)

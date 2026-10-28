@@ -70,8 +70,13 @@ def search_shape(ranker, M: int, N: int, K: int, k: int, dtype=torch.float16, or
     t0 = time.perf_counter()
     keys = ranker.rank(M, N, K, k, order=order)
     rank_s = time.perf_counter() - t0
-    a, b, _ = placed_inputs(M, N, K, dtype, seed=0)
-    ref = reference(a, b)
+    try:
+        a, b, _ = placed_inputs(M, N, K, dtype, seed=0)
+        ref = reference(a, b)
+    except torch.OutOfMemoryError as e:  # the shape's tensors + fp32 reference do not fit: record it, do not kill the run
+        a = b = ref = None
+        torch.cuda.empty_cache()
+        return {"rank_s": rank_s, "candidates": [], "skipped": f"oom_inputs: {str(e).splitlines()[0][:150]}"}
     cands = []
     for key in keys:
         backend = TritonMatmul(ranker.cfgs[ranker.pool_keys.index(key)])

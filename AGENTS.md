@@ -81,7 +81,7 @@ Measuring commands pin the process to one CPU core and write under `data/<hw_id>
 | `roofline` | B0: measured peak tensor TFLOP/s and DRAM bandwidth vs spec | `roofline.json` |
 | `benchmark --suite S1,S2 --backends ... --cache-modes cold[,hot]` | Validate, then time every (shape, candidate). Resumable, `--budget 30m`, `--n-allocs 3`, `--graph-batch N` (hot only: CUDA-graph amortized), `--shapes-file`, `--out-name`, `--prune-shapes` | `<out-name>.jsonl` + `.raw.jsonl` |
 | `baseline` | Alias of `benchmark` with `--which` defaulting to `torch,triton_tutorial` | same |
-| `sweep [--split tune\|heldout] [--per-suite N] [--max-gflop G] [--workers W]` | Stage-1 screen: every pruned Triton config on a stratified shape subset (`--list-only` writes the subset only) | `sweep_screen[_heldout]/` (one JSON per shape + `subset.json`) |
+| `sweep [--split tune\|heldout] [--per-suite N] [--max-gflop G] [--workers W]` | Stage-1 screen: every pruned Triton config on a stratified shape subset (`--list-only` writes the subset only). `--workers 0` (default) = auto: up to 10, capped by free host RAM and VRAM (~1 GiB + ~450 MiB per worker, measured); a killed worker halves the pool, a shape that does not fit in VRAM is recorded as `skipped` (retried on the next run) | `sweep_screen[_heldout]/` (one JSON per shape + `subset.json`) |
 | `noise --rounds 3 --repeats 100` | Noise-floor study over `suites/v1/noise.json` | `noise.jsonl` |
 | `drift --minutes 10` | Continuous 8192³ thermal-drift run | `drift-*.csv` |
 | `analyze --results results_lock1755.jsonl` | Tables + figures; output names get the results tag as a suffix | `reports/week1_results*.md`, `reports/figures/` |

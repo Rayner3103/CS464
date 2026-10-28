@@ -66,3 +66,13 @@ def test_build_writes_report(tmp_path):
     assert list(summary["variants"]) == ["native"]            # as_is has no rows: skipped, not an error
     assert summary["variants"]["native"]["scores"]["online-3"]["all"]["median"] == 0.0
     assert "Zero-shot selector transfer: `hw_x`" in out.read_text()
+
+
+def test_skipped_oom_rows_are_not_scored_as_bad_picks(tmp_path):
+    screen = zs.load_screen(_screen(tmp_path, {(1, 2, 3): {"a": 10.0, "b": 12.0}, (4, 5, 6): {"a": 1.0, "b": 2.0}}))
+    skipped = {"M": 4, "N": 5, "K": 6, "k": 3, "candidates": [], "skipped": "oom_inputs: x",
+               "choice": {str(j): {"key": None} for j in (1, 2, 3)}}
+    ok = _row(1, 2, 3, [("a", True), ("b", True), ("a", True)], ["a", "a", "a"])
+    sc = zs.score_rows(screen, [ok, skipped], 3, fixed="b")
+    assert sc["_skipped"] == 1 and sc["_oracle_us"] == [10.0]
+    assert sc["online-3"] == [0.0] and sc["fixed"] == pytest.approx([0.2])

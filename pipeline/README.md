@@ -22,7 +22,7 @@ shapes against `torch.matmul` and a searched cuBLASLt (B3+). Everything it write
 | git | The harness records the commit and dirty state on every row |
 | Network | First run downloads torch (cu130 wheel, about 3 GB with its CUDA libraries) and the other pinned packages. Override the wheel index with `TORCH_INDEX_URL` |
 | Disk | ≥ 20 GB free (venv ≈ 8 GB; a full run's data is several GB) |
-| CPU / RAM | The sweep compiles in parallel (`--workers`, default 10). 12 cores and 16 GB or more are comfortable |
+| CPU / RAM | The sweep compiles in parallel (`--workers`, default auto: up to 10, capped so each worker (~1 GiB RAM, ~450 MiB VRAM) fits in free memory). On a 16 GB RAM / 6 GB VRAM machine expect 3-4 workers, so the sweep is slower but does not run out of memory |
 | Idle GPU | No other compute process may be using the GPU. Overlapping jobs contaminate timings. The script checks before every GPU stage and stops if it finds one |
 | sudo | Only for you to lock the clock (below). The script never calls sudo |
 
@@ -90,7 +90,7 @@ Run order, with the `tune` command behind each. Logs are `pipeline/runs/<run>/lo
 --skip-install                 use the current `python` on PATH (checks the pinned versions, installs nothing)
 --skip-tests                   skip pytest
 --venv DIR, --python BIN       virtualenv location, interpreter used to create it
---workers N                    parallel sweep compile workers (default 10)
+--workers N                    parallel sweep compile workers (default 0 = auto, capped by free RAM / VRAM)
 --list-stages, --check-only
 ```
 

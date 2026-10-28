@@ -237,7 +237,7 @@ def main(argv=None):
     p.add_argument("--suite", default="all")
     p.add_argument("--per-suite", type=int, default=24, help="shapes per suite in the coarse subset")
     p.add_argument("--max-gflop", type=float, default=1200.0, help="skip shapes above this many GFLOP")
-    p.add_argument("--workers", type=int, default=10, help="parallel compile processes")
+    p.add_argument("--workers", type=int, default=0, help="parallel compile processes; 0 = auto (up to 10). Either way capped by free host RAM and VRAM (~1 GiB and ~450 MiB per worker), see tune/sweep.py")
     p.add_argument("--session", default=None)
     p.add_argument("--list-only", action="store_true", help="write the subset and stop")
     p.add_argument("--split", choices=["tune", "heldout"], default="tune",

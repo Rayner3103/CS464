@@ -24,7 +24,7 @@ VENV="$REPO/pipeline/.venv"
 PYTHON_BIN="${PYTHON:-python3}"
 SKIP_INSTALL=0
 SKIP_TESTS=0
-WORKERS=10
+WORKERS=0
 FROM=""
 ONLY=""
 CHECK_ONLY=0
@@ -49,7 +49,7 @@ Options:
   --python BIN            interpreter used to create the venv (default python3, or \$PYTHON)
   --skip-install          use the current 'python' on PATH as is (checks the pinned versions, installs nothing)
   --skip-tests            skip the pytest stage
-  --workers N             parallel compile workers for the Triton sweep (default $WORKERS)
+  --workers N             parallel compile workers for the Triton sweep (default 0 = auto: up to 10, capped by free RAM / VRAM)
   --from STAGE            start at STAGE (earlier stages are assumed done)
   --only STAGE[,STAGE]    run only these stages
   --force                 re-run stages even if marked done
