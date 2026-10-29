@@ -51,6 +51,7 @@ analysis/
   learned.py         learned selectors v0: DT, linear SVM, LightGBM, RF, logistic regression; cls and rank forms; grouped CV;
                      Ranker (saved lgbm_rank), top-k scoring (build_topk)
   alloc_variance.py  allocation-placement noise experiment
+  plots.py           figures + reports/results_overview.md for the current state (baselines, noise, selectors, kernel-selection stats); CPU-only, reads existing results (`python -m analysis.plots`)
   zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`)
 tests/       pytest unit tests (102 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
@@ -91,7 +92,8 @@ Measuring commands pin the process to one CPU core and write under `data/<hw_id>
 | `topk [--results ... --graph-results ... --online ...]` | Refit lgbm_rank on all tune shapes, save `data/<hw>/lgbm_rank.txt/.json`, write top-5 picks per held-out shape, score best-of-k and the online search | `data/<hw>/learned_topk_picks.json`, `reports/learned_topk.md` |
 | `online --shapes-file ... --k 5 [--order diverse\|inner] --fresh-cache` | First-use search: rank (plain or diversified top-k), compile + validate + short-time the top k (empty Triton cache), keep the fastest; choices for every k' <= k stored | `online_lgbm_rank[_diverse].jsonl` |
 
-Not part of `python -m tune`: `python -m analysis.zero_shot` runs the saved ranker on another GPU with no refit (variants `as_is` with the source GPU's numbers and
+Not part of `python -m tune`: `python -m analysis.plots [--theme light|dark] [--only baselines,noise,selectors,selection]` redraws every overview figure into `reports/figures/overview/` and rewrites
+`reports/results_overview.md` from the files already in `data/<hw>/` and `reports/`. It never touches the GPU (safe next to a running job), so it is not a `tune` subcommand, which imports torch. `python -m analysis.zero_shot` runs the saved ranker on another GPU with no refit (variants `as_is` with the source GPU's numbers and
 `native` with this device's; diversified top-3 + the short online search) and scores it against that GPU's own held-out screen (`reports/zero_shot_<hw_id>.md`).
 Runbook (full version and how to read the report in the module docstring), same GPU job hygiene as section 7:
 1. Copy `lgbm_rank.txt` and `lgbm_rank.json` from the source GPU's `data/<hw>/` by hand (`data/` is gitignored; the model is ~35 MB). Match `requirements.txt` versions.
