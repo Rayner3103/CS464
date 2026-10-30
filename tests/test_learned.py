@@ -81,6 +81,20 @@ def test_online_choose_uses_graph_times_below_50us_and_sums_cost():
     assert choose(c[1:2], 1)["key"] is None
 
 
+def test_online_choose_joint_counts_lt_candidates_and_cost():
+    from tune.online import choose
+    t = lambda key, cold, comp, fam=None: dict({"config_key": key, "valid": True, "compile_s": comp, "time_s": 0.01,
+                                               "cold_us": cold, "graph_us": cold}, **({"family": fam} if fam else {}))
+    c = [t("t0", 100.0, 0.5, "triton"), t("t1", 90.0, 0.5, "triton"), t("h0", 95.0, 0.05, "cublaslt"),
+         t("h1", 80.0, 0.0, "cublaslt")]
+    assert choose(c, 1)["key"] == "h1" and choose(c, 1)["family"] == "cublaslt"  # all cuBLASLt candidates by default
+    assert choose(c, 1, 0)["key"] == "t0"                                          # lt_n = 0: Triton only
+    assert choose(c, 2, 1)["key"] == "t1"                                          # lt_n = 1: h0 (95) loses to t1 (90)
+    assert abs(choose(c, 2, 1)["compile_s"] - 1.05) < 1e-12 and abs(choose(c, 1, 0)["compile_s"] - 0.5) < 1e-12
+    old = [{k: v for k, v in x.items() if k != "family"} for x in c[:2]]            # pre-joint rows: all Triton
+    assert choose(old, 1)["key"] == "t0" and choose(old, 2)["key"] == "t1"
+
+
 def test_ranker_save_load_round_trip(tmp_path):
     import lightgbm as lgb
     from analysis.learned import Ranker
