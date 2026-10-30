@@ -13,12 +13,16 @@ Isolation: each shape runs in its own subprocess, which appends one line per con
 (a config faulted the CUDA context), the parent marks the config after the last written line as crashed and restarts
 from there. Compilation runs first in parallel worker processes (`warmup`, no launch) to fill Triton's disk cache.
 
-Memory: every compile worker is a spawned process with its own torch + CUDA context (measured on an RTX 3080: ~0.8 GiB
-host RAM peak including ptxas, ~360 MiB VRAM). Ten of them is ~8 GiB + ~3.6 GiB, which a 16 GB / 6 GB machine that also
-drives a display cannot spare, so `workers_for` sizes the pool from free host RAM and free VRAM, and `prewarm` halves the
-pool and retries the unfinished chunks if a worker is killed (whatever it did not compile is JIT-compiled lazily by the
-screen process, only slower). A shape whose tensors do not fit in free VRAM is recorded as skipped (with the reason),
-not retried as a series of "crashed configs".
+Memory: every compile worker is a spawned process with its own torch + CUDA context (~0.85 GiB host RAM right after
+start, ~360 MiB VRAM). Triton keeps every kernel a process compiles in its JIT cache, so a worker's RSS also grows by
+~0.6 MiB per config (measured on an RTX 3080 compiling a 1062-config share of 2000^3: 0.87 GiB after 40 configs, 1.49 GiB
+after 1062). A long-lived worker therefore outgrows any per-worker budget: on a 16 GB / 6 GB machine ten of them
+(~1.4 GiB each by the end of a shape) made the kernel OOM killer take down the desktop session mid-sweep. So each chunk
+runs in a fresh process (`max_tasks_per_child=1`, CHUNK_CONFIGS configs per chunk), which bounds a worker at ~1.0 GiB;
+`workers_for` sizes the pool from free host RAM and free VRAM, once per shape; and `prewarm` halves the pool and
+retries the unfinished chunks if a worker is killed (whatever it did not compile is JIT-compiled lazily by the screen
+process, only slower). A shape whose tensors do not fit in free VRAM is recorded as skipped (with the reason), not
+retried as a series of "crashed configs".
 """
 from __future__ import annotations
 
@@ -72,10 +76,13 @@ def shape_configs(M: int, N: int, K: int):
     return first + rest, dropped
 
 
-# Per compile worker, measured on an RTX 3080 with an empty Triton cache (heavy tiles included): 0.80 GiB host RSS (own
-# process + ptxas children) and ~363 MiB VRAM. Rounded up; the reserves leave room for the parent, the OS and a desktop.
+# Per compile worker, measured on an RTX 3080 with an empty Triton cache: RSS starts at ~0.85 GiB (torch + CUDA context) and
+# grows ~0.6 MiB per compiled config (the JIT cache keeps every kernel), so a chunk of CHUNK_CONFIGS configs peaks at
+# ~1.0 GiB; ptxas children and sampling gaps are covered by rounding up. VRAM ~363 MiB. The reserves leave room for the
+# parent, the OS and a desktop.
 DEFAULT_WORKERS = 10
-WORKER_HOST_GIB, WORKER_VRAM_MIB = 1.0, 450.0
+CHUNK_CONFIGS = 200  # configs per compile task; each task runs in a fresh process, which bounds the worker's RSS growth
+WORKER_HOST_GIB, WORKER_VRAM_MIB = 1.25, 450.0
 HOST_RESERVE_GIB, VRAM_RESERVE_MIB = 3.0, 768.0
 EXIT_OOM = 4  # the screen process could not fit this shape's tensors in VRAM
 
@@ -153,7 +160,7 @@ def _compile_pool(chunks: dict[int, tuple], workers: int) -> dict[int, dict]:
     from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
     done: dict[int, dict] = {}
     try:
-        with ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn")) as ex:
+        with ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), max_tasks_per_child=1) as ex:
             futs = {ex.submit(_warm_worker, c): i for i, c in chunks.items()}
             for f in as_completed(futs):
                 try:
@@ -171,7 +178,8 @@ def prewarm(cfgs, M: int, N: int, K: int, workers: int, pool=_compile_pool, log=
     """Compile every config of a shape in `workers` processes. If workers die, halve the pool and redo only the unfinished
     chunks; with one worker left that still fails, return what finished (the screen process compiles the rest lazily)."""
     dicts = [c.to_dict() for c in cfgs]
-    pending = {i: (dicts[i::workers * 4], M, N, K) for i in range(workers * 4)}
+    n_chunks = max(workers * 4, -(-len(dicts) // CHUNK_CONFIGS))  # small chunks: a worker's RSS grows with what it compiled
+    pending = {i: (dicts[i::n_chunks], M, N, K) for i in range(n_chunks)}
     res: dict = {}
     while pending:
         for i, d in pool(pending, workers).items():
@@ -386,12 +394,16 @@ def run_sweep(shapes: list[dict], out_dir: Path, *, workers: int, session_id: st
     from tune.env import write_env
     sweep_dir = out_dir / screen_dir
     env = write_env(out_dir, session_id=session_id, kind="sweep")
-    workers, why = workers_for(workers, os.cpu_count() or 1, host_available_gib(), gpu_free_mib())
-    log(f"compile workers: {workers}" + (f" ({why})" if why else ""))
+    requested, last = workers, None
     t0 = time.perf_counter()
     manifest = {"session_id": env["session_id"], "screen_version": SCREEN_VERSION, "shapes": []}
     for i, s in enumerate(shapes):
         M, N, K = s["M"], s["N"], s["K"]
+        # Free memory is re-read before every shape: the desktop and other jobs come and go during a multi-hour sweep.
+        workers, why = workers_for(requested, os.cpu_count() or 1, host_available_gib(), gpu_free_mib())
+        if (workers, why) != last:
+            log(f"compile workers: {workers}" + (f" ({why})" if why else ""))
+            last = (workers, why)
         d = run_shape_isolated(M, N, K, sweep_dir, workers, log=log)
         ok = [r for r in d["rows"] if r["status"] == "ok"]
         best = min((r["us"] for r in ok), default=None)
