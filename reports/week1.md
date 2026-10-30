@@ -9,7 +9,7 @@
 **What ran** (RTX 3080, `--clock-lock 1755`, driver 595.99.02).
 - Tune stage 2: `results_lock1755_tune477.jsonl`, session `20261030-141736-f6aa5f`: 477 tune shapes, cold, `torch`, `triton:sweep:8`, `cublaslt:16`, `cublaslt_deep:20`; 11,023 rows, 0 invalid, 121 not converged, ≈8% power-capped; harness `6548db4`, clean.
   Graph: `results_lock1755_tune477_graph.jsonl`, session `20261030-151839-b4fa3b`: the 198 tune shapes whose screen oracle is < 50 µs (`sweep_screen/subset_lt50us_477.json`, new; the old `subset_lt50us.json` is the 160-shape subset), `--graph-batch 50`; 4,802 rows, 0 invalid, ≈5% power-capped.
-- Joint online search on the 86 held-out shapes: `online_joint_diverse.jsonl`, session `20261031-003456-76db31`, `tune online --order diverse --k 5 --lt-n 16 --fresh-cache`; 0 skipped, 0 invalid candidates. **Harness dirty** (the `--lt-n` change was uncommitted).
+- Joint online search on the 86 held-out shapes: `online_joint_diverse.jsonl`, session `20261031-005000-437cca`, `tune online --order diverse --k 5 --lt-n 16 --fresh-cache`, harness `e9f3906`, clean; 0 skipped, 0 invalid candidates. A first run with the change uncommitted (`online_joint_diverse_dirty.jsonl`, session `20261031-003456-76db31`) agrees: the chosen config is identical on 90% of shapes and 1 shape differs by > 5% at stage-2 time.
   Every pick is scored at its full-protocol stage-2 time (held-out sessions `selectors3` / `topkd`, cold and graph). Held-out shapes were only scored, not fitted.
 
 **Tune split: the families split the wins.** Against the Triton screen's top 8 re-timed, 477 shapes: heuristic-only cuBLASLt (B3) is > 2% faster on 124 and Triton on 254; B3+ (20 s search) is faster than Triton on 219 and slower on 99 (159 ties).
@@ -19,20 +19,20 @@ Deep search beats the heuristic by > 2% on 237 shapes. The perfect joint choice 
 
 | selector | first-use cost | vs B2 median / p10 | faster / slower than B2 (> 5%) | vs B3 median | faster / slower than B3 | vs B3+ median | faster / slower than B3+ | regret vs joint oracle median / p95 / mean | picks cuBLASLt |
 |---|---|---|---|---|---|---|---|---|---|
-| Triton top-3 only | 0.52 s | 0.964 / 0.706 | 41 / 18 | 0.981 | 31 / 26 | 1.019 | 23 / 36 | 4.6% / 41.5% / 11.5% | 0% |
-| top-3 + B2 | 0.54 s | 0.964 / 0.706 | 41 / 0 | 0.983 | 31 / 12 | 1.000 | 23 / 24 | 1.4% / 20.5% / 5.2% | 30% |
-| top-3 + LT4 | 0.56 s | 0.923 / 0.688 | 46 / 0 | 0.983 | 31 / 3 | 1.000 | 23 / 16 | 0.5% / 13.7% / 3.3% | 40% |
-| **top-3 + LT16** | **0.60 s** | **0.913 / 0.688** | **49 / 0** | **0.983** | **31 / 0** | **1.000** | **23 / 14** | **0.5% / 13.2% / 3.0%** | 42% |
-| top-5 + LT16 | 0.90 s | 0.901 / 0.688 | 51 / 0 | 0.979 | 33 / 0 | 1.000 | 25 / 13 | 0.4% / 11.9% / 2.7% | 42% |
-| top-1 + LT16 | 0.33 s | 0.921 / 0.696 | 48 / 0 | 0.996 | 26 / 0 | 1.000 | 20 / 15 | 1.5% / 14.5% / 3.9% | 49% |
+| Triton top-3 only | 0.52 s | 0.961 / 0.706 | 41 / 18 | 0.981 | 31 / 27 | 1.020 | 23 / 37 | 4.4% / 41.5% / 11.6% | 0% |
+| top-3 + B2 | 0.54 s | 0.961 / 0.706 | 41 / 0 | 0.983 | 31 / 13 | 1.000 | 23 / 25 | 1.4% / 21.2% / 5.3% | 33% |
+| top-3 + LT4 | 0.56 s | 0.923 / 0.696 | 46 / 0 | 0.983 | 31 / 3 | 1.000 | 23 / 16 | 0.5% / 13.7% / 3.4% | 40% |
+| **top-3 + LT16** | **0.59 s** | **0.916 / 0.696** | **49 / 0** | **0.983** | **31 / 0** | **1.000** | **23 / 14** | **0.5% / 13.2% / 3.1%** | 41% |
+| top-5 + LT16 | 0.90 s | 0.908 / 0.696 | 51 / 0 | 0.979 | 33 / 0 | 1.000 | 25 / 13 | 0.4% / 11.9% / 2.8% | 41% |
+| top-1 + LT16 | 0.33 s | 0.921 / 0.696 | 48 / 0 | 1.000 | 26 / 0 | 1.000 | 20 / 15 | 1.5% / 14.5% / 3.9% | 51% |
 
-Split at 50 µs (top-3 + LT16): < 50 µs (n = 56, graph times) 0.881 vs B2, 36 faster / 0 slower, 0.990 vs B3+; ≥ 50 µs (n = 30, cold, ε = 2%) 0.977 vs B2, 20 / 0, 1.014 vs B3+ (B3+ faster on 15).
+Split at 50 µs (top-3 + LT16): < 50 µs (n = 56, graph times) 0.894 vs B2, 36 faster / 0 slower, 0.990 vs B3+; ≥ 50 µs (n = 30, cold, ε = 2%) 0.976 vs B2, 20 / 0, 1.015 vs B3+ (B3+ faster on 15).
 Caveat: choices are made by short online timings and scored by stage 2, so this is a real selection, but one placement and one run per shape; the cuBLASLt heuristic list is stage-2-timed in the same session as the Triton picks.
 
 **Findings.**
-- cuBLASLt candidates need no compile, so adding them costs ~0.08 s and removes every loss to B2 and B3 (Triton-only loses > 5% to B2 on 18 shapes, to B3 on 26).
+- cuBLASLt candidates need no compile, so adding them costs ~0.08 s and removes every loss to B2 and B3 (Triton-only loses > 5% to B2 on 18 shapes, to B3 on 27).
 - The remaining gap to B3+ (14 shapes > 5% slower, 15 of 30 at ≥ 50 µs) is the offline deep search, which has no online equivalent here. G4 (differentiation ≥ 50 µs) is unchanged.
-- Triton top-1 + LT16 already costs 0.33 s and keeps most of the gain; top-3 buys ~0.9 points of mean regret for ~0.27 s.
+- Triton top-1 + LT16 already costs 0.33 s and keeps most of the gain; top-3 buys ~0.8 points of mean regret for ~0.26 s.
 - **Decision (user):** default k = 3, k = 5 for frequently called kernel patterns. Measured cost is ~0.145 s per extra Triton candidate (compile 0.134 s, timing 0.011 s). Payback of k = 1 → 3: ~40,000 calls pooled (~17,000 at ≥ 50 µs, ~870,000 at < 50 µs).
 - The family router is a *cost* optimisation only (skip Triton compiles when cuBLASLt is clearly ahead, up to ~0.4 s on ~40% of shapes), not a quality lever. Deprioritised.
 
@@ -47,7 +47,7 @@ Caveat: choices are made by short online timings and scored by stage 2, so this 
 **Gates.** No gate changed. G5 (held-out tractability) is unaffected by this update.
 
 **Next steps.** (1) Remaining tail work: more tune shapes in the sub-50 µs / unaligned / N ≤ 16 regimes (new `tail` suite, tune split), then re-fit with analytic features + weighting and re-score held-out once.
-(2) Commit the `--lt-n` change and re-run the joint search clean; add the joint selector to the zero-shot runbook. (3) Optional cost router. (4) Graph-mode noise study before relying on sub-50 µs wins.
+(2) Add the joint selector to the zero-shot runbook (the `--lt-n` change is committed in `e9f3906` and the joint search re-run clean). (3) Optional cost router. (4) Graph-mode noise study before relying on sub-50 µs wins.
 
 Reproduce: `python -m tune --clock-lock 1755 benchmark --shapes-file $D/sweep_screen/subset.json --backends torch,triton:sweep:8,cublaslt:16,cublaslt_deep:20 --cache-modes cold --out-name results_lock1755_tune477.jsonl`;
 the same with `subset_lt50us_477.json --cache-modes hot --graph-batch 50` (graph); `python -m tune --clock-lock 1755 online --shapes-file $D/sweep_screen_heldout/subset.json --k 5 --order diverse --lt-n 16 --fresh-cache`.
