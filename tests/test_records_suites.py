@@ -42,6 +42,30 @@ def test_suites_deterministic_and_split():
     assert any(s["K"] == 11008 and s["split"] == "heldout_region" for s in a["S2"])
 
 
+def test_tail_suite_is_clean_extra_tune_data():
+    from suites.generate import TAIL_MAX_US, TAIL_MIN_US, roofline_us
+    a = build(68)
+    tail = a["tail"]
+    assert len(tail) == 150 and {s["split"] for s in tail} == {"tune"}
+    others = [s for k, v in a.items() if k != "tail" for s in v]
+    keys = {(s["M"], s["N"], s["K"]) for s in others}
+    held = [(s["M"], s["N"], s["K"]) for s in others if s["split"].startswith("heldout")]
+    seen = set()
+    for s in tail:
+        k = (s["M"], s["N"], s["K"])
+        assert k not in keys and k not in seen          # new shapes only, none repeated
+        seen.add(k)
+        assert not (9000 <= s["K"] <= 12000 or 300 <= s["M"] <= 450)   # outside the held-out regions
+        assert not any(sum(x == y for x, y in zip(k, h)) >= 2 for h in held)  # shares at most one dim with held-out
+        assert TAIL_MIN_US <= roofline_us(*k) <= TAIL_MAX_US and max(k) <= 16384
+    # The committed S1-S5 / S7 files (which do not depend on the SM count) are exactly what build() makes: adding the tail
+    # suite (its own RNG stream) did not move any draw or split.
+    from pathlib import Path
+    for name in ("S1", "S2", "S3", "S4", "S5", "S7"):
+        disk = json.loads((Path(__file__).resolve().parents[1] / "suites" / "v1" / f"{name}.json").read_text())["shapes"]
+        assert disk == a[name], name
+
+
 def test_s6_depends_on_sm_count():
     assert build(68)["S6"] != build(108)["S6"]
 

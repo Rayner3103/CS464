@@ -5,6 +5,10 @@
 Deterministic: fixed seed, no dependence on the GPU except S6, which needs the SM count. S6 records the
 SM count it was built for, and the suite is regenerated per GPU.
 
+The `tail` suite (added 2026-10-31, after the learned-selector results) is extra *tune* data aimed at the regimes where the
+ranker's out-of-fold tail sits (reports/week1.md, 2026-10-31). It has its own RNG stream (SEED + 3), is built after the split,
+and is not part of `--suite all`, so S1-S7, edge, noise and every split assignment are byte-identical to before.
+
 Held-out policy (fixed before any results exist):
   * Region holdout: every shape with 9000 <= K <= 12000 (contains LLaMA-7B's 11008 FFN dim) or
     300 <= M <= 450. This tests extrapolation into unseen K and M ranges.
@@ -143,6 +147,60 @@ def noise_set(all_shapes, rng: random.Random, n: int = 30):
     return pick[:n]
 
 
+def _log_int(rng: random.Random, lo: int, hi: int) -> int:
+    return int(round(math.exp(rng.uniform(math.log(lo), math.log(hi)))))
+
+
+# (regime, count, M, N, K) where each of M, N, K is a (lo, hi) log-uniform range or a list to choose from, and
+# "unaligned" asks for at least one dimension that is not a multiple of 8 (no 16-byte vector loads).
+TAIL_REGIMES = [
+    ("narrow_n", 30, (16, MAX_DIM), [1, 2, 3, 4, 6, 8, 12, 16], (16, MAX_DIM), False),
+    ("small_m", 30, [1, 2, 3, 4, 6, 8, 12, 16], (64, 8192), (64, 8192), False),
+    ("tiny_k", 20, (16, 8192), (16, 8192), [1, 2, 3, 5, 7, 16, 30, 33, 64, 100, 128], False),
+    ("sub50_unaligned", 40, (32, 2048), (32, 2048), (32, 2048), True),
+    ("mid_square", 20, (200, 1100), (200, 1100), (200, 1100), False),
+    ("splitk_small_mn", 10, (16, 512), (16, 512), (2048, 8192), False),
+]
+
+
+def roofline_us(M: int, N: int, K: int, peak_flops: float = 62.9e12, peak_bw: float = 686e9) -> float:
+    """Roofline time (us) of one GEMM: max(compute, one pass over A, B, C in fp16), launch cost excluded. The RTX 3080's
+    measured peaks; only used to keep the tail suite out of launch-dominated shapes, where the screen cannot tell
+    configs apart (the timing grid is ~1 us)."""
+    return 1e6 * max(2 * M * N * K / peak_flops, 2 * (M * K + K * N + M * N) / peak_bw)
+
+
+TAIL_MIN_US, TAIL_MAX_US = 3.0, 400.0
+
+
+def _share_two(a, b):
+    return sum(x == y for x, y in zip(a, b)) >= 2
+
+
+def tail_suite(rng: random.Random, existing: list[dict]) -> list[dict]:
+    """Tune shapes in the regimes where the lgbm_rank out-of-fold tail sits (narrow N, tiny M, tiny K, unaligned sub-50 us,
+    small-M/N split-K) whose roofline time is TAIL_MIN_US..TAIL_MAX_US. Never a shape already in another suite, never in the held-out region, and never one that shares
+    two of (M, N, K) with a held-out shape, so the held-out set stays clean."""
+    taken = {(s["M"], s["N"], s["K"]) for s in existing}
+    held = [(s["M"], s["N"], s["K"]) for s in existing if s["split"].startswith("heldout")]
+    out = []
+    for regime, n, m_r, n_r, k_r, unaligned in TAIL_REGIMES:
+        got = 0
+        while got < n:
+            M, N, K = (rng.choice(r) if isinstance(r, list) else _log_int(rng, *r) for r in (m_r, n_r, k_r))
+            if not unaligned and rng.random() < 0.4:  # keep ~40% of the other regimes' large dims 8-aligned
+                M, N, K = (v // 8 * 8 if v >= 64 else v for v in (M, N, K))
+            key = (M, N, K)
+            if (key in taken or max(key) > MAX_DIM or min(key) < 1 or 9000 <= K <= 12000 or 300 <= M <= 450
+                    or not TAIL_MIN_US <= roofline_us(M, N, K) <= (40.0 if regime == "sub50_unaligned" else TAIL_MAX_US)
+                    or (unaligned and M % 8 == 0 and N % 8 == 0 and K % 8 == 0) or any(_share_two(key, h) for h in held)):
+                continue
+            taken.add(key)
+            out.append(_shape(M, N, K, "tail", regime=regime, split="tune"))
+            got += 1
+    return out
+
+
 def assign_split(s, rng: random.Random):
     if s["suite"] in ("edge", "noise"):
         return "aux"
@@ -173,6 +231,7 @@ def build(sm_count: int) -> dict[str, list[dict]]:
     all_main = [s for v in suites.values() for s in v]
     suites["edge"] = [dict(s, split="aux") for s in edge_suite()]
     suites["noise"] = [dict(s, split="aux") for s in noise_set(all_main, random.Random(SEED + 2))]
+    suites["tail"] = tail_suite(random.Random(SEED + 3), [s for v in suites.values() for s in v])
     return suites
 
 
