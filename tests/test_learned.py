@@ -1,4 +1,6 @@
+import json
 import numpy as np
+import pytest
 
 
 def test_canonical_labels_take_first_member_within_eps():
@@ -93,6 +95,81 @@ def test_online_choose_joint_counts_lt_candidates_and_cost():
     assert abs(choose(c, 2, 1)["compile_s"] - 1.05) < 1e-12 and abs(choose(c, 1, 0)["compile_s"] - 0.5) < 1e-12
     old = [{k: v for k, v in x.items() if k != "family"} for x in c[:2]]            # pre-joint rows: all Triton
     assert choose(old, 1)["key"] == "t0" and choose(old, 2)["key"] == "t1"
+
+
+def test_kpolicy_k_for():
+    from tune.online import FREQUENT_CALLS, K_DEFAULT, K_FREQUENT, KPolicy
+    pol = KPolicy()
+    assert (pol.k, pol.k_frequent, pol.frequent_calls) == (K_DEFAULT, K_FREQUENT, FREQUENT_CALLS) == (3, 5, 1_000_000)
+    assert pol.k_for() == 3 and pol.k_for(calls=0) == 3 and pol.k_for(calls=FREQUENT_CALLS - 1) == 3  # no signal: default
+    assert pol.k_for(calls=FREQUENT_CALLS) == 5 and pol.k_for(calls=10**9) == 5
+    assert pol.k_for(frequent=True) == 5 and pol.k_for(calls=10**9, frequent=False) == 3  # explicit flag wins
+    assert pol.k_for(calls=5, frequent=True) == 5
+    assert KPolicy(2, 4, 10).k_for(calls=10) == 4
+    for bad in ({"k": 0}, {"k": 4, "k_frequent": 3}, {"frequent_calls": 0}):
+        with pytest.raises(ValueError):
+            KPolicy(**bad)
+    with pytest.raises(ValueError):
+        pol.k_for(calls=-1)
+
+
+def _fake_search(calls):
+    def fake(ranker, M, N, K, k, dtype, order, lt_n):
+        calls.append((M, N, K, k, lt_n))
+        c = [{"config_key": f"c{i}", "valid": True, "compile_s": 0.1, "time_s": 0.01, "cold_us": 100.0 - i, "graph_us": None}
+             for i in range(k)]
+        return {"rank_s": 0.0, "candidates": c}
+    return fake
+
+
+def test_select_kernel_uses_the_policy_k(monkeypatch):
+    import tune.online as online
+    seen = []
+    monkeypatch.setattr(online, "search_shape", _fake_search(seen))
+    a = online.select_kernel(None, 64, 64, 64)
+    b = online.select_kernel(None, 64, 64, 64, calls=2_000_000)
+    c = online.select_kernel(None, 64, 64, 64, calls=2_000_000, policy=online.KPolicy(3, 8, 5_000_000))
+    d = online.select_kernel(None, 64, 64, 64, frequent=True, lt_n=0)
+    assert [x[3] for x in seen] == [3, 5, 3, 5] and seen[3][4] == 0 and seen[0][4] == 16
+    assert (a["k"], a["reason"]) == (3, "default") and (b["k"], b["reason"]) == (5, "frequent") and c["reason"] == "default"
+    assert b["choice"]["key"] == "c4" and b["choice"]["compile_s"] == pytest.approx(0.5) and len(b["candidates"]) == 5
+    assert d["reason"] == "frequent"
+
+
+def test_select_kernel_reports_a_skipped_shape(monkeypatch):
+    import tune.online as online
+    monkeypatch.setattr(online, "search_shape", lambda *a, **k: {"rank_s": 0.1, "candidates": [], "skipped": "oom_inputs: x"})
+    out = online.select_kernel(None, 1, 1, 1, calls=10**7)
+    assert out["choice"] is None and out["skipped"].startswith("oom") and out["k"] == 5
+
+
+def test_run_picks_k_per_shape_and_resumes_per_k(tmp_path, monkeypatch):
+    import tune.online as online
+    from analysis import learned
+    seen = []
+    monkeypatch.setattr(online, "search_shape", _fake_search(seen))
+    monkeypatch.setattr(online, "write_env", lambda out_dir, **kw: {"hw_id": "hw", "driver": "d"})
+    monkeypatch.setattr(online, "provenance", lambda env: {})
+    class FakeRanker:
+        meta = {}
+        def rule(self, order):
+            return {"group": "tile_split_bk"}
+    monkeypatch.setattr(learned.Ranker, "load", classmethod(lambda cls, stem: FakeRanker()))
+    shapes = [{"M": 8, "N": 8, "K": 8}, {"M": 16, "N": 16, "K": 16, "calls": 3_000_000},
+              {"M": 32, "N": 32, "K": 32, "frequent": True}, {"M": 64, "N": 64, "K": 64, "calls": 10}]
+    run = lambda **kw: online.run(shapes, tmp_path / "ranker", tmp_path, order="diverse", out_name="o.jsonl", log=lambda m: None, **kw)
+    run(k=3, policy=online.KPolicy())
+    rows = [json.loads(l) for l in (tmp_path / "o.jsonl").read_text().splitlines()]
+    assert [r["k"] for r in rows] == [3, 5, 5, 3] and [r["k_reason"] for r in rows] == ["default", "frequent", "frequent", "default"]
+    assert [len(r["choice"]) for r in rows] == [3, 5, 5, 3] and rows[1]["calls"] == 3_000_000
+    n = len(seen)
+    run(k=3, policy=online.KPolicy())                       # same policy: everything is resumed
+    assert len(seen) == n
+    run(k=3, policy=online.KPolicy(3, 6, 1_000_000))        # a different k_frequent re-searches only the frequent shapes
+    assert sorted(x[0] for x in seen[n:]) == [16, 32] and {x[3] for x in seen[n:]} == {6}
+    n = len(seen)
+    run(k=4)                                                # no policy: the global k for every shape
+    assert [x[3] for x in seen[n:]] == [4, 4, 4, 4]
 
 
 def test_ranker_save_load_round_trip(tmp_path):

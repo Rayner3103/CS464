@@ -188,8 +188,10 @@ def cmd_online(args):
     out_name = args.out_name or ("online_lgbm_rank.jsonl" if args.order == "plain" else f"online_lgbm_rank_{args.order}.jsonl")
     if args.lt_n and not args.out_name:
         out_name = out_name.replace("online_lgbm_rank", "online_joint")
+    from tune.online import KPolicy
+    policy = KPolicy(args.k, args.k_frequent, args.frequent_calls) if args.k_frequent else None
     path = run(_shapes(args.suite, args.shapes_file), Path(args.ranker or args.out / "lgbm_rank"), args.out, k=args.k,
-               dtype=args.dtype, order=args.order, out_name=out_name, session_id=args.session, lt_n=args.lt_n)
+               dtype=args.dtype, order=args.order, out_name=out_name, session_id=args.session, lt_n=args.lt_n, policy=policy)
     print(f"online -> {path}")
 
 
@@ -312,6 +314,11 @@ def main(argv=None):
     p.add_argument("--order", choices=["plain", "diverse", "inner"], default="plain",
                    help="top-k order: score order, the ranker's CV-chosen diversification rule, or the diagnostic "
                         "rule that also varies warps / stages of the top tile")
+    p.add_argument("--k-frequent", type=int, default=0,
+                   help="call-count-aware k: shapes in --shapes-file with `calls` >= --frequent-calls (or `frequent: true`) "
+                        "get this many candidates, the rest --k (e.g. --k 3 --k-frequent 5); 0 = same k for every shape")
+    p.add_argument("--frequent-calls", type=int, default=1_000_000,
+                   help="launches at which a shape counts as frequently called (default: the held-out 3 -> 5 break-even)")
     p.add_argument("--lt-n", type=int, default=0,
                    help="also time cuBLASLt's heuristic top N in the same pool (joint selection); default 0 = Triton only")
     p.add_argument("--out-name", default=None, help="default online_lgbm_rank[_diverse].jsonl (online_joint_* with --lt-n)")
