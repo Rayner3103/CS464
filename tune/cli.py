@@ -178,6 +178,14 @@ def cmd_topk(args):
         for o, sc in s["screen_best_of_k"].items()) + f" -> {out}")
 
 
+def cmd_ranker_v2(args):
+    from analysis.learned import train_ranker_v2
+    rk, info = train_ranker_v2(args.data, tuple(args.extra_screens), args.stem)
+    r = info["rules"][0]
+    print(f"saved {args.data / args.stem}.txt/.json: {len(rk.pool_keys)} pool configs, {rk.meta['n_tune_shapes']} tune shapes; "
+          f"diverse rule {r['rule']} (tune OOF best-of-3 mean {100 * r['k3']['mean']:.2f}%, p95 {100 * r['k3']['p95']:.1f}%)")
+
+
 def cmd_online(args):
     if args.fresh_cache:
         # Before any Triton compile in this process: compile cost must be a first use, not a cache hit.
@@ -324,10 +332,17 @@ def main(argv=None):
     p.add_argument("--out-name", default=None, help="default online_lgbm_rank[_diverse].jsonl (online_joint_* with --lt-n)")
     p.add_argument("--fresh-cache", action="store_true", help="compile into an empty TRITON_CACHE_DIR under --out")
 
+    p = sub.add_parser("ranker-v2", help="fit rank v2 (analytic features, near-top weights, extra tune screens) on all tune "
+                                         "shapes and save data/<hw>/lgbm_rank_v2.*; CPU only, reads no held-out shape")
+    p.set_defaults(fn=cmd_ranker_v2)
+    p.add_argument("--data", type=Path, default=None)
+    p.add_argument("--extra-screens", nargs="*", default=["sweep_screen_tail"], help="extra tune screen dirs under --data")
+    p.add_argument("--stem", default="lgbm_rank_v2")
+
     args = ap.parse_args(argv)
     if args.clock_lock is not None:
         os.environ["TUNE_CLOCK_LOCK"] = args.clock_lock
-    if args.cmd in ("analyze", "portfolio", "selectors", "learned", "topk"):
+    if args.cmd in ("analyze", "portfolio", "selectors", "learned", "topk", "ranker-v2"):
         args.data = args.data or default_data_dir()
     else:
         args.out = args.out or default_data_dir()

@@ -172,6 +172,91 @@ def test_run_picks_k_per_shape_and_resumes_per_k(tmp_path, monkeypatch):
     assert [x[3] for x in seen[n:]] == [4, 4, 4, 4]
 
 
+_GPU = {"smem_per_block_optin_bytes": 101376, "regs_per_sm": 65536, "sm_count": 68, "smem_per_sm_bytes": 102400,
+        "max_threads_per_sm": 1536}
+
+
+def _space():
+    from kernels.config_space import HwLimits, full_space, prune
+    return prune(full_space(), HwLimits(101376, 65536, 68))[0]
+
+
+def test_shape_ok_matches_shape_violations():
+    from analysis.learned import shape_ok, space_array
+    from kernels.config_space import shape_violations
+    cfgs = _space()
+    arr = space_array(cfgs)
+    for M, N, K in [(1, 1, 1), (16, 16, 16), (1, 2, 10369), (7296, 36, 3142), (4378, 2, 58), (16384, 16384, 16384),
+                    (17, 33, 65), (128, 256, 16384), (5, 5, 5), (1024, 1024, 1024), (3, 4000, 33), (16384, 1, 16384)]:
+        want = np.array([not shape_violations(c, M, N, K) for c in cfgs])
+        assert (shape_ok(arr, M, N, K) == want).all(), (M, N, K)
+
+
+def test_analytic_features_relative_to_the_best_runnable_config():
+    from analysis.learned import ANALYTIC_FEATURES, analytic_features, shape_ok, space_array
+    cfgs = _space()
+    arr = space_array(cfgs)
+    shapes = [{"M": 1024, "N": 1024, "K": 1024}, {"M": 7, "N": 2, "K": 4093}]
+    ok = np.stack([shape_ok(arr, s["M"], s["N"], s["K"]) for s in shapes])
+    F = analytic_features(shapes, cfgs, 68, ok)
+    assert F.shape == (2, len(cfgs), len(ANALYTIC_FEATURES)) and np.isfinite(F).all()
+    rel, pct = F[:, :, 1], F[:, :, 2]
+    for i in range(2):
+        assert rel[i, ok[i]].min() == pytest.approx(0.0, abs=1e-6) and (rel[i, ok[i]] >= -1e-6).all()
+        assert pct[i, ok[i]].max() < ok[i].sum() / len(cfgs) + 1e-9  # runnable configs rank before every inf
+
+
+def test_rank_v2_training_and_inference_features_agree():
+    from analysis.learned import (Ranker, analytic_features, candidate_features, config_params, fit_rank_v2, shape_matrix,
+                                  shape_ok, space_array)
+    cfgs = _space()
+    arr = space_array(cfgs)
+    rng = np.random.default_rng(3)
+    shapes = [{"M": int(m), "N": int(n), "K": int(k)} for m, n, k in rng.integers(1, 4000, (24, 3))]
+    ok = np.stack([shape_ok(arr, s["M"], s["N"], s["K"]) for s in shapes])
+    R = np.where(ok, 1 + rng.gamma(1.0, 0.5, ok.shape), np.inf)
+    R = R / R.min(axis=1, keepdims=True)
+    Xs, Pc, Fc = shape_matrix(shapes, 68), config_params(cfgs), candidate_features(shapes, cfgs, _GPU)
+    Fa = analytic_features(shapes, cfgs, 68, ok)
+    hp = {"objective": "regression", "num_leaves": 4, "n_estimators": 20}
+    train, test = np.arange(20), np.arange(20, 24)
+    S, pool, est = fit_rank_v2(hp, Xs, Pc, Fc, Fa, R, train, Xs[test], Fc[test], Fa[test], ok[test])
+    assert S.shape == (4, len(pool)) and set(pool) <= set(range(len(cfgs))) and np.isinf(S[~ok[test][:, pool]]).all()
+    rk = Ranker(est.booster_, [cfgs[j].key() for j in pool], hp, _GPU, {"features": "v2"})
+    for row, i in enumerate(test):
+        got = rk.scores(shapes[i]["M"], shapes[i]["N"], shapes[i]["K"])
+        both = np.isfinite(got) & np.isfinite(S[row])
+        assert (np.isfinite(got) == np.isfinite(S[row])).all() and both.any()
+        assert np.allclose(got[both], S[row][both], atol=1e-5)   # what training scored == what the saved Ranker scores
+
+
+def test_rank_v2_near_top_weight_is_applied(monkeypatch):
+    import analysis.learned as L
+    seen = {}
+    real = L.make_model
+    def spy(model, form, hp):
+        est = real(model, form, hp)
+        orig_fit = est.fit
+        def fit(X, y, sample_weight=None):
+            seen["w"], seen["y"] = sample_weight, y
+            return orig_fit(X, y, sample_weight=sample_weight)
+        est.fit = fit
+        return est
+    monkeypatch.setattr(L, "make_model", spy)
+    cfgs = _space()[:60]
+    rng = np.random.default_rng(1)
+    shapes = [{"M": int(m), "N": int(n), "K": int(k)} for m, n, k in rng.integers(16, 600, (12, 3))]
+    ok = np.ones((12, 60), bool)
+    R = 1 + rng.gamma(1.0, 0.6, (12, 60)); R /= R.min(axis=1, keepdims=True)
+    Fa = L.analytic_features(shapes, cfgs, 68, ok)
+    L.fit_rank_v2({"objective": "regression", "num_leaves": 4, "n_estimators": 5}, L.shape_matrix(shapes, 68),
+                  L.config_params(cfgs), L.candidate_features(shapes, cfgs, _GPU), Fa, R, np.arange(10),
+                  L.shape_matrix(shapes, 68)[10:], L.candidate_features(shapes, cfgs, _GPU)[10:], Fa[10:], ok[10:])
+    w, y = seen["w"], seen["y"]
+    assert set(np.unique(w)) <= {1.0, L.NEAR_WEIGHT} and (w[np.exp(y) < L.NEAR_TOP] == L.NEAR_WEIGHT).all()
+    assert (w[np.exp(y) >= L.NEAR_TOP] == 1.0).all()
+
+
 def test_ranker_save_load_round_trip(tmp_path):
     import lightgbm as lgb
     from analysis.learned import Ranker

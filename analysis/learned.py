@@ -226,6 +226,83 @@ def fit_predict_rank(model: str, hp: dict, Xs: np.ndarray, Pc: np.ndarray, Fc: n
     return (pick, pool, est) if full else pick
 
 
+# ---------------------------------------------------------------- rank v2: analytic features + near-top weights
+# v2 = the v1 rank form (same pool, LightGBM regression of capped log regret, same hyperparameters) plus
+#   * ANALYTIC_FEATURES per (shape, candidate): a roofline-style time estimate and where it sits among every runnable
+#     config of the shape (label-free, so nothing is fit on held-out data);
+#   * NEAR_WEIGHT on training rows within NEAR_TOP of the shape's best, so the model spends its capacity on ordering
+#     the good configs;
+#   * the tail suite as extra tune shapes (context(extra_screens=...)).
+# Chosen on tune out-of-fold regret only (reports/week1.md, 2026-10-31). Constants are the RTX 3080's measured roofline
+# (roofline.json); other GPUs get the same numbers, which only shifts the compute/memory balance features.
+FEATURES_V2 = "v2"
+PEAK_FLOPS, PEAK_BW = 62.9e12, 686e9
+NEAR_TOP, NEAR_WEIGHT = 1.25, 5.0
+ANALYTIC_FEATURES = ("log2_est_us", "log2_est_rel_best", "est_rank_pct", "log2_cmp_over_mem", "bytes_per_flop",
+                     "log2_c_traffic_share", "log2_ctas_per_sm", "log2_est_over_roof")
+
+
+def space_array(cfgs: list) -> np.ndarray:
+    """[config, 5] BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, GROUP_M (the columns `shape_ok` needs)."""
+    return np.array([[c.BLOCK_M, c.BLOCK_N, c.BLOCK_K, c.SPLIT_K, c.GROUP_M] for c in cfgs], np.int64)
+
+
+def shape_ok(arr: np.ndarray, M: int, N: int, K: int, max_workspace_bytes: int = 512 * 2**20) -> np.ndarray:
+    """Vectorized `kernels.config_space.shape_violations(...) == []` over `space_array` rows (tested equal)."""
+    bm, bn, bk, sk, gm = arr.T
+    cover = lambda x: max(16, 1 << (x - 1).bit_length())
+    ok = (bm <= 2 * cover(M)) & (bn <= 2 * cover(N)) & (bk <= 2 * cover(K))
+    ws = sk * M * N
+    ok &= (sk == 1) | ((K >= sk * bk) & (ws * 4 <= max_workspace_bytes) & (ws < 2**31))
+    ok &= (gm == 1) | (-(-M // bm) > 1)
+    return ok
+
+
+def analytic_features(shapes: list[dict], cfgs: list, sm_count: int, ok: np.ndarray) -> np.ndarray:
+    """[shape, config, len(ANALYTIC_FEATURES)]. cfgs must be the *whole* static-kept space (the relative features are
+    taken over every runnable config of the shape; ok: [shape, config] runnable mask)."""
+    a = np.array([[s["M"], s["N"], s["K"]] for s in shapes], float)
+    M, N, K = (x[:, None] for x in a.T)
+    c = np.array([[x.BLOCK_M, x.BLOCK_N, x.BLOCK_K, x.SPLIT_K] for x in cfgs], float)
+    bm, bn, bk, sk = (x[None, :] for x in c.T)
+    tm, tn = np.ceil(M / bm), np.ceil(N / bn)
+    ctas = tm * tn * sk
+    flops_cta = 2 * bm * bn * np.ceil(K / (sk * bk)) * bk
+    t_cmp = np.ceil(ctas / sm_count) * flops_cta * sm_count / PEAK_FLOPS
+    b_ab = 2 * (M * K * tn + K * N * tm)
+    b_c = np.where(sk > 1, sk * M * N * 4 * 2 + 2 * M * N, 2 * M * N)
+    t_mem = (b_ab + b_c) / PEAK_BW
+    t_est = np.where(ok, np.maximum(t_cmp, t_mem) + 2e-6 + np.where(sk > 1, 2e-6, 0.0), np.inf)
+    best = t_est.min(axis=1, keepdims=True)
+    rank_pct = np.argsort(np.argsort(t_est, axis=1), axis=1) / t_est.shape[1]
+    safe = np.where(ok, t_est, 1.0)
+    f = [np.log2(safe * 1e6), np.log2(np.where(ok, t_est / best, 1.0)), rank_pct, np.log2(t_cmp / t_mem),
+         (b_ab + b_c) / (2 * M * N * K), np.log2(b_c / (b_ab + b_c)), np.log2(ctas / sm_count),
+         np.log2(safe / (2 * M * N * K / PEAK_FLOPS))]
+    return np.stack(f, axis=2).astype(np.float32)
+
+
+def fit_rank_v2(hp: dict, Xs, Pc, Fc, Fa, R, train, Xt, Fct, Fat, ok_t, seed: int = SEED):
+    """Fit rank v2 on shapes `train` and score the targets (Xt, Fct, Fat: their shape features, candidate features and
+    analytic features; ok_t: [target, config] runnable). Returns (S [target, pool] predicted log regret, inf where not
+    runnable; pool config columns; estimator). Same pool as v1: the union of each training shape's top POOL_TOP."""
+    nc = len(CAND_FEATURES)
+    pool = np.unique(np.argsort(R[train], axis=1, kind="stable")[:, :POOL_TOP])
+    Rt = R[np.ix_(train, pool)]
+    si, cj = np.nonzero(np.isfinite(Rt))
+    gs, gc = train[si], pool[cj]
+    X = np.concatenate([Xs[gs], Pc[gc], Fc[gs, gc, :nc], Fa[gs, gc]], axis=1).astype(np.float32)
+    r = Rt[si, cj]
+    est = make_model("lgbm", "rank", hp)
+    est.set_params(random_state=seed)
+    est.fit(X, np.log(np.minimum(r, REGRET_CAP)), sample_weight=np.where(r < NEAR_TOP, NEAR_WEIGHT, 1.0))
+    ti, tj = np.meshgrid(np.arange(len(Xt)), np.arange(len(pool)), indexing="ij")
+    ti, cq = ti.ravel(), pool[tj.ravel()]
+    Xq = np.concatenate([Xt[ti], Pc[cq], Fct[ti, cq, :nc], Fat[ti, cq]], axis=1).astype(np.float32)
+    S = est.predict(Xq).reshape(len(Xt), len(pool))
+    return np.where(ok_t[:, pool], S, np.inf), pool, est
+
+
 # ---------------------------------------------------------------- cross-validation on tune shapes
 
 def grouped_folds(shapes: list[dict], n_folds: int = N_FOLDS, seed: int = SEED) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -267,12 +344,18 @@ def knn_cv_picks(F: dict, R: np.ndarray, ok: np.ndarray, weights: dict, k: int, 
 
 # ---------------------------------------------------------------- build
 
-def context(data: Path) -> dict:
-    """Tune and held-out screens, features and runnable masks (the masks take ~1 min of pruning-rule calls)."""
+def context(data: Path, extra_screens: tuple[str, ...] = ()) -> dict:
+    """Tune and held-out screens, features and runnable masks (the masks take ~1 min of pruning-rule calls).
+    extra_screens: further *tune* screen directories under `data` (e.g. "sweep_screen_tail") appended after the main
+    one; the config columns become the union of the screens' keys. Empty = exactly the original 477-shape context."""
     from tune.sweep import parse_key
     hw = hw_limits(data)
     gpu = json.loads((Path(data) / "env.json").read_text())["gpu"]
     shapes, keys, T = load_screen(data / "sweep_screen")
+    for name in extra_screens:
+        es, ek, eT = load_screen(data / name)
+        union = sorted(set(keys) | set(ek))
+        T, shapes, keys = np.vstack([align(union, keys, T), align(union, ek, eT)]), shapes + es, union
     hdir = data / "sweep_screen_heldout"
     hshapes, hkeys, hT = load_screen(hdir)
     hshapes = _split_info(hdir, hshapes)
@@ -381,15 +464,33 @@ class Ranker:
         self.Pc = config_params(self.cfgs)
         from kernels.config_space import HwLimits
         self.hw = HwLimits(gpu["smem_per_block_optin_bytes"], gpu["regs_per_sm"], gpu["sm_count"])
+        self.features = self.meta.get("features", "v1")
+        self._space = None  # v2: (static-kept configs, space_array, pool -> space column), built on first use
+
+    def space(self):
+        """v2 only: the whole static-kept config space the relative analytic features are taken over."""
+        if self._space is None:
+            from kernels.config_space import full_space, prune
+            cfgs, _ = prune(full_space(), self.hw)
+            col = {c.key(): i for i, c in enumerate(cfgs)}
+            self._space = (cfgs, space_array(cfgs), np.array([col[k] for k in self.pool_keys]))
+        return self._space
 
     def scores(self, M: int, N: int, K: int) -> np.ndarray:
         """Predicted log regret per pool member (lower is better; inf where the pruning rules reject it)."""
         s = [{"M": M, "N": N, "K": K}]
         X = pair_rows(shape_matrix(s, self.gpu["sm_count"]), self.Pc, candidate_features(s, self.cfgs, self.gpu),
                       np.zeros(len(self.cfgs), int), np.arange(len(self.cfgs)))
+        if self.features == FEATURES_V2:
+            cfgs, arr, col = self.space()
+            ok_all = shape_ok(arr, M, N, K)
+            Fa = analytic_features(s, cfgs, self.gpu["sm_count"], ok_all[None, :])[0]
+            X = np.concatenate([X, Fa[col]], axis=1)
+            ok = ok_all[col]
+        else:
+            ok = np.array([runnable(c, M, N, K, self.hw) for c in self.cfgs])
         pred = self.booster.predict(X)
         pred = -pred if self.hp.get("objective") == "lambdarank" else pred
-        ok = np.array([runnable(c, M, N, K, self.hw) for c in self.cfgs])
         return np.where(ok, pred, np.inf)
 
     def rank(self, M: int, N: int, K: int, k: int = 5, order: str = "plain") -> list[str]:
@@ -437,6 +538,68 @@ def train_ranker(data: Path, ctx: dict | None = None, log=print) -> tuple["Ranke
                  "diverse_rule": rules[0]["rule"], "inner_rule": inner, "diverse_k": DIVERSE_K})
     rk.save(Path(data) / "lgbm_rank")
     return rk, {"ctx": ctx, "cols": cols, "pool": pool, "rules": rules}
+
+
+V2_STEM = "lgbm_rank_v2"
+V2_EXTRA_SCREENS = ("sweep_screen_tail",)
+
+
+def v2_tag(ctx: dict, hp: dict) -> str:
+    import hashlib
+    return hashlib.sha1(json.dumps([ctx["keys"], [(s["M"], s["N"], s["K"]) for s in ctx["shapes"]], hp, POOL_TOP, NEAR_TOP,
+                                    NEAR_WEIGHT, N_FOLDS, SEED, FEATURES_V2]).encode()).hexdigest()
+
+
+def cv_scores_v2(ctx: dict, Fa: np.ndarray, hp: dict, data: Path, log=print) -> np.ndarray:
+    """Out-of-fold rank-v2 scores on every tune shape (N_FOLDS grouped folds over all of them), cached in
+    data/<hw>/lgbm_rank_v2_cv_scores.npz. inf outside a fold's pool or where not runnable."""
+    tag = v2_tag(ctx, hp)
+    cache = Path(data) / "lgbm_rank_v2_cv_scores.npz"
+    if cache.exists():
+        z = np.load(cache)
+        if str(z["tag"]) == tag:
+            return z["S"]
+    S = np.full(ctx["R"].shape, np.inf, np.float32)
+    for f, (train, test) in enumerate(grouped_folds(ctx["shapes"])):
+        Sf, pool, _ = fit_rank_v2(hp, ctx["Xs"], ctx["Pc"], ctx["Fc"], Fa, ctx["R"], train, ctx["Xs"][test],
+                                  ctx["Fc"][test], Fa[test], ctx["ok"][test])
+        S[np.ix_(test, pool)] = Sf
+        log(f"v2 cv scores fold {f + 1}/{N_FOLDS}")
+    np.savez_compressed(cache, S=S, tag=tag)
+    return S
+
+
+def train_ranker_v2(data: Path, extra_screens: tuple[str, ...] = V2_EXTRA_SCREENS, out_stem: str = V2_STEM,
+                    log=print) -> tuple["Ranker", dict]:
+    """Rank v2 (analytic features + near-top weights + the extra tune screens), fit on every tune shape and saved as
+    data/<hw>/<out_stem>.*. Hyperparameters are the v1 ranker's CV-chosen ones (data/<hw>/lgbm_rank.json), not
+    re-searched. The diversification rule is refit on v2's own out-of-fold scores over all tune shapes. No held-out
+    shape is read by any fit."""
+    from tune.sweep import parse_key
+    data = Path(data)
+    ctx = context(data, extra_screens)
+    hp = json.loads((data / "lgbm_rank.json").read_text())["hp"]
+    cfgs = [parse_key(k) for k in ctx["keys"]]
+    gpu = json.loads((data / "env.json").read_text())["gpu"]
+    from kernels.config_space import full_space, prune
+    space, _ = prune(full_space(), hw_limits(data))
+    if {c.key() for c in space} != set(ctx["keys"]):
+        log(f"warning: screen config columns ({len(ctx['keys'])}) differ from the static-kept space ({len(space)}); "
+            "the relative analytic features at inference use the latter")
+    Fa = analytic_features(ctx["shapes"], cfgs, gpu["sm_count"], ctx["ok"])
+    S = cv_scores_v2(ctx, Fa, hp, data, log)
+    rules = fit_diverse_rule(ctx, S, DIVERSE_K)
+    inner = next(e["rule"] for e in rules if e["rule"].get("inner_pos") == "before")
+    allsh = np.arange(len(ctx["R"]))
+    _, pool, est = fit_rank_v2(hp, ctx["Xs"], ctx["Pc"], ctx["Fc"], Fa, ctx["R"], allsh, ctx["Xs"][:1], ctx["Fc"][:1],
+                               Fa[:1], ctx["ok"][:1])
+    rk = Ranker(est.booster_, [ctx["keys"][j] for j in pool], hp, gpu,
+                {"features": FEATURES_V2, "tag": v2_tag(ctx, hp), "n_tune_shapes": len(ctx["shapes"]),
+                 "extra_screens": list(extra_screens), "pool_top": POOL_TOP, "near_top": NEAR_TOP,
+                 "near_weight": NEAR_WEIGHT, "diverse_rule": rules[0]["rule"], "inner_rule": inner,
+                 "diverse_k": DIVERSE_K, "hp_from": "lgbm_rank.json (v1 CV-chosen, not re-searched)"})
+    rk.save(data / out_stem)
+    return rk, {"ctx": ctx, "pool": pool, "rules": rules, "S": S}
 
 
 TOPK = 5
