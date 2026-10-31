@@ -233,8 +233,11 @@ def fit_predict_rank(model: str, hp: dict, Xs: np.ndarray, Pc: np.ndarray, Fc: n
 #   * NEAR_WEIGHT on training rows within NEAR_TOP of the shape's best, so the model spends its capacity on ordering
 #     the good configs;
 #   * the tail suite as extra tune shapes (context(extra_screens=...)).
-# Chosen on tune out-of-fold regret only (reports/week1.md, 2026-10-31). Constants are the RTX 3080's measured roofline
-# (roofline.json); other GPUs get the same numbers, which only shifts the compute/memory balance features.
+# Chosen on tune out-of-fold regret only (reports/week1.md, 2026-10-31). PEAK_FLOPS / PEAK_BW are fixed model units (the
+# RTX 3080's unlocked-clock roofline, 62.9 TFLOP/s and 686 GB/s), not per-GPU measurements, and must stay the same at training
+# and at use: the features are then well defined on any GPU. An ablation (reports/week1.md, 2026-11-01) found a 4x wrong
+# compute/memory balance does as well as the true one, so v2 does not need a roofline measurement; do not read these from
+# roofline.json for a new GPU, which would shift the features away from what the model was trained on.
 FEATURES_V2 = "v2"
 PEAK_FLOPS, PEAK_BW = 62.9e12, 686e9
 NEAR_TOP, NEAR_WEIGHT = 1.25, 5.0
