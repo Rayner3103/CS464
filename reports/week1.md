@@ -4,6 +4,57 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-11-01: rank v2 (analytic features, near-top weights, tail suite) — Triton-only tail halves, the joint search barely moves
+
+**What ran** (RTX 3080, `--clock-lock 1755`, driver 595.99.02).
+- Tail suite (`suites/v1/tail.json`, 150 new tune shapes, commit `6280b0f`): `python -m tune --clock-lock 1755 sweep --suite tail --per-suite 1000 --screen-dir sweep_screen_tail`, env `sweep-20261031-011440`;
+  150 of 150 shapes complete, 0 skipped, 8,269 s. Regimes: 30 narrow-N, 30 small-M, 20 tiny-K, 40 unaligned sub-50 µs, 20 mid-size, 10 small-M/N split-K (roofline 3–400 µs; none duplicates an existing shape, lies in the held-out regions or shares two dims with a held-out shape).
+- Rank v2 (`python -m tune ranker-v2`, CPU only, commit `2a6c246`): `lgbm_rank_v2.*`, 1,174 pool configs, 627 tune shapes (477 + tail), v1's CV-chosen hyperparameters (not re-searched), diversification rule refit on v2's own out-of-fold scores.
+  Tune out-of-fold best-of-3: 2.14% mean, 8.0% p95. No held-out shape was read by any fit.
+- Held-out, one new stage-2 session for every pick and baseline so v1 and v2 are not confounded by session noise: v2 joint online search `online_joint_diverse_v2.jsonl` (session `20261101-020041-c23bdc`);
+  stage 2 cold `results_lock1755_v2.jsonl` (`20261101-020208-bcca60`, 2,725 rows, 0 invalid, 62 not converged, ≈5% power-capped) and graph `results_lock1755_v2_graph.jsonl` (`20261101-021022-e5d06f`, 1,794 rows, 0 invalid, ≈6% power-capped), 56 shapes < 50 µs.
+  The session times `torch`, `triton:sweep:8`, the union of v1's clean and v2's diverse top-5 Triton picks, `cublaslt:16` and `cublaslt_deep:20`. All at harness `2a6c246`, clean. v1 numbers are from the clean joint run `20261031-005000-437cca`.
+  The full table is [`ranker_compare.md`](ranker_compare.md) (`python -m analysis.ranker_compare --online v1=online_joint_diverse.jsonl v2=online_joint_diverse_v2.jsonl`).
+
+**What v2 is.** v1's rank form (pool = union of each training shape's top 5, LightGBM regression of capped log regret) plus (1) 8 label-free analytic features per (shape, candidate): a roofline-style time estimate, its value relative to the best runnable config of the shape and its rank among all runnable configs, compute/memory balance, bytes per flop, split-K traffic share, CTAs per SM;
+(2) weight 5 on training rows within 25% of the shape's best; (3) the tail suite as extra tune data. The three were chosen on tune out-of-fold regret before any held-out look (below).
+
+**Tune evidence** (20 grouped folds on the original 477 shapes, paired bootstrap, diverse top-3): baseline 2.77% mean / 10.1% p95 (floored at 1.02 µs: 1.73% / 8.8%);
+all three: 2.13% / 9.4% (floored 0.99% / 5.3%); mean change −0.64 points [−0.99, −0.30], floored p95 −3.5 points [−5.7, −0.7]; raw p95 −0.7 [−3.2, +0.9] is not significant. Each ingredient adds: analytic features + weighting −0.29 points, tail data on top −0.35 [−0.66, −0.05].
+Learning curve (50 / 100 / 150 tail shapes): mean 2.41% / 2.23% / 2.13% vs 2.48% with none; the original-shape gain per added shape is shrinking (−0.07, −0.18, −0.10 points per 50), so a second batch of the same mix is expected to add ≲ 0.2 points.
+
+**Held-out screen regret** (86 shapes, diverse picks, median / p95 (mean); the screen oracle is biased low): top-1 v1 3.6% / 18.1% (5.5%) → v2 2.8% / 13.0% (4.6%); top-3 2.0% / 10.6% (3.4%) → 1.0% / 9.3% (2.1%); top-5 0.9% / 9.0% (2.6%) → 0.5% / 7.8% (1.7%). Top-3: v2 better by > 2% regret on 24 shapes, worse on 9.
+
+**Held-out stage 2, same session** (picks scored at their full-protocol time; regret vs the Triton oracle / the joint oracle of the session):
+
+| selector | ranker | first-use cost | regret vs oracle, median / p95 (mean) | vs B2 median / p10 | faster / slower than B2 | vs B3+ median | faster / slower than B3+ |
+|---|---|---|---|---|---|---|---|
+| Triton top-3 only | v1 | 0.52 s | 0.4% / 9.5% (2.3%) vs Triton oracle | 0.962 / 0.701 | 41 / 18 | 1.019 | 24 / 38 |
+| Triton top-3 only | **v2** | 0.60 s | **0.2% / 4.6% (1.2%)** vs Triton oracle | 0.949 / 0.698 | 43 / 15 | 1.016 | 23 / 35 |
+| top-3 + cuBLASLt top-16 | v1 | 0.59 s | 0.4% / 12.5% (3.0%) vs joint oracle | 0.911 / 0.698 | 49 / 0 | 1.000 | 24 / 14 |
+| top-3 + cuBLASLt top-16 | **v2** | 0.67 s | 0.4% / 10.4% (2.7%) vs joint oracle | 0.902 / 0.680 | 49 / 0 | 1.000 | 23 / 14 |
+| top-5 + cuBLASLt top-16 | v1 | 0.90 s | 0.3% / 12.0% (2.7%) | 0.901 / 0.697 | 52 / 0 | 1.000 | 26 / 13 |
+| top-5 + cuBLASLt top-16 | v2 | 0.96 s | 0.3% / 10.4% (2.5%) | 0.902 / 0.680 | 51 / 0 | 1.000 | 25 / 14 |
+
+Faster / slower counts use the 5% tie margin below 50 µs and 2% above. Paired v2 vs v1, geometric-mean ratio of the chosen config's time (95% bootstrap interval): Triton-only top-3 **0.9897 [0.9823, 0.9970]** (v2 faster on 11 shapes, slower on 4);
+joint top-3 0.9970 [0.9917, 1.0018] (4 / 4); joint top-5 0.9985 [0.9942, 1.0022] (1 / 2); joint top-1 0.9977 [0.9899, 1.0050] (6 / 8).
+
+**Findings.**
+- v2 does what tune predicted for Triton alone: held-out regret vs the Triton oracle falls from 2.3% to 1.2% mean and 9.5% to 4.6% p95 at top-3, in both regimes (< 50 µs 2.1% → 1.2%, ≥ 50 µs 2.6% → 1.1%), and the effect is significant in the paired time ratio.
+- In the joint search the gain is **not** significant: the interval for the paired ratio includes 1, v2 is faster on 4 shapes and slower on 4, and the median regret and the B2 / B3 / B3+ counts barely move (the p95 vs the joint oracle goes from 12.5% to 10.4%).
+  The cuBLASLt candidates already cover most of the regimes where the Triton ranker was weak, so a better Triton ranking changes the final pick on few shapes. The remaining joint tail is mainly B3+ (offline deep search) wins, unchanged by the ranker. G4 is unchanged.
+- **First-use cost rises by ~0.08 s** (0.59 → 0.67 s at top-3 + LT16): ranking is ~40 ms slower per shape online (0.099 → 0.139 s: the analytic features over the full 10,840-config space), and v2's picks compile ~11 ms slower per candidate (slightly more warps and stages).
+- Net: adopt v2 for **Triton-only** selection (where it halves the tail); for the joint search it is a small, uncertain gain for a small cost, so v1 and v2 are both acceptable there.
+
+**Caveats.** One GPU, one stage-2 session per ranker pair, placement-pooled but single-run online choices (the choice differs between two runs on ~10% of shapes). The analytic features use the RTX 3080's measured peaks (62.9 TFLOP/s, 686 GB/s) for every GPU, so a zero-shot run of v2 elsewhere shifts only the compute/memory-balance features;
+it is not a clean zero-shot test of the same features. The tail regimes were taken from the worst *tune* out-of-fold shapes (Step 0 of this work), but while relating the Triton tail to cuBLASLt wins I had also seen held-out shapes with N ≈ 1 (e.g. 384×2×10369, 7039×1×93), so the narrow-N regime was not chosen in strict isolation from held-out information; no held-out shape or label entered a fit, and the suite excludes anything sharing two dims with a held-out shape. The v2 ingredients were fixed on tune before the first held-out look.
+
+**Gates.** None changed. **Not done / next steps.** (1) Add the joint selector and `KPolicy` to the zero-shot runbook (`analysis/zero_shot.py`), including `lgbm_rank_v2`. (2) Speed up v2 ranking (precompute the static part of the analytic features; ~40 ms is most of the cost increase). (3) A second tail batch only if it targets what is left: oracle split-K > 1, 10–50 µs runtimes and narrow N (tail rates 11%, 9%, 9% after v2).
+(4) Graph-mode noise study before relying on sub-50 µs wins. (5) A cache so a shape can move from k = 3 to k = 5 without a new search.
+
+Reproduce: `python -m tune --clock-lock 1755 sweep --suite tail --per-suite 1000 --screen-dir sweep_screen_tail`; `python -m tune ranker-v2`; `python -m tune --clock-lock 1755 online --ranker data/<hw>/lgbm_rank_v2 --shapes-file $D/sweep_screen_heldout/subset.json --k 5 --order diverse --lt-n 16 --fresh-cache --out-name online_joint_diverse_v2.jsonl`;
+then `benchmark --shapes-file $D/sweep_screen_heldout/subset.json --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20 --cache-modes cold --out-name results_lock1755_v2.jsonl` with `TUNE_SWEEP_DIR=$D/sweep_screen_heldout` and `TUNE_PICKS` pointing at the union of v1 and v2 candidates (`v2_stage2_picks.json`), the same with `subset_lt50us.json --cache-modes hot --graph-batch 50` for the graph file, and `python -m analysis.ranker_compare --online v1=online_joint_diverse.jsonl v2=online_joint_diverse_v2.jsonl`.
+
 ## Update 2026-10-31: joint {Triton ∪ cuBLASLt} online selection (no router) and a tail diagnosis
 
 **What ran** (RTX 3080, `--clock-lock 1755`, driver 595.99.02).

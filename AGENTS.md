@@ -191,7 +191,10 @@ Other findings to keep in mind:
 - Losses ≥ 50 µs are kernel-level: unaligned strides (no 16-byte vector loads) and split-K reduction cost on tiny M, N. Better selection cannot fix them.
 - Parameter importance: SPLIT_K ≫ BLOCK_M > BLOCK_K > BLOCK_N ≫ warps, stages, GROUP_M.
 - Measured roofline: 62.9 TFLOP/s fp16 tensor, 686 GB/s DRAM. Under sustained load the card power-caps (throttle 0x4).
-- **Current selector bar: lgbm diverse online top-3** (`tune online --order diverse`, sessions `topkd` / `topkd-graph` / `online-…-topkd`). lgbm_rank (`analysis/learned.py`) is a LightGBM regressor
+- **Joint selection and rank v2 (2026-11-01).** `tune online --lt-n 16` puts cuBLASLt's heuristic top-16 in the same short-timed pool as the Triton picks: top-3 + LT16 costs ~0.6 s first use and is > 5% faster than B2 on 49 of 86 held-out shapes and slower on 0
+  (median 0.91 vs B2, 1.00 vs B3+; B3+ stays an offline bar). `KPolicy` / `select_kernel` (`tune/online.py`) choose k = 3, or 5 for shapes the caller marks frequent (`calls` >= 1M). Rank v2 (`python -m tune ranker-v2`, analytic features + near-top weights + the `tail` suite as tune data) halves the Triton-only held-out tail
+  (regret vs the Triton oracle at top-3: 0.4% / 9.5% / 2.3% -> 0.2% / 4.6% / 1.2% median / p95 / mean) but moves the joint search only within noise, for +0.08 s. Details and caveats: `reports/week1.md` 2026-11-01, `reports/ranker_compare.md`. Score rankers side by side with `python -m analysis.ranker_compare`.
+- **Triton-only selector bar (v1): lgbm diverse online top-3** (`tune online --order diverse`, sessions `topkd` / `topkd-graph` / `online-…-topkd`). lgbm_rank (`analysis/learned.py`) is a LightGBM regressor
   of log regret per (shape, candidate) over each tune shape's top-5 pool, using shape features + config params + `candidate_features`. It ranks the shape. `diverse_order` keeps the top pick, then takes the best config
   of each new (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K) group within 0.05 predicted log regret. That rule was fit on out-of-fold tune scores and is saved in `lgbm_rank.json`. The 3 picks are compiled, validated and short-timed (graph when < 50 µs), and the fastest is kept.
   Cold all: 1.0% / 9.9% / 2.7% (median / p95 / mean). ≥ 50 µs: 0.9% / 11.1% / 2.5%. Graph < 50 µs: 0.2% / 9.9% / 2.1%. Cost: ~0.4 s first use per shape (JIT compile).
@@ -271,7 +274,7 @@ python -m tune selectors       # re-score with both stage-2 files
 
 1. **Learned selector v0: done** (lgbm_rank, see §6 and `reports/week1.md` 2026-10-19 late). Next: lambdarank / regression blends, a larger candidate pool.
 2. **Top-k + short online search: done** (`tune online --order diverse`, top-3; inner warps / stages pass tried, a tie). Next: better ranking for N = 1 / tiny-K shapes and near-optimal tiles ranked low.
-3. **Joint {Triton ∪ cuBLASLt} selection**, especially under 50 µs where the families split the wins.
+3. **Joint {Triton ∪ cuBLASLt} selection: done without a router** (`--lt-n 16`, see §6). Left: a cost-only family router (skip Triton compiles when cuBLASLt is clearly ahead), the joint selector in the zero-shot runbook, faster v2 ranking (+40 ms), and a cache to move a shape from k = 3 to k = 5.
 4. Noise study for graph-amortized mode (second session plus a reboot) before relying on tiny-GEMM wins.
 5. Kernel-level fixes if differentiation matters: an aligned-copy or padded path for unaligned strides, and a fused or atomic split-K reduction.
 6. Not built yet: B4 (CUTLASS), per-candidate subprocess isolation with hang timeouts (plan 7.2), adaptive sampling.
