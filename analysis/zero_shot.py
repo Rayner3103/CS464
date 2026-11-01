@@ -13,6 +13,19 @@ Two variants separate what the model gets wrong from what the features get wrong
 Both use the diversified top-k (`order="diverse"`, the saved CV-chosen rule) with the short online search, and store the
 choice for every k' <= k, so top-1 (no online search) and best-of-k come from one run.
 
+More than one model, the joint selector and the k policy (added 2026-11-01):
+  * `--ranker v1=<dir>/lgbm_rank v2=<dir>/lgbm_rank_v2` runs several saved models (rank v1 and rank v2, reports/week1.md
+    2026-11-01) in one invocation: `name=stem` pairs write zero_shot_<name>_<variant>.jsonl; a bare path keeps the original
+    zero_shot_<variant>.jsonl names, so results already produced with the old version still score. v2 needs its
+    lgbm_rank_v2.txt/.json copied by hand like v1 (its constants are fixed model units, not this GPU's roofline: do not change them).
+    `native` rebuilds v2's pruning space from this GPU's limits, which is what a deployment would do.
+  * `--lt-n 16` also times cuBLASLt's heuristic top 16 in the same short-timing pool (joint selection). The screen oracle is
+    Triton-only, so the screen table scores the Triton-only choice (`choice_lt` "<k>_lt0"); the joint choice is scored in a
+    small stage-2 session on this GPU against B2 / B3 (see the `picks` subcommand and analysis.ranker_compare).
+  * `--k 3 --k-frequent 5 --frequent-calls 1000000` applies tune.online.KPolicy: a shape in the shapes file with `calls` >= the
+    threshold (or `frequent: true`) gets k = 5, every other shape k = 3. Held-out shapes carry no call counts, so for the
+    evaluation just run `--k 5` and read `online-3` (default tier) and `online-5` (frequent tier) from the same rows.
+
 Runbook on the target machine (e.g. an RTX 2060; GPU idle, one GPU job at a time, AGENTS.md section 7):
   0. check out the commit with this module (the saved model is NOT in git: data/ is gitignored, lgbm_rank.txt is ~35 MB, so
      copy data/<src_hw>/lgbm_rank.txt and lgbm_rank.json to this machine by hand); pip versions must match requirements.txt
@@ -22,9 +35,13 @@ Runbook on the target machine (e.g. an RTX 2060; GPU idle, one GPU job at a time
   3. the oracle, this GPU's own screen of the held-out shapes (hours; ~1.3 h on the 3080, expect longer on a 2060):
         python -m tune --clock-lock X sweep --split heldout --per-suite 1000
      --per-suite 1000 gives the same 86 shapes as the 3080 run (the default of 24 per suite is a smaller subset)
-  4. python -m analysis.zero_shot --clock-lock X run --ranker <dir>/lgbm_rank --fresh-cache
-     (--clock-lock goes before the subcommand; only start this after step 3 has finished: never two GPU jobs at once)
-  5. python -m analysis.zero_shot --clock-lock X score          -> reports/zero_shot_<hw_id>.md (+ _summary.json)
+  4. python -m analysis.zero_shot --clock-lock X run --ranker v1=<dir>/lgbm_rank v2=<dir>/lgbm_rank_v2 --k 5 --lt-n 16 --fresh-cache
+     (--clock-lock goes before the subcommand; only start this after step 3 has finished: never two GPU jobs at once;
+      plain `--ranker <dir>/lgbm_rank --k 3` is the original Triton-only experiment)
+  5. python -m analysis.zero_shot --clock-lock X score --k 3    -> reports/zero_shot_<hw_id>.md (+ _summary.json);
+     `score --k 5` for the frequent tier
+  6. (joint selector, optional, ~0.5 h) python -m analysis.zero_shot picks   writes the picks file and prints the two
+     `tune benchmark` commands (cold, and graph for the shapes under 50 us) and the final `analysis.ranker_compare` command
 
 Reading the report: online-3 and best-of-3 of `native` vs `as_is` (the gap is what the source GPU's numbers in the features
 cost); the 3080 reference rows at the bottom; the `fixed` row (if the ranker barely beats one reused config the transfer is
@@ -52,14 +69,42 @@ CAP = 10.0       # regret for "no valid pick", the same convention as `portfolio
 EPS = 0.02       # tie margin at >= 50 us (AGENTS.md section 6, G1)
 SMALL_US = 50.0
 VARIANTS = ("as_is", "native")
-# The 3080 reference rows: reports/learned_topk.md, "Screen" table, orders plain / diverse (median, p95, mean; all shapes).
+# The 3080 reference rows (median, p95, mean; all 86 held-out shapes, regret vs the held-out screen oracle, diverse picks):
+# rank v1 from reports/learned_topk.md "Screen" table; rank v2 from reports/week1.md 2026-11-01 (same method).
 REFERENCE_3080 = {"top-1": (0.036, 0.181, 0.055), "best-of-3 (diverse)": (0.020, 0.106, 0.034)}
+REFERENCE_3080_V2 = {"top-1": (0.028, 0.130, 0.046), "best-of-3 (diverse)": (0.010, 0.093, 0.021),
+                     "best-of-5 (diverse)": (0.005, 0.078, 0.017)}
 # B6 on the 3080 (AGENTS.md section 6): the "just reuse the single best 3080 config" baseline.
 FIXED_3080 = "bm32_bn32_bk32_w4_s5_g1_sk1"
 
 
-def out_name(variant: str) -> str:
-    return f"zero_shot_{variant}.jsonl"
+def out_name(variant: str, model: str = "") -> str:
+    """Rows file of one (model, variant); model "" keeps the original zero_shot_<variant>.jsonl name."""
+    return f"zero_shot_{model}_{variant}.jsonl" if model else f"zero_shot_{variant}.jsonl"
+
+
+def parse_rankers(items: list[str]) -> list[tuple[str, Path]]:
+    """`--ranker` values: `name=stem` (named model) or a bare stem (the original, unnamed model)."""
+    out = []
+    for x in items:
+        name, _, stem = x.partition("=") if "=" in x else ("", "", x)
+        if name and not name.replace("-", "").replace("_", "").isalnum():
+            raise ValueError(f"model name {name!r} must be alphanumeric (it is part of a file name)")
+        out.append((name, Path(stem)))
+    if len({n for n, _ in out}) != len(out):
+        raise ValueError("duplicate model names in --ranker")
+    return out
+
+
+def find_models(data: Path, variants=VARIANTS) -> list[str]:
+    """Models with rows in `data`: "" for the original file names, then every <name> of zero_shot_<name>_<variant>.jsonl."""
+    names = [""] if any((data / out_name(v)).exists() for v in variants) else []
+    for v in variants:
+        for p in sorted(data.glob(f"zero_shot_*_{v}.jsonl")):
+            name = p.name[len("zero_shot_"):-len(f"_{v}.jsonl")]
+            if name and name not in names:
+                names.append(name)
+    return names
 
 
 def source_gpu_name(stem: Path) -> str | None:
@@ -76,9 +121,12 @@ def variant_ranker(stem: Path, variant: str, native_gpu: dict | None):
 
 
 def run(shapes: list[dict], ranker_stem: Path, out_dir: Path, *, variants=VARIANTS, k: int = 3,
-        session_id: str | None = None, log=print) -> list[Path]:
+        session_id: str | None = None, log=print, name: str = "", lt_n: int = 0, policy=None) -> list[Path]:
+    """Rank + short online search for each variant of one saved model. name: output file tag (see out_name); lt_n > 0:
+    also time cuBLASLt's heuristic top lt_n (joint selection); policy: a tune.online.KPolicy making k per shape from
+    the shape's `calls` / `frequent` fields (k is then the default tier)."""
     from tune.env import provenance, write_env
-    from tune.online import choose, search_shape
+    from tune.online import all_choices, search_shape, shape_k
     from tune.records import RecordWriter
     import torch
 
@@ -88,30 +136,31 @@ def run(shapes: list[dict], ranker_stem: Path, out_dir: Path, *, variants=VARIAN
     for variant in variants:
         ranker = variant_ranker(ranker_stem, variant, env["gpu"])
         rule = ranker.rule("diverse")
-        path = out_dir / out_name(variant)
+        path = out_dir / out_name(variant, name)
         paths.append(path)
         done = set()
         if path.exists():
-            done = {(r["M"], r["N"], r["K"]) for r in map(json.loads, path.read_text().splitlines())
-                    if r.get("k") == k and r.get("rule") == rule}
-        todo = [s for s in shapes if (s["M"], s["N"], s["K"]) not in done]
+            done = {(r["M"], r["N"], r["K"], r.get("k")) for r in map(json.loads, path.read_text().splitlines())
+                    if r.get("rule") == rule and r.get("lt_n", 0) == lt_n}
+        todo = [dict(s, _k=shape_k(s, k, policy)) for s in shapes]
+        todo = [s for s in todo if (s["M"], s["N"], s["K"], s["_k"]) not in done]
         t0 = time.perf_counter()
         with RecordWriter(path) as w:
             for i, s in enumerate(todo):
-                M, N, K = s["M"], s["N"], s["K"]
+                M, N, K, ks = s["M"], s["N"], s["K"], s["_k"]
                 t = time.perf_counter()
-                r = search_shape(ranker, M, N, K, k, torch.float16, "diverse")
-                row = {"M": M, "N": N, "K": K, "dtype": "fp16", "k": k, "order": "diverse", "rule": rule,
-                       "variant": variant, "split": s.get("split"), "suite": s.get("suite"),
+                r = search_shape(ranker, M, N, K, ks, torch.float16, "diverse", lt_n)
+                row = {"M": M, "N": N, "K": K, "dtype": "fp16", "k": ks, "order": "diverse", "rule": rule, "lt_n": lt_n,
+                       "model": name or "lgbm_rank", "variant": variant, "split": s.get("split"), "suite": s.get("suite"),
+                       **({"calls": s.get("calls"), "frequent": s.get("frequent")} if policy else {}),
                        "session_id": session_id, "hw_id": env["hw_id"], "driver": env["driver"], **provenance(env),
                        "source_gpu": source_gpu,
                        "ranker": str(ranker_stem), "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"),
-                       "wall_s": time.perf_counter() - t, **r,
-                       "choice": {str(j): choose(r["candidates"], j) for j in range(1, k + 1)},
+                       "wall_s": time.perf_counter() - t, **r, **all_choices(r["candidates"], ks, lt_n),
                        "timestamp": time.time()}
                 w.write(row)
                 el = time.perf_counter() - t0
-                log(f"[{variant} {i + 1}/{len(todo)}] {M}x{N}x{K} -> {row['choice'][str(k)]['key']} "
+                log(f"[{name or 'lgbm_rank'} {variant} {i + 1}/{len(todo)}] {M}x{N}x{K} k={ks} -> {row['choice'][str(ks)]['key']} "
                     f"({row['wall_s']:.1f}s) | {el:.0f}s elapsed, ETA {el / (i + 1) * (len(todo) - i - 1):.0f}s")
     return paths
 
@@ -162,7 +211,9 @@ def score_rows(screen: dict, rows: list[dict], k: int, fixed: str | None = None)
             ok = [c["config_key"] for c in cands[:j] if c["valid"] and c["config_key"] in t]
             out.setdefault(f"best-of-{j}", []).append(
                 regret(t, min(ok, key=t.get)) if ok else (CAP if not any(c["valid"] for c in cands[:j]) else None))
-            out.setdefault(f"online-{j}", []).append(regret(t, r["choice"][str(j)]["key"]))
+            # The screen holds Triton configs only: a joint row's Triton-only choice ("<j>_lt0") is what it can score.
+            ch = (r.get("choice_lt") or {}).get(f"{j}_lt0") or r["choice"][str(j)]
+            out.setdefault(f"online-{j}", []).append(regret(t, ch["key"]))
         out["invalid_picks"] = out.get("invalid_picks", []) + [sum(not c["valid"] for c in cands[:k])]
     if fixed is not None:
         shapes = [(r["M"], r["N"], r["K"]) for r in rows if screen.get((r["M"], r["N"], r["K"])) and not r.get("skipped")]
@@ -193,39 +244,52 @@ def fmt(s: dict) -> str:
 
 
 def build(data: Path, report: Path, *, screen_name: str = "sweep_screen_heldout", k: int = 3,
-          fixed: str | None = FIXED_3080, variants=VARIANTS) -> tuple[Path, dict]:
+          fixed: str | None = FIXED_3080, variants=VARIANTS, models: list[str] | None = None) -> tuple[Path, dict]:
+    """Score every (model, variant) rows file in `data` against the screen. Rows searched with a larger k (a k = 5 run, or
+    a KPolicy run) also score at this k, since they store the choice for every k' <= k. models: names as in out_name
+    ("" = the original file names); default: every model found."""
     screen = load_screen(data / screen_name)
+    models = find_models(data, variants) if models is None else models
     summary: dict = {"hw_id": data.name, "n_screen_shapes": len(screen), "k": k, "fixed_config": fixed, "variants": {}}
-    for v in variants:
-        p = data / out_name(v)
-        if not p.exists():
-            continue
-        rows = [json.loads(x) for x in p.read_text().splitlines()]
-        rows = [r for r in rows if r.get("k") == k]
-        sc = score_rows(screen, rows, k, fixed)
-        oracle = np.array(sc.pop("_oracle_us"))
-        n_skipped = sc.pop("_skipped")
-        inv = sc.pop("invalid_picks", [])
-        masks = {"all": None, ">= 50 us": oracle >= SMALL_US, "< 50 us": oracle < SMALL_US}
-        summary["variants"][v] = {
-            "n_shapes": len(oracle), "n_skipped_oom": n_skipped, "invalid_picks_per_shape_mean": float(np.mean(inv)) if inv else None,
-            "scores": {name: {g: summarize(vals, m) for g, m in masks.items()} for name, vals in sc.items()}}
+    for model in models:
+        for v in variants:
+            p = data / out_name(v, model)
+            if not p.exists():
+                continue
+            rows = [r for r in map(json.loads, p.read_text().splitlines()) if r.get("k", 0) >= k]
+            if not rows:
+                continue
+            sc = score_rows(screen, rows, k, fixed)
+            oracle = np.array(sc.pop("_oracle_us"))
+            n_skipped = sc.pop("_skipped")
+            inv = sc.pop("invalid_picks", [])
+            masks = {"all": None, ">= 50 us": oracle >= SMALL_US, "< 50 us": oracle < SMALL_US}
+            summary["variants"][f"{model}/{v}" if model else v] = {
+                "model": model or "lgbm_rank", "variant": v, "joint_rows": bool(rows[0].get("lt_n")),
+                "n_shapes": len(oracle), "n_skipped_oom": n_skipped,
+                "invalid_picks_per_shape_mean": float(np.mean(inv)) if inv else None,
+                "scores": {name: {g: summarize(vals, m) for g, m in masks.items()} for name, vals in sc.items()}}
     lines = [f"# Zero-shot selector transfer: `{data.name}`", "",
-             f"Source model: lgbm_rank fit on another GPU, no refit. Oracle: this GPU's held-out screen "
+             f"Source models: lgbm_rank (v1) and, when present, lgbm_rank_v2, fit on another GPU, no refit. Oracle: this GPU's held-out screen "
              f"(`{screen_name}`, {len(screen)} complete shapes). Cells are median / p95 (mean) regret vs the screen oracle, "
              f"the format of the 3080 `Screen` table in `reports/learned_topk.md`. A shape with no valid pick counts as "
-             f"{100 * CAP:.0f}% regret.", ""]
-    for v, d in summary["variants"].items():
+             f"{100 * CAP:.0f}% regret. Scored at k = {k}; the screen holds Triton configs only, so joint rows are scored on their "
+             f"Triton-only choice (the joint choice is scored in a stage-2 session: `picks`, then analysis.ranker_compare).", ""]
+    for key, d in summary["variants"].items():
         inv = d["invalid_picks_per_shape_mean"]
-        lines += [f"## Variant `{v}` ({d['n_shapes']} shapes, {'n/a' if inv is None else f'{inv:.2f}'} invalid picks per shape "
-                  f"out of {k}"
-                  + (f"; {d['n_skipped_oom']} shapes skipped, out of VRAM" if d["n_skipped_oom"] else "") + ")", "", "| pick | all | >= 50 us | < 50 us | within 2% | no pick | unscored |", "|---|---|---|---|---|---|---|"]
+        lines += [f"## Model `{d['model']}`, variant `{d['variant']}` ({d['n_shapes']} shapes, "
+                  f"{'n/a' if inv is None else f'{inv:.2f}'} invalid picks per shape out of {k}"
+                  + (f"; {d['n_skipped_oom']} shapes skipped, out of VRAM" if d["n_skipped_oom"] else "") + ")", "",
+                  "| pick | all | >= 50 us | < 50 us | within 2% | no pick | unscored |", "|---|---|---|---|---|---|---|"]
         for name, g in d["scores"].items():
             lines.append(f"| {name} | {fmt(g['all'])} | {fmt(g['>= 50 us'])} | {fmt(g['< 50 us'])} | "
                          f"{100 * g['all'].get('within_eps', 0):.0f}% | {g['all'].get('no_pick', 0)} | {g['all'].get('unscored', 0)} |")
         lines.append("")
-    lines += ["## RTX 3080 reference (same method, its own screen)", "", "| pick | all |", "|---|---|"]
-    lines += [f"| {n} | {100 * a:.1f}% / {100 * b:.1f}% ({100 * c:.1f}%) |" for n, (a, b, c) in REFERENCE_3080.items()]
+    lines += ["## RTX 3080 reference (same method, its own screen)", "", "| pick | rank v1 | rank v2 |", "|---|---|---|"]
+    fm = lambda t: f"{100 * t[0]:.1f}% / {100 * t[1]:.1f}% ({100 * t[2]:.1f}%)"
+    names = list(dict.fromkeys([*REFERENCE_3080, *REFERENCE_3080_V2]))
+    lines += [f"| {n} | {fm(REFERENCE_3080[n]) if n in REFERENCE_3080 else 'n/a'} | "
+              f"{fm(REFERENCE_3080_V2[n]) if n in REFERENCE_3080_V2 else 'n/a'} |" for n in names]
     lines += ["", f"`fixed` row: the 3080's B6 config `{fixed}` used as-is on every shape.",
               "`unscored`: a pick that is not in this GPU's screen (pruned there), excluded from the stats.",
               "`online-k` is what the short search chose; `best-of-k` is the best of the same k candidates by screen time."]
@@ -236,16 +300,45 @@ def build(data: Path, report: Path, *, screen_name: str = "sweep_screen_heldout"
     return out, summary
 
 
+def write_stage2_picks(data: Path, screen_name: str = "sweep_screen_heldout") -> tuple[Path, Path, int]:
+    """Inputs of the joint-selector stage-2 session on this GPU: the union of every Triton candidate the zero-shot runs
+    searched, per shape (<data>/zero_shot_stage2_picks.json, the format of TUNE_PICKS), and the shapes whose screen
+    oracle is < 50 us (<data>/zero_shot_lt50us.json) for the graph-amortized pass."""
+    picks: dict[str, list[str]] = {}
+    for p in sorted(data.glob("zero_shot*_*.jsonl")):
+        if p.name.startswith("zero_shot_stage2"):
+            continue
+        for line in p.read_text().splitlines():
+            r = json.loads(line)
+            key = f"{r['M']}x{r['N']}x{r['K']}"
+            for c in r.get("candidates", []):
+                if c.get("family", "triton") == "triton" and c["config_key"] not in picks.setdefault(key, []):
+                    picks[key].append(c["config_key"])
+    path = data / "zero_shot_stage2_picks.json"
+    path.write_text(json.dumps({"picks": picks, "by_selector": {"zero_shot": {}},
+                                "note": "union of the Triton candidates of every zero-shot run"}))
+    screen = load_screen(data / screen_name)
+    base = json.loads((data / screen_name / "subset.json").read_text())
+    small = [s for s in base["shapes"] if screen.get((s["M"], s["N"], s["K"])) and min(screen[(s["M"], s["N"], s["K"])].values()) < SMALL_US]
+    lt = data / "zero_shot_lt50us.json"
+    lt.write_text(json.dumps({**base, "note": f"shapes whose screen oracle is < {SMALL_US:.0f} us", "n": len(small), "shapes": small}))
+    return path, lt, len(picks)
+
+
 def _main(argv=None):
     ap = argparse.ArgumentParser(prog="analysis.zero_shot", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--clock-lock", default=None, help="declared SM clock lock in MHz, like `tune --clock-lock`")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("run", help="rank + short online search on this GPU for each variant (needs the GPU, idle)")
-    p.add_argument("--ranker", type=Path, required=True, help="saved model stem, e.g. <dir>/lgbm_rank (.txt + .json)")
+    p.add_argument("--ranker", nargs="+", required=True,
+                   help="saved model stems, bare (<dir>/lgbm_rank, original file names) or name=stem (v2=<dir>/lgbm_rank_v2)")
     p.add_argument("--shapes-file", type=Path, default=None,
                    help="default <data>/sweep_screen_heldout/subset.json (the shapes the oracle covers)")
-    p.add_argument("--k", type=int, default=3)
+    p.add_argument("--k", type=int, default=3, help="Triton candidates per shape (default tier with --k-frequent)")
+    p.add_argument("--k-frequent", type=int, default=0, help="k for shapes marked `frequent` / with calls >= --frequent-calls; 0 = off")
+    p.add_argument("--frequent-calls", type=int, default=1_000_000)
+    p.add_argument("--lt-n", type=int, default=0, help="also time cuBLASLt's heuristic top N (joint selection); 0 = Triton only")
     p.add_argument("--variants", default=",".join(VARIANTS))
     p.add_argument("--out", type=Path, default=None, help="default data/<hw_id>")
     p.add_argument("--fresh-cache", action="store_true", help="compile into an empty TRITON_CACHE_DIR under --out")
@@ -255,8 +348,11 @@ def _main(argv=None):
     p.add_argument("--data", type=Path, default=None, help="default data/<hw_id> of this machine")
     p.add_argument("--report", type=Path, default=Path("reports"))
     p.add_argument("--screen", default="sweep_screen_heldout")
-    p.add_argument("--k", type=int, default=3)
+    p.add_argument("--k", type=int, default=3, help="score at this k (rows searched with a larger k also score)")
     p.add_argument("--fixed-config", default=FIXED_3080, help="fixed-config baseline row ('' to skip)")
+    p = sub.add_parser("picks", help="write the joint-selector stage-2 inputs and print the commands (no GPU)")
+    p.add_argument("--data", type=Path, default=None)
+    p.add_argument("--screen", default="sweep_screen_heldout")
     args = ap.parse_args(argv)
     if args.clock_lock is not None:
         os.environ["TUNE_CLOCK_LOCK"] = args.clock_lock
@@ -269,7 +365,22 @@ def _main(argv=None):
             print(f"{v}: {d['n_shapes']} shapes, online-{args.k} {fmt(g)}")
         print(f"-> {out}")
         return 0
+    if args.cmd == "picks":
+        from tune.env import default_data_dir
+        data = args.data or default_data_dir()
+        picks, lt, n = write_stage2_picks(data, args.screen)
+        lock = f"--clock-lock {args.clock_lock} " if args.clock_lock else "--clock-lock X "
+        files = [f"{(m + '_' if m else '') + v}={out_name(v, m)}" for m in find_models(data) for v in VARIANTS if (data / out_name(v, m)).exists()]
+        be = "torch,triton:sweep:8,triton:picks,cublaslt:16"
+        print(f"{n} shapes -> {picks}\n{lt}\n\nRun on the idle GPU (never alongside another GPU job), then score:\n"
+              f"  export TUNE_SWEEP_DIR={data / args.screen} TUNE_PICKS={picks}\n"
+              f"  python -m tune {lock}benchmark --shapes-file {data / args.screen / 'subset.json'} --backends {be} --cache-modes cold --out-name results_zero_shot.jsonl\n"
+              f"  python -m tune {lock}benchmark --shapes-file {lt} --backends {be} --cache-modes hot --graph-batch 50 --out-name results_zero_shot_graph.jsonl\n"
+              f"  python -m analysis.ranker_compare --data {data} --results results_zero_shot.jsonl --graph-results results_zero_shot_graph.jsonl --online "
+              + " ".join(files) + "\n(add cublaslt_deep:20 to --backends for B3+, 20 s per shape)")
+        return 0
     from tune.env import default_data_dir, pin_cpu
+    from tune.online import KPolicy
     out_dir = args.out or default_data_dir()
     if args.fresh_cache:
         cache = out_dir / "online_triton_cache" / time.strftime("%Y%m%d-%H%M%S")
@@ -279,7 +390,11 @@ def _main(argv=None):
         pin_cpu()
     shapes_file = args.shapes_file or out_dir / "sweep_screen_heldout" / "subset.json"
     shapes = json.loads(shapes_file.read_text())["shapes"]
-    paths = run(shapes, args.ranker, out_dir, variants=tuple(args.variants.split(",")), k=args.k, session_id=args.session)
+    policy = KPolicy(args.k, args.k_frequent, args.frequent_calls) if args.k_frequent else None
+    paths = []
+    for name, stem in parse_rankers(args.ranker):
+        paths += run(shapes, stem, out_dir, variants=tuple(args.variants.split(",")), k=args.k, session_id=args.session,
+                     name=name, lt_n=args.lt_n, policy=policy)
     print("zero-shot rows -> " + ", ".join(map(str, paths)))
     return 0
 

@@ -40,7 +40,8 @@ def references(cold: dict, hot: dict) -> dict:
     for s, v in cold.items():
         small = min(min(v["tri"].values()), min(v["lth"].values())) < SMALL_US and s in hot and bool(hot[s]["tri"])
         src = hot[s] if small else v
-        lth, ltd = min(src["lth"].values()), min(src["ltd"].values())
+        lth = min(src["lth"].values())
+        ltd = min(src["ltd"].values(), default=lth)  # no cublaslt_deep rows (e.g. a new GPU): B3+ = B3
         out[s] = {"small": small, "b2": next(t for k, t in src["lth"].items() if k.startswith("h0_")), "b3": lth,
                   "b3p": min(lth, ltd), "tri_orc": min(src["tri"].values()), "src": src}
         out[s]["orc"] = min(out[s]["tri_orc"], out[s]["b3p"])
@@ -51,10 +52,15 @@ def chosen_times(online: Path, ref: dict, cold: dict) -> dict:
     """{config name: {"t": [us per shape], "cost": [first-use s], "family": [...], "shapes": [...]}} for one online file."""
     rows = [json.loads(line) for line in Path(online).read_text().splitlines()]
     rows = [r for r in rows if r.get("candidates")]
-    out = {n: {"t": [], "cost": [], "family": [], "shapes": []} for n, _, _ in CONFIGS}
+    # "+ LT16" = every cuBLASLt candidate of the row's search: only a joint run (lt_n > 0) has any
+    has = lambda r, k, lt: (str(k) in r["choice"] and r.get("lt_n", 0) > 0) if lt == 16 else f"{k}_lt{lt}" in r.get("choice_lt", {})
+    configs = [c for c in CONFIGS if all(has(r, c[1], c[2]) for r in rows)]  # a k = 3 run has no "top-5" selectors
+    if not configs:
+        raise ValueError(f"{online}: no joint selectors to score; run the search with --lt-n 16 (choice_lt missing)")
+    out = {n: {"t": [], "cost": [], "family": [], "shapes": []} for n, _, _ in configs}
     for r in rows:
         s = (r["M"], r["N"], r["K"])
-        for name, k, lt in CONFIGS:
+        for name, k, lt in configs:
             ch = r["choice"][str(k)] if lt == 16 else r["choice_lt"][f"{k}_lt{lt}"]
             src = ref[s]["src"]
             t = next((src[f][ch["key"]] for f in ("tri", "lth", "ltd") if ch["key"] in src[f]), None)
@@ -68,6 +74,8 @@ def chosen_times(online: Path, ref: dict, cold: dict) -> dict:
 
 
 def stats(x: np.ndarray) -> dict:
+    if not len(x):  # an empty group (e.g. no shape under 50 us on this GPU)
+        return {k: float("nan") for k in ("median", "p10", "p90", "p95", "mean")}
     return {"median": float(np.median(x)), "p10": float(np.percentile(x, 10)), "p90": float(np.percentile(x, 90)),
             "p95": float(np.percentile(x, 95)), "mean": float(np.mean(x))}
 
@@ -75,12 +83,13 @@ def stats(x: np.ndarray) -> dict:
 def score(online: Path, ref: dict, cold: dict) -> dict:
     """Per config and group (all / < 50 us / >= 50 us): cost, ratios to B2 / B3 / B3+, win-loss counts, regrets."""
     ct = chosen_times(online, ref, cold)
-    shapes = ct[CONFIGS[0][0]]["shapes"]
+    names_ = list(ct)
+    shapes = ct[names_[0]]["shapes"]
     small = np.array([ref[s]["small"] for s in shapes])
     R = {k: np.array([ref[s][k] for s in shapes]) for k in ("b2", "b3", "b3p", "orc", "tri_orc")}
     groups = {"all": (np.ones(len(small), bool), EPS["small"]), "< 50 us": (small, EPS["small"]), ">= 50 us": (~small, EPS["large"])}
     out = {}
-    for name, _, _ in CONFIGS:
+    for name in names_:
         t = np.array(ct[name]["t"])
         out[name] = {}
         for g, (m, eps) in groups.items():
@@ -92,7 +101,7 @@ def score(online: Path, ref: dict, cold: dict) -> dict:
             e["regret_joint"] = stats(t[m] / R["orc"][m] - 1)
             e["regret_triton"] = stats(t[m] / R["tri_orc"][m] - 1)
             out[name][g] = e
-    return {"scores": out, "times": {n: ct[n]["t"] for n, _, _ in CONFIGS}, "shapes": shapes, "small": small.tolist()}
+    return {"scores": out, "times": {n: ct[n]["t"] for n in names_}, "shapes": shapes, "small": small.tolist()}
 
 
 def paired(a: dict, b: dict, name: str, seed: int = 0) -> dict:
@@ -116,18 +125,19 @@ def build(data: Path, report: Path, online: dict[str, str], results: str, graph_
     ref = references(cold, hot)
     sc = {n: score(Path(data) / f, ref, cold) for n, f in online.items()}
     names = list(online)
+    cfgs = [c for c, _, _ in CONFIGS if all(c in sc[n]["scores"] for n in names)]  # selectors every file can score
     lines = [f"# Joint online search: {' vs '.join(names)} (auto-generated)", "",
              f"Stage 2 (one session for every pick and baseline): `{results}` (cold), `{graph_results}` (graph, < 50 us). "
              f"{len(ref)} held-out shapes, {sum(r['small'] for r in ref.values())} timed graph-amortized. "
              "Ratio < 1 = faster than the reference; counts are shapes faster / slower than the reference by more than the tie "
              "margin (5% below 50 us, 2% above). Regret is vs the joint oracle (every Triton config timed in the session and B3+).", ""]
     for g in ("all", "< 50 us", ">= 50 us"):
-        lines += [f"## {g} (n = {sc[names[0]]['scores'][CONFIGS[0][0]][g]['n']})", "",
+        lines += [f"## {g} (n = {sc[names[0]]['scores'][cfgs[0]][g]['n']})", "",
                   "| ranker | selector | first-use cost | vs B2 median / p10 | faster / slower | vs B3 median / p10 | faster / slower | "
                   "vs B3+ median / p10 | faster / slower | regret vs joint oracle median / p95 (mean) | picks cuBLASLt |",
                   "|---|---|---|---|---|---|---|---|---|---|---|"]
         for n in names:
-            for c, _, _ in CONFIGS:
+            for c in cfgs:
                 e = sc[n]["scores"][c][g]
                 rg = e["regret_joint"]
                 lines.append(f"| {n} | {c} | {e['cost_s']:.2f} s | " + " | ".join(fmt(e, r) for r in ("b2", "b3", "b3p"))
@@ -136,7 +146,7 @@ def build(data: Path, report: Path, online: dict[str, str], results: str, graph_
     lines += ["## Triton only: regret vs the Triton oracle of the session (median / p95 (mean))", "",
               "| selector | " + " | ".join(f"{n} {g}" for n in names for g in ("all", "< 50 us", ">= 50 us")) + " |",
               "|---|" + "---|" * (3 * len(names))]
-    for c in ("top-3 Triton only",):
+    for c in [c for c in ("top-3 Triton only",) if c in cfgs]:
         cells = []
         for n in names:
             for g in ("all", "< 50 us", ">= 50 us"):
@@ -146,10 +156,10 @@ def build(data: Path, report: Path, online: dict[str, str], results: str, graph_
     pr = {}
     if len(names) == 2:
         a, b = sc[names[0]], sc[names[1]]
-        pr = {c: paired(a, b, c) for c, _, _ in CONFIGS}
+        pr = {c: paired(a, b, c) for c in cfgs}
         lines += ["", f"## Paired: {names[1]} vs {names[0]} (chosen config's stage-2 time; geometric-mean ratio, 95% bootstrap interval)", "",
                   "| selector | geomean ratio | 95% interval | " + f"{names[1]} faster / slower (> tie margin) |", "|---|---|---|---|"]
-        for c, _, _ in CONFIGS:
+        for c in cfgs:
             p = pr[c]
             lines.append(f"| {c} | {p['geomean_ratio']:.4f} | [{p['ci'][0]:.4f}, {p['ci'][1]:.4f}] | {p['b_faster']} / {p['b_slower']} of {p['n']} |")
     out = Path(report) / "ranker_compare.md"

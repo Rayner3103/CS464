@@ -16,7 +16,7 @@ def _online(shape, picks):
     """picks: {k: (key, family)} -> a joint online row; choice for lt_n' in {0, 1} reuse the same pick for simplicity."""
     M, N, K = shape
     ch = lambda k: {"key": picks[k][0], "family": picks[k][1], "compile_s": 0.1 * k, "time_s": 0.0}
-    return {"M": M, "N": N, "K": K, "candidates": [{"x": 1}], "rank_s": 0.1,
+    return {"M": M, "N": N, "K": K, "candidates": [{"x": 1}], "rank_s": 0.1, "lt_n": 16,
             "choice": {str(k): ch(k) for k in picks},
             "choice_lt": {f"{k}_lt{n}": ch(k) for k in picks for n in (0, 1)}}
 

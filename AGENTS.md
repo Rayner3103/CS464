@@ -97,11 +97,14 @@ Not part of `python -m tune`: `python -m analysis.plots [--theme light|dark] [--
 `reports/results_overview.md` from the files already in `data/<hw>/` and `reports/`. It never touches the GPU (safe next to a running job), so it is not a `tune` subcommand, which imports torch. `python -m analysis.zero_shot` runs the saved ranker on another GPU with no refit (variants `as_is` with the source GPU's numbers and
 `native` with this device's; diversified top-3 + the short online search) and scores it against that GPU's own held-out screen (`reports/zero_shot_<hw_id>.md`).
 Runbook (full version and how to read the report in the module docstring), same GPU job hygiene as section 7:
-1. Copy `lgbm_rank.txt` and `lgbm_rank.json` from the source GPU's `data/<hw>/` by hand (`data/` is gitignored; the model is ~35 MB). Match `requirements.txt` versions.
+1. Copy `lgbm_rank.txt/.json` (rank v1) and `lgbm_rank_v2.txt/.json` (rank v2) from the source GPU's `data/<hw>/` by hand (`data/` is gitignored; ~35 MB each). Match `requirements.txt` versions. v2's analytic-feature constants are fixed model units: do not change them for the new GPU.
 2. Pick an SM clock lock the target GPU holds under load and use it for every command (`--clock-lock X`); only compare sessions with the same lock and driver.
 3. The oracle: `python -m tune --clock-lock X sweep --split heldout --per-suite 1000` (the same 86 shapes as the 3080 run; ~1.3 h there).
-4. `python -m analysis.zero_shot --clock-lock X run --ranker <dir>/lgbm_rank --fresh-cache`, then `python -m analysis.zero_shot --clock-lock X score`
-   (`--clock-lock` goes before the subcommand; `run` resumes; never overlap it with the sweep).
+4. `python -m analysis.zero_shot --clock-lock X run --ranker v1=<dir>/lgbm_rank v2=<dir>/lgbm_rank_v2 --k 5 --lt-n 16 --fresh-cache`, then
+   `python -m analysis.zero_shot --clock-lock X score --k 3` (and `--k 5` for the frequent tier: a k = 5 run stores every k' <= 5; with `--k 3 --k-frequent 5` shapes carrying `calls` >= 1M or `frequent: true` get k = 5)
+   (`--clock-lock` goes before the subcommand; `run` resumes per shape and k; never overlap it with the sweep; a bare `--ranker <dir>/lgbm_rank --k 3` is the original Triton-only run and keeps its file names).
+   The screen oracle is Triton-only, so `score` rates the Triton-only choice of a joint (`--lt-n`) run. The joint choice is scored against B2 / B3 in a short stage-2 session:
+   `python -m analysis.zero_shot picks` writes its inputs and prints the `tune benchmark` and `python -m analysis.ranker_compare` commands (~0.5 h; add `cublaslt_deep:20` for B3+).
 5. Add a dated update to `reports/week1.md` with the table.
 
 ### Backend spec strings (`--backends`, comma-separated; `runner.candidates_for`)

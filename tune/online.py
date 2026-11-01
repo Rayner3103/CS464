@@ -76,6 +76,11 @@ class KPolicy:
         return self.k_frequent if frequent else self.k
 
 
+def shape_k(shape: dict, k: int, policy: KPolicy | None) -> int:
+    """k for one shape of a shapes file: the policy's (from the shape's `calls` / `frequent` fields) or the global k."""
+    return policy.k_for(shape.get("calls"), shape.get("frequent")) if policy else k
+
+
 def short_configs():
     from tune.timing import TimingConfig
     cold = TimingConfig(cache_mode="cold", warmup_ms=SHORT_WARMUP_MS, min_warmup_iters=1, min_reps=SHORT_REPS,
@@ -120,6 +125,15 @@ def choose(cands: list[dict], k: int, lt_n: int | None = None) -> dict:
     best = min(ok, key=lambda x: x["graph_us"] if small else x["cold_us"])
     return {"key": best["config_key"], "rank": c.index(best), "mode": "graph" if small else "cold",
             "family": best.get("family", "triton"), **cost}
+
+
+def all_choices(cands: list[dict], k: int, lt_n: int) -> dict:
+    """The row fields for a search of k Triton candidates (+ lt_n cuBLASLt): `choice` for every k' <= k (all cuBLASLt
+    candidates included) and, with lt_n > 0, `choice_lt` for k' x lt_n' in {0, 1, 4, lt_n}."""
+    out = {"choice": {str(j): choose(cands, j) for j in range(1, k + 1)}}
+    if lt_n:
+        out["choice_lt"] = {f"{j}_lt{n}": choose(cands, j, n) for j in range(1, k + 1) for n in sorted({0, 1, 4, lt_n}) if n <= lt_n}
+    return out
 
 
 def search_shape(ranker, M: int, N: int, K: int, k: int, dtype=torch.float16, order: str = "plain",
@@ -206,7 +220,7 @@ def run(shapes: Iterable[dict], ranker_stem: Path, out_dir: Path, *, k: int = 5,
         done = {(r["M"], r["N"], r["K"], r.get("k")) for r in map(json.loads, path.read_text().splitlines())
                 if r.get("order", "plain") == order and r.get("rule") == rule and r.get("lt_n", 0) == lt_n}
     # Per-shape k: the policy's, from the shape's own `calls` / `frequent` fields; without a policy, the global k.
-    shapes = [dict(s, _k=policy.k_for(s.get("calls"), s.get("frequent")) if policy else k) for s in shapes]
+    shapes = [dict(s, _k=shape_k(s, k, policy)) for s in shapes]
     shapes = [s for s in shapes if (s["M"], s["N"], s["K"], s["_k"]) not in done]
     t0 = time.perf_counter()
     with RecordWriter(path) as w:
@@ -222,10 +236,7 @@ def run(shapes: Iterable[dict], ranker_stem: Path, out_dir: Path, *, k: int = 5,
                    "session_id": session_id, "hw_id": env["hw_id"], "driver": env["driver"], **provenance(env),
                    "ranker": str(ranker_stem), "ranker_meta": ranker.meta,
                    "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"), "wall_s": time.perf_counter() - t,
-                   **r, "choice": {str(j): choose(r["candidates"], j) for j in range(1, ks + 1)},
-                   **({"choice_lt": {f"{j}_lt{n}": choose(r["candidates"], j, n) for j in range(1, ks + 1)
-                                     for n in sorted({0, 1, 4, lt_n}) if n <= lt_n}} if lt_n else {}),
-                   "timestamp": time.time()}
+                   **r, **all_choices(r["candidates"], ks, lt_n), "timestamp": time.time()}
             w.write(row)
             el = time.perf_counter() - t0
             log(f"[{i + 1}/{len(shapes)}] {M}x{N}x{K} k={ks} -> {row['choice'][str(ks)]['key']} ({row['wall_s']:.1f}s) | "
