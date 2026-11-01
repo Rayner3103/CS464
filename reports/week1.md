@@ -4,6 +4,49 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-11-02: first second-GPU run (RTX 2060, retrained from scratch) — the selector recipe transfers, the Triton family does not (no tensor cores on sm_75)
+
+**What ran.** `pipeline/run.sh --quick` on an RTX 2060 (`rtx2060_sm75_30sms_6gb`, 30 SMs, 6 GB, driver 595.99.02, `--clock-lock 1755`, rows at harness `6548db4`, clean). Run directory `data/rtx2060/quick-20261029-095746-v2/` (copied here by hand; the numbers below are read from it, nothing was re-measured on this machine).
+- Tune sweep: 56 shapes, 35,799 s (9.9 h). Held-out screen: 27 shapes, 63,650 s (17.7 h). Held-out shapes are **27 of the 3080's 86** (all 27 keys are in the 3080 held-out set; checked). `lgbm_rank` v1 form (regression, 63 leaves, 1,500 trees) refit on the 56 tune shapes only, pool 165 configs; no held-out shape was read by any fit.
+- Roofline on the 2060: 26.4 TFLOP/s fp16 tensor (fp32 accumulate), 289 GB/s (spec 336); the 3080: 62.9 TFLOP/s, 686 GB/s.
+- Stage 2 cold `results_validate.jsonl` (`20261101-155413-4a1b56`): 809 rows, 0 invalid, 32 power-capped (4%), 216 `cublaslt_deep` rows (B3+ exists). Graph (`20261101-160530-155120`, shapes < 50 µs): 163 rows, 0 invalid, 0 power-capped. Online search `online_lgbm_rank_diverse.jsonl` (`20261101-160722-b3270a`): 27 shapes, k = 5, fresh Triton cache.
+- **Not a zero-shot run.** `analysis.zero_shot` found nothing to score here (no `zero_shot_*.jsonl`); this is the *retrain* arm. The zero-shot arm is still open (next steps).
+
+**Comparison method.** Both GPUs restricted to the same 27 shapes and scored with the repo's own functions (`analysis.zero_shot.score_rows` for regret vs each GPU's own screen oracle; `analysis.ranker_compare.load_stage2` / `references` for stage 2 vs B3+). 3080 rows: v1 `online_lgbm_rank_diverse.jsonl`, v2 `online_joint_diverse_v2.jsonl` (Triton-only choice `3_lt0`), stage 2 `results_lock1755_v2{,_graph}.jsonl`. The comparison script is ad hoc and not committed. **Do not compare a subset run to the 86-shape `REFERENCE_3080` constants in `analysis/zero_shot.py`**: on the same 27 shapes the 3080's v1 online top-3 is 1.5% / 7.6% (2.6%), not the 2.3% / 13.7% (4.4%) of the 86. (The constants themselves recompute exactly from the 3080 rows.)
+
+**1. Selection quality** (regret vs the GPU's own screen oracle, median / p95 (mean), 27 shared shapes):
+
+| pick | 3080 v1 (477 tune shapes) | 3080 v2 | 2060 retrained (56 tune shapes) |
+|---|---|---|---|
+| top-1 | 1.9% / 12.5% (3.6%) | 0.9% / 7.2% (2.4%) | 0.7% / 9.1% (2.6%) |
+| online top-3 | 1.5% / 7.6% (2.6%) | 0.8% / 6.9% (1.8%) | 0.7% / 7.5% (2.5%) |
+| online top-5 | 0.8% / 7.2% (2.3%) | 0.8% / 6.9% (1.9%) | 0.5% / 6.7% (2.1%) |
+
+Paired bootstrap on the 27 shapes (online top-3, 2060 minus 3080 v1; 5,000 resamples): mean **−0.1 points [−1.7, +1.6]**, median −0.8 [−2.1, +1.8], p90 −0.4 [−3.6, +5.5]. Six shapes exceed 5% regret on each GPU; 18 (2060) vs 16 (3080) are within 2%. Online ranking cost 37 ms on the 2060 (pool 165) vs 99 ms (3080 v1).
+
+**2. Value against the vendor path** (stage 2, speed = t_B3+ / t_pick, > 1 = faster than the searched cuBLASLt; online top-3, Triton only):
+
+| group | 3080 v1 | 3080 v2 | 2060 |
+|---|---|---|---|
+| all 27 | 1.005 | 1.005 | **0.434** [p10 0.163, p90 0.907] |
+| ≥ 50 µs, cold (3080 n = 16, 2060 n = 21) | 0.967 | 0.985 | **0.242** |
+| < 50 µs, graph (3080 n = 11, 2060 n = 6) | 1.147 | 1.147 | 0.928 |
+
+Family ceiling (best Triton row in the session vs B3+, i.e. G2 / G4 on these shapes): median t_B3+/t_Triton-oracle 1.007 (3080) vs **0.440** (2060); shapes with the Triton oracle ≥ 90% of B3+: 25/27 vs **3/27**; Triton oracle faster than B3+ by more than the tie margin: 8 vs 2; slower by more: 10 vs **24**. The only 2060 wins are two launch-bound shapes of ~3 µs (105×6×9, 369×17×12, 1.7×). Largest shape, 8192×4096×11008: B3+ 28.3 ms (26.1 TFLOP/s, at the measured 26.4 peak) vs best Triton 173 ms (4.3 TFLOP/s), 6.1×. Selection cannot fix this: the oracle itself is far behind.
+
+**Why (observed, cause not isolated).** All **193** Triton kernels in the 2060's compile cache (`online_triton_cache`, `.target sm_75`) contain **zero `mma.sync`** and only `fma.rn.f32`; the same check on 400 kernels from the 3080's cache (`sm_86`) finds `mma.sync` in all 400. So with Triton 3.7.1 the `tl.dot` on Turing ran on CUDA cores (4.3 TFLOP/s is plausible for fp32 FMA on 1,920 cores at 1755 MHz); cuBLASLt uses the tensor cores. I did not test whether any Triton option or version emits tensor-core code on sm_75. The 2060's choices are also far less varied (7 distinct tiles over the 27 shapes, mostly BLOCK_K = 16, vs 18 on the 3080), which is a plausible reason 56 tune shapes were enough.
+
+**Findings.**
+- The pipeline (sweep → `lgbm_rank` → diversified top-k → short online search) runs end to end on a second architecture and selects as well as the 3080's within what 27 shapes can resolve (interval ±1.7 points on the mean). It does **not** show equality, and it does not show a general result for tensor-core GPUs: the 2060 space is simpler and one family is FMA-only.
+- On the 2060 the Triton family fails G2 (3/27 shapes ≥ 90% of B3+) and G4: as a cuBLAS competitor it is not viable there; any value would come from a joint {Triton ∪ cuBLASLt} selector or the tiny launch-bound shapes. The joint search was not run on the 2060.
+- Retrain cost on the 2060: ≈ 10 h of tune sweep (the 17.7 h held-out sweep is only the evaluation oracle).
+
+**Caveats.** n = 27 (p95 is about the second-worst shape); a different harness commit and session than the 3080 numbers; v1 form only (no rank v2, no tail suite) on the 2060; the 2060's regime split differs because the same shapes are slower there (oracle < 50 µs: 6 shapes vs 11); ε = 2% / 5% taken from the 3080 noise study, the 2060's own noise study (`noise.jsonl`) was not analysed; 4% of the cold stage-2 rows were power-capped.
+
+**Gates.** 3080 gates unchanged. New for the 2060 (27 shapes, indicative): G2 fails, G4 fails. **Next steps.** (1) **Zero-shot arm on the 2060** (the 3080 `lgbm_rank` / `lgbm_rank_v2`, no refit), reusing this run's held-out screen as the oracle (skips the 17.7 h sweep): `python -m analysis.zero_shot --clock-lock 1755 run --out $D --ranker v1=$D/src3080/lgbm_rank v2=$D/src3080/lgbm_rank_v2 --k 5 --lt-n 16 --fresh-cache`, then `score --data $D --report $D/../reports --k 3` (and `--k 5`), optionally `picks` for the joint stage 2; copy the 3080 models into a separate `src3080/` folder (the run's own `lgbm_rank.*` would be overwritten). Bar to beat: the retrained row above. A poor zero-shot result is confounded by the FMA-only path; a good one is the stronger evidence. (2) Joint selection and B3+ on the 2060. (3) A second tensor-core GPU for the generality claim. (4) Report a same-subset 3080 reference in `analysis.zero_shot` instead of the 86-shape constants.
+
+Reproduce (CPU only): the run is `pipeline/run.sh --quick` on the 2060; scoring reads `data/rtx2060/quick-20261029-095746-v2/data/` and `data/rtx3080_sm86_68sms_10gb/` as described above.
+
 ## Update 2026-11-01: rank v2 (analytic features, near-top weights, tail suite) — Triton-only tail halves, the joint search barely moves
 
 **What ran** (RTX 3080, `--clock-lock 1755`, driver 595.99.02).
