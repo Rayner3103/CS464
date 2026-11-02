@@ -52,9 +52,9 @@ analysis/
                      Ranker (saved lgbm_rank), top-k scoring (build_topk)
   alloc_variance.py  allocation-placement noise experiment
   plots.py           figures + reports/results_overview.md for the current state (baselines, noise, selectors, kernel-selection stats); CPU-only, reads existing results (`python -m analysis.plots`)
-  zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`)
+  zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`); `load_screen` keeps `slow` screen rows
   cross_gpu.py       cross-GPU comparison on the held-out shapes the runs share: regret vs each GPU's own screen, speed vs B3+, family ceiling, PTX mma check, paired bootstrap; CPU-only (`python -m analysis.cross_gpu --side LABEL DIR ...`, docstring has the command). Never compare a subset run to the 86-shape `REFERENCE_3080` constants in `zero_shot.py`
-tests/       pytest unit tests (131 tests; most need a CUDA GPU)
+tests/       pytest unit tests (136 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)
@@ -106,7 +106,7 @@ Runbook (full version and how to read the report in the module docstring), same 
    (`--clock-lock` goes before the subcommand; `run` resumes per shape and k; never overlap it with the sweep; a bare `--ranker <dir>/lgbm_rank --k 3` is the original Triton-only run and keeps its file names).
    The screen oracle is Triton-only, so `score` rates the Triton-only choice of a joint (`--lt-n`) run. The joint choice is scored against B2 / B3 in a short stage-2 session:
    `python -m analysis.zero_shot picks` writes its inputs and prints the `tune benchmark` and `python -m analysis.ranker_compare` commands (~0.5 h; add `cublaslt_deep:20` for B3+).
-5. Add a dated update to `reports/week1.md` with the table.
+5. Add a dated update to `reports/week1.md` with the table. Read the `regret > 50%` and `unscored` columns first: the screen cuts a config as `slow` after one sample once it is > 1.5x the best so far, and `load_screen` keeps those rows (their regret is > 50%); a scorer that drops them hides the bad picks (this happened once, `reports/week1.md` 2026-11-02 later). For a run on a subset of the 86 shapes (a `pipeline/run.sh --quick` GPU has 27), compare on the shared shapes with `python -m analysis.cross_gpu`, not with the 86-shape reference rows.
 
 ### Backend spec strings (`--backends`, comma-separated; `runner.candidates_for`)
 
@@ -198,6 +198,7 @@ Other findings to keep in mind:
 - **Joint selection and rank v2 (2026-11-01).** `tune online --lt-n 16` puts cuBLASLt's heuristic top-16 in the same short-timed pool as the Triton picks: top-3 + LT16 costs ~0.6 s first use and is > 5% faster than B2 on 49 of 86 held-out shapes and slower on 0
   (median 0.91 vs B2, 1.00 vs B3+; B3+ stays an offline bar). `KPolicy` / `select_kernel` (`tune/online.py`) choose k = 3, or 5 for shapes the caller marks frequent (`calls` >= 1M). Rank v2 (`python -m tune ranker-v2`, analytic features + near-top weights + the `tail` suite as tune data) halves the Triton-only held-out tail
   (regret vs the Triton oracle at top-3: 0.4% / 9.5% / 2.3% -> 0.2% / 4.6% / 1.2% median / p95 / mean) but moves the joint search only within noise, for +0.08 s. Details and caveats: `reports/week1.md` 2026-11-01, `reports/ranker_compare.md`. Score rankers side by side with `python -m analysis.ranker_compare`.
+- **Second GPU (RTX 2060, Turing, 2026-11-02).** Triton's `tl.dot` compiles to FMAs on sm_75 (no `mma.sync` in any cached kernel): the best Triton config is 0.44x of B3+ (3080: 1.0x), so the family fails G2 and G4 there. Retrained on 56 shapes (~10 h of sweep) the ranker selects as well as on the 3080 (online top-3 0.7% / 7.5% / 2.5%, 0 of 27 picks > 50% off); the 3080 rankers used zero-shot do not transfer for Triton-only selection (13 of 27 top-3 picks > 50% off in `native`, the 2060 oracle uses BLOCK_K = 16 everywhere), but the joint search with cuBLASLt top-16 lands at its pool's ceiling (0.98 of B3+, cuBLASLt chosen on 24 of 27). Confounded by the missing tensor-core path; a second tensor-core GPU is open. `reports/week1.md` 2026-11-02, `reports/cross_gpu.md`.
 - **Triton-only selector bar (v1): lgbm diverse online top-3** (`tune online --order diverse`, sessions `topkd` / `topkd-graph` / `online-…-topkd`). lgbm_rank (`analysis/learned.py`) is a LightGBM regressor
   of log regret per (shape, candidate) over each tune shape's top-5 pool, using shape features + config params + `candidate_features`. It ranks the shape. `diverse_order` keeps the top pick, then takes the best config
   of each new (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K) group within 0.05 predicted log regret. That rule was fit on out-of-fold tune scores and is saved in `lgbm_rank.json`. The 3 picks are compiled, validated and short-timed (graph when < 50 µs), and the fastest is kept.

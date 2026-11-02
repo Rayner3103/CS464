@@ -4,6 +4,51 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-11-02 (later): zero-shot arm on the 2060 — the 3080 rankers do not transfer for Triton-only selection; a scorer bug had hidden it
+
+**What ran.** The 3080's `lgbm_rank` (v1) and `lgbm_rank_v2`, no refit, on the RTX 2060 (`rtx2060_sm75_30sms_6gb`, `--clock-lock 1755`, driver 595.99.02), run directory `data/rtx2060/quick-20261029-095746-v3/` (v2 plus the zero-shot rows; its `results_validate.jsonl` and retrained `online_lgbm_rank_diverse.jsonl` are byte-identical to v2's). `python -m analysis.zero_shot run --ranker v1=... v2=... --k 5 --lt-n 16 --fresh-cache`, variants `as_is` / `native`.
+- Four row files, 27 shapes each (= the 2060 held-out set, 27 of the 3080's 86), k = 5, cuBLASLt top-16 in the pool, 0 skipped, **0 invalid candidates**. Sessions `20261102-113735-d051df` (v1 as_is + native), `20261102-115635-e7d450` (v2 as_is), `20261102-124121-809c54` (v2 native); lock 1755, clean. Harness `60aa667` for three files and `bed0914` for v2 native: the only code difference that matters is `4319453` (v2 `native` space lookup for pool configs the 2060 cannot hold), which v1 and v2 `as_is` never reach.
+- The models in `src3080/` are byte-identical (md5) to the 3080's `lgbm_rank.txt` / `lgbm_rank_v2.txt` and differ from the 2060's own retrained model. Oracle: the retrain run's held-out screen (27 shapes); the 17.7 h sweep was not repeated.
+
+**Scorer bug found and fixed.** `analysis.zero_shot.load_screen` kept only `ok` screen rows. The screen cuts a config as `slow` after one sample once it is > 1.5× the best so far, so every pick with regret > 50% was dropped as "unscored", and the generated table looked several times better than it was (medians 6–16% instead of 43–80% at top-3): 12–16 of 27 chosen configs per variant were `slow`. `load_screen` now keeps `slow` rows (their one-sample time is a real measurement and proves regret > 50%), `summarize` counts `over_50`, the report has a `regret > 50%` column, and three tests cover it (`tests/test_zero_shot.py`). **No earlier number changes**: in the 3080 runs and the retrained 2060 run all 27 picks are `ok` (checked pick by pick), and the `REFERENCE_3080` constants still recompute exactly. An independent script reproduced the corrected numbers.
+
+**Zero-shot vs retrained** (27 shared shapes, regret vs the 2060's own screen oracle, median / p95 (mean); `analysis.cross_gpu`, full table in [`cross_gpu.md`](cross_gpu.md)):
+
+| pick | 3080 v1 / v2 | 2060 retrained | v1 as_is | v1 native | v2 as_is | v2 native |
+|---|---|---|---|---|---|---|
+| online top-1 | 1.9 / 12.5 (3.6) / 0.9 / 7.2 (2.4) | 0.7 / 9.1 (2.6) | 198 / 6169 (810) | 94 / 673 (303) | 227 / 3600 (806) | 203 / 2782 (471) |
+| online top-3 | 1.5 / 7.6 (2.6) / 0.8 / 6.9 (1.8) | 0.7 / 7.5 (2.5) | 80 / 658 (288) | 43 / 604 (157) | 58 / 636 (270) | **43 / 228 (81)** |
+| online top-5 | 0.8 / 7.2 (2.3) / 0.8 / 6.9 (1.9) | 0.5 / 6.7 (2.1) | 39 / 658 (269) | 19 / 598 (111) | 38 / 392 (108) | 15 / 228 (72) |
+| top-3 picks with regret > 50% | 0 / 0 of 27 | 0 of 27 | 16 of 26 (+1 absent) | 13 of 27 | 13 of 26 (+1 absent) | 13 of 27 |
+
+Paired bootstrap vs the 3080's v1 (online top-3): zero-shot is worse on the mean by +78 [+37, +137] points (v2 native) to +286 [+84, +624] (v1 as_is); the retrained ranker is within −0.1 [−1.7, +1.6]. By regime (online top-3 median): ≥ 50 µs (n = 20–21) 88–94% for v1 and v2 as_is and v1 native, 54% for v2 native; < 50 µs (n = 5–6) 6.8–14.5%. Even the best of the 5 candidates (by screen time) is still > 50% off on 8 (v1 native) and 10 (v2 native) shapes. `as_is` → `native` helps both models (medians 80 → 43 and 58 → 43); v2 `native` has the best tail (p95 228% vs ~600%). `absent` = pick not in the 2060 screen at all (pruned there but valid when run).
+
+**Why (partly observed).** The 2060 oracle uses BLOCK_K = 16 on all 27 shapes (the FMA-only Triton path of the earlier update). The 3080 rankers spread their top-3 over bk 16 / 32 / 64 / 128: bk 16 is 28% of the top-3 candidates for v1 `as_is`, 53% for v1 `native`, 26% / 44% for v2 `as_is` / `native`. They are asking for tiles tuned for a tensor-core GPU. This is a **confound**: the data cannot separate "different architecture" from "no tensor-core path for Triton".
+
+**Joint search (Triton top-3 + cuBLASLt top-16).** In all four variants the joint choice is cuBLASLt on 24 of 27 shapes (the 3080: 8–9 of 27). Timed in the 2060 stage-2 session (cuBLASLt keys are deterministic; 25–26 of 27 shapes are covered, the rest are Triton picks that session did not time): speed vs B3+ median **0.979–0.983**, p10 0.770–0.772, within 5% of B3+ on 16/25–17/26; the 3080 on the same shapes 1.005, p10 0.93–0.94, 22/27. The ceiling of that pool on the 2060 (best of B3 and the Triton oracle vs B3+) is 0.986 median, p10 0.775: **the zero-shot joint search is at the pool's ceiling**, because Triton cannot beat cuBLASLt there. What is left to B3+ is the offline deep search (B3+ vs B3 on the 2060: median 0.986, p10 0.775; on the 3080 0.994 / 0.877).
+
+**Findings.**
+- The zero-shot run is valid and complete; the generated report of the first scoring was not (survivorship, fixed above).
+- **Triton-only selection does not transfer** from the 3080 to this 2060 without refitting: 13 of 27 top-3 picks are ≥ 50% off even with the 2060's own limits in the features (`native`), vs 0 of 27 for the ranker retrained on 56 shapes (≈ 10 h of tune sweep).
+- **Joint selection is robust to the failure**: it lands at the pool's ceiling, so on this GPU the retrain buys almost nothing for the joint selector (Triton is chosen on 2–3 shapes), and a lot for Triton-only selection. Whether retraining pays for a *tensor-core* GPU other than the 3080 is open.
+
+**Caveats.** n = 27 (counts of picks > 50% off are robust by construction; medians and p95 of the slow picks use one-sample screen times); the 2060 Triton path is FMA-only (confound above); mixed harness commits (benign, above); v2 on the 2060 sees a pruned space of this GPU in `native`, the 3080's in `as_is`; the joint speed excludes Triton picks the stage-2 session did not time (`picks` + stage 2 would cover them); the 3080 reference numbers are on the same 27 shapes, not its 86.
+
+**Gates.** None changed. **Next steps.** (1) `python -m analysis.zero_shot picks` and its stage-2 commands on the 2060 to time the zero-shot Triton picks and score the joint choice with full coverage. (2) A tensor-core GPU other than the 3080 (Ampere / Ada) for the transfer claim without the FMA confound. (3) Use `cross_gpu` for every subset comparison.
+
+Reproduce (CPU only): `python -m analysis.zero_shot score --data data/rtx2060/quick-20261029-095746-v3/data --report data/rtx2060/quick-20261029-095746-v3/reports --k 3`, then `python -m analysis.cross_gpu` with the sides below (writes `reports/cross_gpu.md`):
+```bash
+D3=data/rtx3080_sm86_68sms_10gb; Z=data/rtx2060/quick-20261029-095746-v3/data
+python -m analysis.cross_gpu \
+  --side 3080-v1 $D3 online_lgbm_rank_diverse.jsonl online_joint_diverse.jsonl results_lock1755_v2.jsonl results_lock1755_v2_graph.jsonl \
+  --side 3080-v2 $D3 online_joint_diverse_v2.jsonl online_joint_diverse_v2.jsonl results_lock1755_v2.jsonl results_lock1755_v2_graph.jsonl \
+  --side 2060-retrained $Z online_lgbm_rank_diverse.jsonl online_lgbm_rank_diverse.jsonl results_validate.jsonl results_validate_graph.jsonl \
+  --side 2060-zs-v1-as_is $Z zero_shot_v1_as_is.jsonl zero_shot_v1_as_is.jsonl results_validate.jsonl results_validate_graph.jsonl \
+  --side 2060-zs-v1-native $Z zero_shot_v1_native.jsonl zero_shot_v1_native.jsonl results_validate.jsonl results_validate_graph.jsonl \
+  --side 2060-zs-v2-as_is $Z zero_shot_v2_as_is.jsonl zero_shot_v2_as_is.jsonl results_validate.jsonl results_validate_graph.jsonl \
+  --side 2060-zs-v2-native $Z zero_shot_v2_native.jsonl zero_shot_v2_native.jsonl results_validate.jsonl results_validate_graph.jsonl
+```
+
 ## Update 2026-11-02: first second-GPU run (RTX 2060, retrained from scratch) — the selector recipe transfers, the Triton family does not (no tensor cores on sm_75)
 
 **What ran.** `pipeline/run.sh --quick` on an RTX 2060 (`rtx2060_sm75_30sms_6gb`, 30 SMs, 6 GB, driver 595.99.02, `--clock-lock 1755`, rows at harness `6548db4`, clean). Run directory `data/rtx2060/quick-20261029-095746-v2/` (copied here by hand; the numbers below are read from it, nothing was re-measured on this machine).
