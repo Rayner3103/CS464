@@ -317,3 +317,30 @@ def test_diverse_order_inner_pass_varies_warps_within_the_top_group():
     assert diverse_order(score, outer, 4, after, inner_groups=inner) == [0, 3, 4, 2]
     tight = dict(before, inner_delta=0.01)
     assert diverse_order(score, outer, 3, tight, inner_groups=inner) == [0, 3, 4]  # 8-warp variant too far behind
+
+
+def test_rank_v2_native_gpu_with_smaller_limits_marks_unsupported_pool_configs_not_runnable():
+    """zero-shot `native` on a smaller GPU: pool configs the target cannot hold (here 80 KB of stages vs a 64 KB limit)
+    are not in its static-kept space. They must score inf, not raise KeyError."""
+    from analysis.learned import (Ranker, analytic_features, candidate_features, config_params, fit_rank_v2, shape_matrix,
+                                  shape_ok, space_array)
+    from kernels.config_space import HwLimits, full_space, prune
+    cfgs = _space()
+    arr = space_array(cfgs)
+    rng = np.random.default_rng(5)
+    shapes = [{"M": int(m), "N": int(n), "K": int(k)} for m, n, k in rng.integers(64, 3000, (16, 3))]
+    ok = np.stack([shape_ok(arr, s["M"], s["N"], s["K"]) for s in shapes])
+    R = np.where(ok, 1 + rng.gamma(1.0, 0.5, ok.shape), np.inf)
+    R = R / R.min(axis=1, keepdims=True)
+    Fa = analytic_features(shapes, cfgs, 68, ok)
+    hp = {"objective": "regression", "num_leaves": 4, "n_estimators": 10}
+    _, _, est = fit_rank_v2(hp, shape_matrix(shapes, 68), config_params(cfgs), candidate_features(shapes, cfgs, _GPU), Fa, R,
+                            np.arange(12), shape_matrix(shapes, 68)[12:], candidate_features(shapes, cfgs, _GPU)[12:],
+                            Fa[12:], ok[12:])
+    big, small = "bm128_bn128_bk32_w4_s5_g16_sk1", "bm64_bn64_bk32_w4_s3_g8_sk1"
+    assert big in {c.key() for c in cfgs} and big not in {c.key() for c in prune(full_space(), HwLimits(65536, 65536, 30))[0]}
+    gpu2060 = {**_GPU, "smem_per_block_optin_bytes": 65536, "smem_per_sm_bytes": 65536, "sm_count": 30, "max_threads_per_sm": 1024}
+    rk = Ranker(est.booster_, [big, small], hp, gpu2060, {"features": "v2"})
+    sc = rk.scores(2048, 2048, 2048)                      # used to raise KeyError: 'bm128_bn128_bk32_w4_s5_g16_sk1'
+    assert np.isinf(sc[0]) and np.isfinite(sc[1])
+    assert rk.rank(2048, 2048, 2048, 2, order="plain") == [small]

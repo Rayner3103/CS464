@@ -471,12 +471,14 @@ class Ranker:
         self._space = None  # v2: (static-kept configs, space_array, pool -> space column), built on first use
 
     def space(self):
-        """v2 only: the whole static-kept config space the relative analytic features are taken over."""
+        """v2 only: the whole static-kept config space of *this* GPU (self.hw) that the relative analytic features are
+        taken over, and each pool member's column in it (-1 = the pool config is not in this GPU's space: a model fit on a
+        bigger GPU can hold configs this one cannot, e.g. 80 KB of stage buffers on a 64 KB card; it is never runnable)."""
         if self._space is None:
             from kernels.config_space import full_space, prune
             cfgs, _ = prune(full_space(), self.hw)
             col = {c.key(): i for i, c in enumerate(cfgs)}
-            self._space = (cfgs, space_array(cfgs), np.array([col[k] for k in self.pool_keys]))
+            self._space = (cfgs, space_array(cfgs), np.array([col.get(k, -1) for k in self.pool_keys], np.int64))
         return self._space
 
     def scores(self, M: int, N: int, K: int) -> np.ndarray:
@@ -486,10 +488,14 @@ class Ranker:
                       np.zeros(len(self.cfgs), int), np.arange(len(self.cfgs)))
         if self.features == FEATURES_V2:
             cfgs, arr, col = self.space()
+            present = col >= 0
             ok_all = shape_ok(arr, M, N, K)
             Fa = analytic_features(s, cfgs, self.gpu["sm_count"], ok_all[None, :])[0]
-            X = np.concatenate([X, Fa[col]], axis=1)
-            ok = ok_all[col]
+            Fp = np.zeros((len(col), Fa.shape[1]), np.float32)   # filler for pool configs outside this GPU's space: scored inf
+            Fp[present] = Fa[col[present]]
+            X = np.concatenate([X, Fp], axis=1)
+            ok = np.zeros(len(col), bool)
+            ok[present] = ok_all[col[present]]
         else:
             ok = np.array([runnable(c, M, N, K, self.hw) for c in self.cfgs])
         pred = self.booster.predict(X)
