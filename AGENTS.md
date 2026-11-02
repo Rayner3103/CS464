@@ -97,7 +97,7 @@ Measuring commands pin the process to one CPU core and write under `data/<hw_id>
 Not part of `python -m tune`: `python -m analysis.plots [--theme light|dark] [--only baselines,noise,selectors,selection]` redraws every overview figure into `reports/figures/overview/` and rewrites
 `reports/results_overview.md` from the files already in `data/<hw>/` and `reports/`. It never touches the GPU (safe next to a running job), so it is not a `tune` subcommand, which imports torch. `python -m analysis.zero_shot` runs the saved ranker on another GPU with no refit (variants `as_is` with the source GPU's numbers and
 `native` with this device's; diversified top-3 + the short online search) and scores it against that GPU's own held-out screen (`reports/zero_shot_<hw_id>.md`).
-Runbook (full version and how to read the report in the module docstring), same GPU job hygiene as section 7:
+Runbook (standalone version with the prerequisites, scoring and pitfalls: [`docs/zero_shot_runbook.md`](docs/zero_shot_runbook.md); how to read the report is in the module docstring), same GPU job hygiene as section 7:
 1. Copy `lgbm_rank.txt/.json` (rank v1) and `lgbm_rank_v2.txt/.json` (rank v2) from the source GPU's `data/<hw>/` by hand (`data/` is gitignored; ~35 MB each). Match `requirements.txt` versions. v2's analytic-feature constants are fixed model units: do not change them for the new GPU.
 2. Pick an SM clock lock the target GPU holds under load and use it for every command (`--clock-lock X`); only compare sessions with the same lock and driver.
 3. The oracle: `python -m tune --clock-lock X sweep --split heldout --per-suite 1000` (the same 86 shapes as the 3080 run; ~1.3 h there).
