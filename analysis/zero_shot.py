@@ -45,7 +45,7 @@ Runbook on the target machine (e.g. an RTX 2060; GPU idle, one GPU job at a time
 
 Reading the report: online-3 and best-of-3 of `native` vs `as_is` (the gap is what the source GPU's numbers in the features
 cost); the 3080 reference rows at the bottom; the `fixed` row (if the ranker barely beats one reused config the transfer is
-weak); and the no-pick / unscored counts and invalid picks per shape (a high rate for as_is means the source GPU's limits
+weak); and the no-pick / unscored counts, the `regret > 50%` count and invalid picks per shape (a high rate for as_is means the source GPU's limits
 produce configs this GPU cannot compile). Caveats: the `native` pruner assumes Ampere-style stage buffers, so on Turing it
 may drop tiles that would run (conservative, a lower bound); 6 GB cards record a too-large shape as a failed shape; a hard
 CUDA fault poisons the process, so rerun `run` (it resumes). Afterwards add a dated update to reports/week1.md (AGENTS.md
@@ -67,6 +67,7 @@ import numpy as np
 
 CAP = 10.0       # regret for "no valid pick", the same convention as `portfolio` (inf capped at 10 = 1000%)
 EPS = 0.02       # tie margin at >= 50 us (AGENTS.md section 6, G1)
+OVER = 0.5       # a screen row cut as `slow` was > 1.5x the best so far at its first sample, so its regret is > 50%
 SMALL_US = 50.0
 VARIANTS = ("as_is", "native")
 # The 3080 reference rows (median, p95, mean; all 86 held-out shapes, regret vs the held-out screen oracle, diverse picks):
@@ -167,16 +168,21 @@ def run(shapes: list[dict], ranker_stem: Path, out_dir: Path, *, variants=VARIAN
 
 # ---------------------------------------------------------------- scoring (no GPU)
 
-def load_screen(screen_dir: Path) -> dict:
-    """{(M, N, K): {config_key: us}} over every complete screen file; only status == ok rows with a time."""
+def load_screen(screen_dir: Path, include_slow: bool = True) -> dict:
+    """{(M, N, K): {config_key: us}} over every complete screen file. The screen cuts a config as `slow` after one sample once it is
+    > 1.5x the best so far: that one-sample time is a real measurement and proves regret > 50%, so it is kept (`include_slow`).
+    Dropping those rows (the first version of this function did) silently removed exactly the bad picks from every statistic:
+    on the 2060 12-16 of 27 zero-shot picks were `slow` and the table looked 5-10x better than it was. The oracle is the fastest
+    `ok` row (a `slow` row cannot be below it); a shape with no `ok` row is skipped."""
+    keep = ("ok", "slow") if include_slow else ("ok",)
     out = {}
     for p in sorted(screen_dir.glob("*_fp16.json")):
         d = json.loads(p.read_text())
         if not d.get("complete"):
             continue
-        t = {r["key"]: r["us"] for r in d["rows"] if r["status"] == "ok" and r["us"] is not None}
-        if t:
-            out[(d["M"], d["N"], d["K"])] = t
+        if not any(r["status"] == "ok" and r["us"] is not None for r in d["rows"]):
+            continue
+        out[(d["M"], d["N"], d["K"])] = {r["key"]: r["us"] for r in d["rows"] if r["status"] in keep and r["us"] is not None}
     return out
 
 
@@ -224,8 +230,9 @@ def score_rows(screen: dict, rows: list[dict], k: int, fixed: str | None = None)
 
 
 def summarize(vals: list, mask: np.ndarray | None = None) -> dict:
-    """median / p90 / p95 / mean / worst and the share within EPS over the scorable shapes; `unscored` counts picks that
-    are absent from the screen (excluded) and `no_pick` counts shapes with no valid pick (counted at CAP)."""
+    """median / p90 / p95 / mean / worst, the share within EPS and `over_50` (picks with regret > 50%) over the scorable shapes;
+    `unscored` counts picks that are absent from the screen (pruned or failed there: excluded, so read it) and `no_pick` counts
+    shapes with no valid pick (counted at CAP)."""
     v = np.array([np.nan if x is None else x for x in vals], float)
     keep = np.ones(len(v), bool) if mask is None else mask
     unscored = int(np.isnan(v[keep]).sum())
@@ -234,7 +241,7 @@ def summarize(vals: list, mask: np.ndarray | None = None) -> dict:
         return {"n": 0, "unscored": unscored, "no_pick": 0}
     return {"n": int(len(x)), "median": float(np.median(x)), "p90": float(np.percentile(x, 90)),
             "p95": float(np.percentile(x, 95)), "mean": float(x.mean()), "worst": float(x.max()),
-            "within_eps": float((x <= EPS).mean()), "unscored": unscored, "no_pick": int((x == CAP).sum())}
+            "within_eps": float((x <= EPS).mean()), "over_50": int((x > OVER).sum()), "unscored": unscored, "no_pick": int((x == CAP).sum())}
 
 
 def fmt(s: dict) -> str:
@@ -280,10 +287,11 @@ def build(data: Path, report: Path, *, screen_name: str = "sweep_screen_heldout"
         lines += [f"## Model `{d['model']}`, variant `{d['variant']}` ({d['n_shapes']} shapes, "
                   f"{'n/a' if inv is None else f'{inv:.2f}'} invalid picks per shape out of {k}"
                   + (f"; {d['n_skipped_oom']} shapes skipped, out of VRAM" if d["n_skipped_oom"] else "") + ")", "",
-                  "| pick | all | >= 50 us | < 50 us | within 2% | no pick | unscored |", "|---|---|---|---|---|---|---|"]
+                  "| pick | all | >= 50 us | < 50 us | within 2% | regret > 50% | no pick | unscored |", "|---|---|---|---|---|---|---|---|"]
         for name, g in d["scores"].items():
             lines.append(f"| {name} | {fmt(g['all'])} | {fmt(g['>= 50 us'])} | {fmt(g['< 50 us'])} | "
-                         f"{100 * g['all'].get('within_eps', 0):.0f}% | {g['all'].get('no_pick', 0)} | {g['all'].get('unscored', 0)} |")
+                         f"{100 * g['all'].get('within_eps', 0):.0f}% | {g['all'].get('over_50', 0)} of {g['all'].get('n', 0)} | "
+                         f"{g['all'].get('no_pick', 0)} | {g['all'].get('unscored', 0)} |")
         lines.append("")
     lines += ["## RTX 3080 reference (same method, its own screen)", "", "| pick | rank v1 | rank v2 |", "|---|---|---|"]
     fm = lambda t: f"{100 * t[0]:.1f}% / {100 * t[1]:.1f}% ({100 * t[2]:.1f}%)"
@@ -291,7 +299,9 @@ def build(data: Path, report: Path, *, screen_name: str = "sweep_screen_heldout"
     lines += [f"| {n} | {fm(REFERENCE_3080[n]) if n in REFERENCE_3080 else 'n/a'} | "
               f"{fm(REFERENCE_3080_V2[n]) if n in REFERENCE_3080_V2 else 'n/a'} |" for n in names]
     lines += ["", f"`fixed` row: the 3080's B6 config `{fixed}` used as-is on every shape.",
-              "`unscored`: a pick that is not in this GPU's screen (pruned there), excluded from the stats.",
+              "`regret > 50%`: scored picks at least 50% slower than the oracle, including picks the screen cut as `slow` (their one-sample time is kept).",
+              "`unscored`: a pick that is not in this GPU's screen at all (pruned or failed there), excluded from the stats: read it before trusting a row.",
+              "The 3080 reference is over its full 86-shape held-out set; for a run on a subset, compare on the shared shapes with `python -m analysis.cross_gpu`.",
               "`online-k` is what the short search chose; `best-of-k` is the best of the same k candidates by screen time."]
     report.mkdir(parents=True, exist_ok=True)
     out = report / f"zero_shot_{data.name}.md"

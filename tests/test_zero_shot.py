@@ -34,6 +34,41 @@ def test_load_screen_skips_incomplete(tmp_path):
     assert list(zs.load_screen(d)) == [(1, 2, 3)]
 
 
+def _screen_with_slow(tmp_path):
+    d = tmp_path / "sweep_screen_heldout"
+    d.mkdir()
+    rows = [{"key": "a", "us": 10.0, "status": "ok"}, {"key": "b", "us": 11.0, "status": "ok"},
+            {"key": "s", "us": 30.0, "status": "slow"}, {"key": "x", "us": None, "status": "failed"}]
+    (d / "1x2x3_fp16.json").write_text(json.dumps({"M": 1, "N": 2, "K": 3, "complete": True, "rows": rows}))
+    (d / "4x5x6_fp16.json").write_text(json.dumps({"M": 4, "N": 5, "K": 6, "complete": True,
+                                                   "rows": [{"key": "s", "us": 9.0, "status": "slow"}]}))   # no ok row: skipped
+    return d
+
+
+def test_load_screen_keeps_slow_rows_so_bad_picks_are_scored(tmp_path):
+    d = _screen_with_slow(tmp_path)
+    screen = zs.load_screen(d)
+    assert list(screen) == [(1, 2, 3)] and set(screen[(1, 2, 3)]) == {"a", "b", "s"}     # failed row (no time) and the all-slow shape are out
+    assert zs.regret(screen[(1, 2, 3)], "s") == pytest.approx(2.0)                        # the old behaviour made this None (unscored)
+    assert set(zs.load_screen(d, include_slow=False)[(1, 2, 3)]) == {"a", "b"}
+
+
+def test_summarize_counts_picks_over_50_percent():
+    s = zs.summarize([0.0, 0.2, 0.6, 2.0, zs.CAP, None])
+    assert s["over_50"] == 3 and s["n"] == 5 and s["unscored"] == 1
+
+
+def test_build_report_has_the_over_50_column_and_counts_slow_picks(tmp_path):
+    data = tmp_path / "hw_x"
+    data.mkdir()
+    _screen_with_slow(data)
+    (data / zs.out_name("native")).write_text(json.dumps(_row(1, 2, 3, [("s", True), ("a", True), ("b", True)], ["s", "s", "a"])) + "\n")
+    out, summary = zs.build(data, tmp_path / "reports", fixed=None)
+    sc = summary["variants"]["native"]["scores"]
+    assert sc["online-1"]["all"]["over_50"] == 1 and sc["online-1"]["all"]["unscored"] == 0 and sc["online-3"]["all"]["over_50"] == 0
+    assert "regret > 50%" in out.read_text()
+
+
 def test_score_rows_top1_best_of_k_and_online(tmp_path):
     screen = zs.load_screen(_screen(tmp_path, {(1, 2, 3): {"a": 10.0, "b": 12.0, "c": 20.0},
                                                (4, 5, 6): {"a": 100.0, "b": 150.0}}))
