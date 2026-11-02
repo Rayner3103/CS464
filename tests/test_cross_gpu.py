@@ -60,3 +60,14 @@ def test_ptx_mma_share_counts_tensor_core_and_fma_only_kernels(tmp_path):
         (d / "_matmul_kernel.ptx").write_text(body)
     assert cg.ptx_mma_share(tmp_path) == {"n": 2, "mma": 1, "fma_only": 1, "sm_86": 1, "sm_75": 1}
     assert cg.ptx_mma_share(tmp_path / "nowhere") is None
+
+
+def test_joint_summary_counts_cublaslt_wins_and_ignores_untimed_picks():
+    ref = {(1, 1, 1): {**_ref(100.0, 90.0, False), "src": {"tri": {}, "lth": {"h2_x": 105.0}, "ltd": {}}},
+           (2, 2, 2): {**_ref(100.0, 90.0, False), "src": {"tri": {}, "lth": {}, "ltd": {}}}}
+    cold = {s: {"tri": {}, "lth": {}, "ltd": {}} for s in ref}
+    rows = [{"M": 1, "N": 1, "K": 1, "lt_n": 16, "choice": {"3": {"key": "h2_x", "family": "cublaslt"}}},
+            {"M": 2, "N": 2, "K": 2, "lt_n": 16, "choice": {"3": {"key": "bm16_untimed", "family": "triton"}}}]
+    j = cg.joint_summary(rows, ref, cold, 3, set(ref))
+    assert j["n"] == 2 and j["cublaslt"] == 1 and j["covered"] == 1 and abs(j["median"] - 100 / 105) < 1e-9
+    assert cg.joint_summary([{"M": 1, "N": 1, "K": 1, "choice": {"3": {"key": "t"}}}], ref, cold, 3, set(ref)) is None

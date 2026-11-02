@@ -111,14 +111,16 @@ def family_ceiling(ref: dict, shapes) -> dict:
             "median_lt50": float(np.median(q[small])) if small.any() else None}
 
 
-def stage2_times(rows: list[dict], ref: dict, cold: dict, k: int) -> dict:
-    """{shape: full-protocol time of the row's Triton-only choice at k} (graph time for shapes timed graph-amortized)."""
+def stage2_times(rows: list[dict], ref: dict, cold: dict, k: int, joint: bool = False) -> dict:
+    """{shape: full-protocol time of the row's choice at k} (graph time for shapes timed graph-amortized). Triton-only choice by
+    default; joint=True takes the joint choice (cuBLASLt top-N in the pool), whose cuBLASLt keys are deterministic and so are
+    found in any stage-2 session that ran `cublaslt:16`. A pick that session did not time is absent: report the coverage."""
     out = {}
     for r in rows:
         s = (r["M"], r["N"], r["K"])
         if s not in ref:
             continue
-        key = chosen(r, k)["key"]
+        key = (r["choice"][str(k)] if joint else chosen(r, k))["key"]
         src = ref[s]["src"]
         t = next((src[f][key] for f in ("tri", "lth", "ltd") if key in src[f]), None)
         if t is None:  # not timed in this mode: the cold session
@@ -143,6 +145,19 @@ def ptx_mma_share(data: Path) -> dict | None:
         m = re.search(r"\.target (\w+)", t)
         c[m.group(1) if m else "?"] += 1
     return dict(c)
+
+
+def joint_summary(rows: list[dict], ref: dict, cold: dict, k: int, shapes) -> dict | None:
+    """Joint-search outcome for rows searched with `--lt-n`: share of shapes where cuBLASLt won, coverage of the stage-2
+    session and speed vs B3+ (t_B3+ / t_pick) on the covered shapes."""
+    rows = [r for r in rows if r.get("lt_n") and str(k) in r["choice"]]
+    if not rows:
+        return None
+    t = stage2_times(rows, ref, cold, k, joint=True)
+    sp = np.array([ref[s]["b3p"] / v for s, v in t.items() if s in shapes])
+    fam = collections.Counter(r["choice"][str(k)].get("family", "triton") for r in rows)
+    return {"n": len(rows), "cublaslt": int(fam.get("cublaslt", 0)), "covered": int(len(sp)),
+            **({"median": float(np.median(sp)), "p10": float(np.percentile(sp, 10)), "within_5pct": int((sp >= 0.95).sum())} if len(sp) else {})}
 
 
 def tile_diversity(rows: list[dict], k: int) -> tuple[int, list]:
@@ -172,7 +187,8 @@ def compare(sides: list[dict], k: int = 3, k_max: int = 5) -> dict:
         res["sides"][s["label"]] = {
             "n_screen": len(screen), "regret": screen_table(screen, rows, (k, k_max)),
             "speed": speed_vs_b3p(ref, stage2_times(r2, ref, cold, k), shapes), "ceiling": family_ceiling(ref, shapes),
-            "tiles": {"distinct": n_t, "top": top}, "ptx": ptx_mma_share(d)}
+            "tiles": {"distinct": n_t, "top": top}, "dir": str(d), "ptx": ptx_mma_share(d),
+            "joint": joint_summary(r2, ref, cold, k, set(shapes))}
     first = sides[0]["label"]
     res["bootstrap"] = {}
     for s in sides[1:]:
@@ -194,6 +210,9 @@ def render(res: dict) -> str:
              "## Selection quality (screen oracle)", "", "| pick | " + " | ".join(labels) + " |", "|---|" + "---|" * len(labels)]
     for p in ("top-1", f"online-{k}", f"online-{km}"):
         lines.append(f"| {p} | " + " | ".join(pct(res["sides"][l]["regret"][p]["all"]) for l in labels) + " |")
+    lines.append(f"| regret > 50% (online-{k}) | " + " | ".join(
+        f"{res['sides'][l]['regret'][f'online-{k}']['all'].get('over_50', 0)} of {res['sides'][l]['regret'][f'online-{k}']['all'].get('n', 0)}"
+        f" (+{res['sides'][l]['regret'][f'online-{k}']['all'].get('unscored', 0)} unscored)" for l in labels) + " |")
     lines += ["", "Regime split by the screen oracle (n shapes >= 50 us / < 50 us): " + "; ".join(
         f"{l} {res['sides'][l]['regret'][f'online-{k}']['>= 50 us'].get('n', 0)} / {res['sides'][l]['regret'][f'online-{k}']['< 50 us'].get('n', 0)}" for l in labels), ""]
     for l, b in res["bootstrap"].items():
@@ -204,16 +223,33 @@ def render(res: dict) -> str:
     for g in ("all", ">= 50 us", "< 50 us"):
         cell = lambda e: "n/a" if not e.get("n") else f"{e['median']:.3f} [{e['p10']:.3f}, {e['p90']:.3f}] (n={e['n']}; ahead {e['ahead']}, behind {e['behind']})"
         lines.append(f"| {g} | " + " | ".join(cell(res["sides"][l]["speed"][g]) for l in labels) + " |")
+    if any(res["sides"][l]["speed"]["all"].get("n", 0) < res["n_common"] for l in labels):
+        lines += ["", "n below the shared-shape count: the Triton picks of that side were not timed in its stage-2 session, so its Triton-only speed covers only a few shapes "
+                      "and is not comparable (the joint table below is). Run `python -m analysis.zero_shot picks` and its stage-2 commands for a full comparison."]
     lines += ["", "## Family ceiling: best Triton row of the session vs B3+", "",
               "| | n | median [p10, p90] | >= 90% of B3+ | ahead / behind by > margin | median >= 50 us | median < 50 us |", "|---|---|---|---|---|---|---|"]
     for l in labels:
         c = res["sides"][l]["ceiling"]
         f = lambda v: "n/a" if v is None else f"{v:.3f}"
         lines.append(f"| {l} | {c['n']} | {c['median']:.3f} [{c['p10']:.3f}, {c['p90']:.3f}] | {c['ge_90pct']}/{c['n']} | {c['ahead']} / {c['behind']} | {f(c['median_ge50'])} | {f(c['median_lt50'])} |")
+    if any(res["sides"][l]["joint"] for l in labels):
+        lines += ["", f"## Joint search (top-{k} Triton + cuBLASLt top-16 in one pool) vs B3+", "",
+                  "| | shapes | picks cuBLASLt | timed in the stage-2 session | speed vs B3+ median / p10 | within 5% of B3+ |", "|---|---|---|---|---|---|"]
+        for l in labels:
+            j = res["sides"][l]["joint"]
+            if j:
+                lines.append(f"| {l} | {j['n']} | {j['cublaslt']} | {j['covered']} | " + (
+                    f"{j['median']:.3f} / {j['p10']:.3f} | {j['within_5pct']}/{j['covered']} |" if j["covered"] else "n/a | n/a |"))
+        lines.append("\nA Triton pick that the stage-2 session did not time has no full-protocol time and is left out of the speed columns (see `timed in the stage-2 session`).")
     lines += ["", "## Choices and compiled kernels", ""]
     for l in labels:
-        t, p = res["sides"][l]["tiles"], res["sides"][l]["ptx"]
-        lines.append(f"- {l}: {t['distinct']} distinct tiles over the shapes (top {t['top']}); " + (
+        tl = res["sides"][l]["tiles"]
+        lines.append(f"- {l}: {tl['distinct']} distinct tiles over the shapes (top {tl['top']}).")
+    seen = {}
+    for l in labels:
+        seen.setdefault(res["sides"][l]["dir"], (l, res["sides"][l]["ptx"]))
+    for d, (l, p) in seen.items():
+        lines.append(f"- `{d}/online_triton_cache` (every run of that directory): " + (
             "no compiled-kernel cache found." if not p else f"{p.get('n', 0)} compiled kernels, {p.get('mma', 0)} with mma.sync, {p.get('fma_only', 0)} FMA-only "
             f"(targets: {', '.join(f'{a} {b}' for a, b in p.items() if a.startswith('sm_'))})."))
     return "\n".join(lines) + "\n"
