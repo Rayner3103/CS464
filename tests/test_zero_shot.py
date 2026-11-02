@@ -219,3 +219,14 @@ def test_ranker_compare_scores_a_k3_run_without_deep_search_rows(tmp_path):
     with pytest.raises(ValueError):
         (tmp_path / "tri.jsonl").write_text(json.dumps({**row, "choice_lt": {}, "lt_n": 0}))   # a Triton-only run
         rc.build(tmp_path, tmp_path, {"zs": "tri.jsonl"}, "c.jsonl", "h.jsonl")
+
+
+def test_picks_prints_a_ranker_compare_command_that_does_not_overwrite_the_3080_report(tmp_path, capsys):
+    data = tmp_path / "hw_x"
+    data.mkdir()
+    _screen(data, {(1, 2, 3): {"a": 10.0, "b": 12.0}})
+    (data / "sweep_screen_heldout" / "subset.json").write_text(json.dumps({"shapes": [{"M": 1, "N": 2, "K": 3}]}))
+    (data / zs.out_name("native", "v1")).write_text(json.dumps(_row(1, 2, 3, [("a", True), ("b", True), ("a", True)], ["a", "a", "a"])) + "\n")
+    assert zs._main(["picks", "--data", str(data)]) == 0
+    out = capsys.readouterr().out
+    assert "analysis.ranker_compare" in out and "--report reports/zero_shot_hw_x" in out and "v1_native=zero_shot_v1_native.jsonl" in out

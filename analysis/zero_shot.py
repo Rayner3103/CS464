@@ -304,7 +304,7 @@ def build(data: Path, report: Path, *, screen_name: str = "sweep_screen_heldout"
               "The 3080 reference is over its full 86-shape held-out set; for a run on a subset, compare on the shared shapes with `python -m analysis.cross_gpu`.",
               "`online-k` is what the short search chose; `best-of-k` is the best of the same k candidates by screen time."]
     report.mkdir(parents=True, exist_ok=True)
-    out = report / f"zero_shot_{data.name}.md"
+    out = report / f"zero_shot_{data.name}.md"   # one fixed name per data directory: score k = 3 and k = 5 into different --report folders
     out.write_text("\n".join(lines) + "\n")
     (report / f"zero_shot_{data.name}_summary.json").write_text(json.dumps(summary, indent=1))
     return out, summary
@@ -386,8 +386,9 @@ def _main(argv=None):
               f"  export TUNE_SWEEP_DIR={data / args.screen} TUNE_PICKS={picks}\n"
               f"  python -m tune {lock}benchmark --shapes-file {data / args.screen / 'subset.json'} --backends {be} --cache-modes cold --out-name results_zero_shot.jsonl\n"
               f"  python -m tune {lock}benchmark --shapes-file {lt} --backends {be} --cache-modes hot --graph-batch 50 --out-name results_zero_shot_graph.jsonl\n"
-              f"  python -m analysis.ranker_compare --data {data} --results results_zero_shot.jsonl --graph-results results_zero_shot_graph.jsonl --online "
-              + " ".join(files) + "\n(add cublaslt_deep:20 to --backends for B3+, 20 s per shape)")
+              f"  python -m analysis.ranker_compare --data {data} --report reports/zero_shot_{data.name} --results results_zero_shot.jsonl "
+              f"--graph-results results_zero_shot_graph.jsonl --online " + " ".join(files)
+              + "\n(add cublaslt_deep:20 to --backends for B3+, 20 s per shape; --report keeps ranker_compare from overwriting reports/ranker_compare.md, the 3080's)")
         return 0
     from tune.env import default_data_dir, pin_cpu
     from tune.online import KPolicy

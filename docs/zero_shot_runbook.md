@@ -4,6 +4,8 @@ Runs the saved RTX 3080 rankers (`lgbm_rank` v1, `lgbm_rank_v2`) on a different 
 GPU's own held-out screen. Code: `analysis/zero_shot.py` (module docstring has the long form); comparison across GPUs: `analysis/cross_gpu.py`.
 First worked example (RTX 2060): `reports/week1.md`, "Update 2026-11-02 (later)". GPU job hygiene is `AGENTS.md` section 7.
 
+On a SLURM cluster (no sudo, so no clock lock) use `remoteGPU/zero_shot.sh` (`sbatch remoteGPU/zero_shot.sh`), which runs steps 2-4 and 6 below with these checks built in.
+
 `$D` below is the target machine's data directory (`data/<hw_id>` by default). If you use another one (e.g. a `pipeline/run.sh` run's `data/`), pass
 `--out $D` to the `tune` commands and `--out $D` / `--data $D` to the `analysis.zero_shot` ones. `X` is the SM clock lock in MHz.
 
@@ -58,11 +60,12 @@ python -m analysis.zero_shot --clock-lock X run --out $D \
 ## 4. Score (CPU only)
 
 ```bash
-python -m analysis.zero_shot score --data $D --report $D/../reports --k 3
-python -m analysis.zero_shot score --data $D --report $D/../reports --k 5      # the frequent-call tier
+python -m analysis.zero_shot score --data $D --report $R/k3 --k 3
+python -m analysis.zero_shot score --data $D --report $R/k5 --k 5      # the frequent-call tier
 ```
 
-Pass `--report` explicitly, otherwise the report lands in the repo's `reports/`. Output: `zero_shot_<dir name>.md` (+ `_summary.json`).
+Pass `--report` explicitly (`R` is any folder, e.g. `reports/zero_shot_<hw_id>`), otherwise the report lands in the repo's `reports/`. Output: `zero_shot_<dir name>.md`
+(+ `_summary.json`): one fixed name per data directory, so **k = 3 and k = 5 must go to different folders** or the second overwrites the first.
 
 ## 5. Reading the report
 
@@ -90,7 +93,7 @@ python -m analysis.zero_shot --clock-lock X picks --data $D
 ```
 
 It writes the stage-2 inputs and prints the two `tune benchmark` commands (cold, and graph for the shapes under 50 us) and the `analysis.ranker_compare`
-command. Add `cublaslt_deep:20` to `--backends` for B3+ (20 s per shape). Without a stage-2 session only cuBLASLt picks, and Triton picks that happen to be
+command (it passes `--report`: without it `ranker_compare` overwrites the committed `reports/ranker_compare.md`, the 3080's). Add `cublaslt_deep:20` to `--backends` for B3+ (20 s per shape). Without a stage-2 session only cuBLASLt picks, and Triton picks that happen to be
 timed there, have a full-protocol time.
 
 ## 7. Write it up

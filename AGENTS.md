@@ -54,7 +54,7 @@ analysis/
   plots.py           figures + reports/results_overview.md for the current state (baselines, noise, selectors, kernel-selection stats); CPU-only, reads existing results (`python -m analysis.plots`)
   zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`); `load_screen` keeps `slow` screen rows
   cross_gpu.py       cross-GPU comparison on the held-out shapes the runs share: regret vs each GPU's own screen, speed vs B3+, family ceiling, PTX mma check, paired bootstrap; CPU-only (`python -m analysis.cross_gpu --side LABEL DIR ...`, docstring has the command). Never compare a subset run to the 86-shape `REFERENCE_3080` constants in `zero_shot.py`
-tests/       pytest unit tests (136 tests; most need a CUDA GPU)
+tests/       pytest unit tests (137 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)
@@ -102,7 +102,7 @@ Runbook (standalone version with the prerequisites, scoring and pitfalls: [`docs
 2. Pick an SM clock lock the target GPU holds under load and use it for every command (`--clock-lock X`); only compare sessions with the same lock and driver.
 3. The oracle: `python -m tune --clock-lock X sweep --split heldout --per-suite 1000` (the same 86 shapes as the 3080 run; ~1.3 h there).
 4. `python -m analysis.zero_shot --clock-lock X run --ranker v1=<dir>/lgbm_rank v2=<dir>/lgbm_rank_v2 --k 5 --lt-n 16 --fresh-cache`, then
-   `python -m analysis.zero_shot --clock-lock X score --k 3` (and `--k 5` for the frequent tier: a k = 5 run stores every k' <= 5; with `--k 3 --k-frequent 5` shapes carrying `calls` >= 1M or `frequent: true` get k = 5)
+   `python -m analysis.zero_shot --clock-lock X score --k 3 --report <dir>/k3` (and `--k 5 --report <dir>/k5` for the frequent tier; each call writes one fixed file name, so use separate `--report` folders: a k = 5 run stores every k' <= 5; with `--k 3 --k-frequent 5` shapes carrying `calls` >= 1M or `frequent: true` get k = 5)
    (`--clock-lock` goes before the subcommand; `run` resumes per shape and k; never overlap it with the sweep; a bare `--ranker <dir>/lgbm_rank --k 3` is the original Triton-only run and keeps its file names).
    The screen oracle is Triton-only, so `score` rates the Triton-only choice of a joint (`--lt-n`) run. The joint choice is scored against B2 / B3 in a short stage-2 session:
    `python -m analysis.zero_shot picks` writes its inputs and prints the `tune benchmark` and `python -m analysis.ranker_compare` commands (~0.5 h; add `cublaslt_deep:20` for B3+).
