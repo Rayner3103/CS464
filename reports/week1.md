@@ -12,7 +12,7 @@
 - Stage 2 cold `results_validate.jsonl` (`20261101-155413-4a1b56`): 809 rows, 0 invalid, 32 power-capped (4%), 216 `cublaslt_deep` rows (B3+ exists). Graph (`20261101-160530-155120`, shapes < 50 µs): 163 rows, 0 invalid, 0 power-capped. Online search `online_lgbm_rank_diverse.jsonl` (`20261101-160722-b3270a`): 27 shapes, k = 5, fresh Triton cache.
 - **Not a zero-shot run.** `analysis.zero_shot` found nothing to score here (no `zero_shot_*.jsonl`); this is the *retrain* arm. The zero-shot arm is still open (next steps).
 
-**Comparison method.** Both GPUs restricted to the same 27 shapes and scored with the repo's own functions (`analysis.zero_shot.score_rows` for regret vs each GPU's own screen oracle; `analysis.ranker_compare.load_stage2` / `references` for stage 2 vs B3+). 3080 rows: v1 `online_lgbm_rank_diverse.jsonl`, v2 `online_joint_diverse_v2.jsonl` (Triton-only choice `3_lt0`), stage 2 `results_lock1755_v2{,_graph}.jsonl`. The comparison script is ad hoc and not committed. **Do not compare a subset run to the 86-shape `REFERENCE_3080` constants in `analysis/zero_shot.py`**: on the same 27 shapes the 3080's v1 online top-3 is 1.5% / 7.6% (2.6%), not the 2.3% / 13.7% (4.4%) of the 86. (The constants themselves recompute exactly from the 3080 rows.)
+**Comparison method.** Both GPUs restricted to the same 27 shapes and scored with the repo's own functions (`analysis.zero_shot.score_rows` for regret vs each GPU's own screen oracle; `analysis.ranker_compare.load_stage2` / `references` for stage 2 vs B3+). 3080 rows: v1 `online_lgbm_rank_diverse.jsonl`, v2 `online_joint_diverse_v2.jsonl` (Triton-only choice `3_lt0`), stage 2 `results_lock1755_v2{,_graph}.jsonl`. The comparison is `analysis/cross_gpu.py` (CPU only; output `reports/cross_gpu.md`, command below). **Do not compare a subset run to the 86-shape `REFERENCE_3080` constants in `analysis/zero_shot.py`**: on the same 27 shapes the 3080's v1 online top-3 is 1.5% / 7.6% (2.6%), not the 2.3% / 13.7% (4.4%) of the 86. (The constants themselves recompute exactly from the 3080 rows.)
 
 **1. Selection quality** (regret vs the GPU's own screen oracle, median / p95 (mean), 27 shared shapes):
 
@@ -34,7 +34,7 @@ Paired bootstrap on the 27 shapes (online top-3, 2060 minus 3080 v1; 5,000 resam
 
 Family ceiling (best Triton row in the session vs B3+, i.e. G2 / G4 on these shapes): median t_B3+/t_Triton-oracle 1.007 (3080) vs **0.440** (2060); shapes with the Triton oracle ≥ 90% of B3+: 25/27 vs **3/27**; Triton oracle faster than B3+ by more than the tie margin: 8 vs 2; slower by more: 10 vs **24**. The only 2060 wins are two launch-bound shapes of ~3 µs (105×6×9, 369×17×12, 1.7×). Largest shape, 8192×4096×11008: B3+ 28.3 ms (26.1 TFLOP/s, at the measured 26.4 peak) vs best Triton 173 ms (4.3 TFLOP/s), 6.1×. Selection cannot fix this: the oracle itself is far behind.
 
-**Why (observed, cause not isolated).** All **193** Triton kernels in the 2060's compile cache (`online_triton_cache`, `.target sm_75`) contain **zero `mma.sync`** and only `fma.rn.f32`; the same check on 400 kernels from the 3080's cache (`sm_86`) finds `mma.sync` in all 400. So with Triton 3.7.1 the `tl.dot` on Turing ran on CUDA cores (4.3 TFLOP/s is plausible for fp32 FMA on 1,920 cores at 1755 MHz); cuBLASLt uses the tensor cores. I did not test whether any Triton option or version emits tensor-core code on sm_75. The 2060's choices are also far less varied (7 distinct tiles over the 27 shapes, mostly BLOCK_K = 16, vs 18 on the 3080), which is a plausible reason 56 tune shapes were enough.
+**Why (observed, cause not isolated).** All **193** Triton kernels in the 2060's compile cache (`online_triton_cache`, `.target sm_75`) contain **zero `mma.sync`** and only `fma.rn.f32`; the same check on the 3080's cache (`sm_86`) finds `mma.sync` in all 1,886 kernels. So with Triton 3.7.1 the `tl.dot` on Turing ran on CUDA cores (4.3 TFLOP/s is plausible for fp32 FMA on 1,920 cores at 1755 MHz); cuBLASLt uses the tensor cores. I did not test whether any Triton option or version emits tensor-core code on sm_75. The 2060's choices are also far less varied (7 distinct tiles over the 27 shapes, mostly BLOCK_K = 16, vs 14 for the 3080's v1 and 15 for v2, counting the Triton-only choice), which is a plausible reason 56 tune shapes were enough.
 
 **Findings.**
 - The pipeline (sweep → `lgbm_rank` → diversified top-k → short online search) runs end to end on a second architecture and selects as well as the 3080's within what 27 shapes can resolve (interval ±1.7 points on the mean). It does **not** show equality, and it does not show a general result for tensor-core GPUs: the 2060 space is simpler and one family is FMA-only.
@@ -45,7 +45,15 @@ Family ceiling (best Triton row in the session vs B3+, i.e. G2 / G4 on these sha
 
 **Gates.** 3080 gates unchanged. New for the 2060 (27 shapes, indicative): G2 fails, G4 fails. **Next steps.** (1) **Zero-shot arm on the 2060** (the 3080 `lgbm_rank` / `lgbm_rank_v2`, no refit), reusing this run's held-out screen as the oracle (skips the 17.7 h sweep): `python -m analysis.zero_shot --clock-lock 1755 run --out $D --ranker v1=$D/src3080/lgbm_rank v2=$D/src3080/lgbm_rank_v2 --k 5 --lt-n 16 --fresh-cache`, then `score --data $D --report $D/../reports --k 3` (and `--k 5`), optionally `picks` for the joint stage 2; copy the 3080 models into a separate `src3080/` folder (the run's own `lgbm_rank.*` would be overwritten). Bar to beat: the retrained row above. A poor zero-shot result is confounded by the FMA-only path; a good one is the stronger evidence. (2) Joint selection and B3+ on the 2060. (3) A second tensor-core GPU for the generality claim. (4) Report a same-subset 3080 reference in `analysis.zero_shot` instead of the 86-shape constants.
 
-Reproduce (CPU only): the run is `pipeline/run.sh --quick` on the 2060; scoring reads `data/rtx2060/quick-20261029-095746-v2/data/` and `data/rtx3080_sm86_68sms_10gb/` as described above.
+Reproduce (CPU only; the run itself is `pipeline/run.sh --quick` on the 2060):
+```bash
+D3=data/rtx3080_sm86_68sms_10gb; D2=data/rtx2060/quick-20261029-095746-v2/data
+python -m analysis.cross_gpu \
+  --side 3080-v1 $D3 online_lgbm_rank_diverse.jsonl online_joint_diverse.jsonl results_lock1755_v2.jsonl results_lock1755_v2_graph.jsonl \
+  --side 3080-v2 $D3 online_joint_diverse_v2.jsonl online_joint_diverse_v2.jsonl results_lock1755_v2.jsonl results_lock1755_v2_graph.jsonl \
+  --side 2060 $D2 online_lgbm_rank_diverse.jsonl online_lgbm_rank_diverse.jsonl results_validate.jsonl results_validate_graph.jsonl
+```
+The tile counts in the Why paragraph were first quoted as 18 for the 3080 (joint choice, which can include cuBLASLt keys); the module counts the Triton-only choice.
 
 ## Update 2026-11-01: rank v2 (analytic features, near-top weights, tail suite) — Triton-only tail halves, the joint search barely moves
 
