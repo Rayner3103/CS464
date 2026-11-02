@@ -53,7 +53,8 @@ analysis/
   alloc_variance.py  allocation-placement noise experiment
   plots.py           figures + reports/results_overview.md for the current state (baselines, noise, selectors, kernel-selection stats); CPU-only, reads existing results (`python -m analysis.plots`)
   zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`)
-tests/       pytest unit tests (102 tests; most need a CUDA GPU)
+  cross_gpu.py       cross-GPU comparison on the held-out shapes the runs share: regret vs each GPU's own screen, speed vs B3+, family ceiling, PTX mma check, paired bootstrap; CPU-only (`python -m analysis.cross_gpu --side LABEL DIR ...`, docstring has the command). Never compare a subset run to the 86-shape `REFERENCE_3080` constants in `zero_shot.py`
+tests/       pytest unit tests (131 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)
