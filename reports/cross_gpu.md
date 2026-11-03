@@ -4,14 +4,14 @@ Regret vs each GPU's own held-out screen oracle (median / p95 (mean)); speed = t
 
 ## Selection quality (screen oracle)
 
-| pick | 3080-v1 | 3080-v2 | 2060-retrained | 2060-zs-v1-as_is | 2060-zs-v1-native | 2060-zs-v2-as_is | 2060-zs-v2-native |
-|---|---|---|---|---|---|---|---|
-| top-1 | 1.9% / 12.5% (3.6%) | 0.9% / 7.2% (2.4%) | 0.7% / 9.1% (2.6%) | 198.1% / 6168.9% (810.0%) | 94.2% / 672.7% (303.3%) | 227.4% / 3599.7% (806.3%) | 203.3% / 2782.3% (470.6%) |
-| online-3 | 1.5% / 7.6% (2.6%) | 0.8% / 6.9% (1.8%) | 0.7% / 7.5% (2.5%) | 79.8% / 658.0% (288.3%) | 43.4% / 604.3% (157.4%) | 58.4% / 635.8% (270.2%) | 42.8% / 228.3% (80.7%) |
-| online-5 | 0.8% / 7.2% (2.3%) | 0.8% / 6.9% (1.9%) | 0.5% / 6.7% (2.1%) | 39.0% / 658.0% (269.2%) | 19.1% / 598.0% (111.3%) | 38.0% / 392.1% (107.8%) | 15.4% / 228.3% (71.8%) |
-| regret > 50% (online-3) | 0 of 27 (+0 unscored) | 0 of 27 (+0 unscored) | 0 of 27 (+0 unscored) | 16 of 26 (+1 unscored) | 13 of 27 (+0 unscored) | 13 of 26 (+1 unscored) | 13 of 27 (+0 unscored) |
+| pick | 3080-v1 | 3080-v2 | 2060-retrained | 2060-zs-v1-as_is | 2060-zs-v1-native | 2060-zs-v2-as_is | 2060-zs-v2-native | 3090-zs-v1-as_is | 3090-zs-v1-native | 3090-zs-v2-as_is | 3090-zs-v2-native |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| top-1 | 1.9% / 12.5% (3.6%) | 0.9% / 7.2% (2.4%) | 0.7% / 9.1% (2.6%) | 198.1% / 6168.9% (810.0%) | 94.2% / 672.7% (303.3%) | 227.4% / 3599.7% (806.3%) | 203.3% / 2782.3% (470.6%) | 6.0% / 23.1% (8.1%) | 4.6% / 13.0% (5.0%) | 1.7% / 18.9% (5.7%) | 2.8% / 14.6% (4.9%) |
+| online-3 | 1.5% / 7.6% (2.6%) | 0.8% / 6.9% (1.8%) | 0.7% / 7.5% (2.5%) | 79.8% / 658.0% (288.3%) | 43.4% / 604.3% (157.4%) | 58.4% / 635.8% (270.2%) | 42.8% / 228.3% (80.7%) | 5.4% / 14.5% (6.1%) | 3.7% / 13.0% (4.5%) | 0.9% / 14.1% (4.0%) | 1.8% / 9.0% (3.1%) |
+| online-5 | 0.8% / 7.2% (2.3%) | 0.8% / 6.9% (1.9%) | 0.5% / 6.7% (2.1%) | 39.0% / 658.0% (269.2%) | 19.1% / 598.0% (111.3%) | 38.0% / 392.1% (107.8%) | 15.4% / 228.3% (71.8%) | 5.4% / 14.5% (6.1%) | 2.8% / 13.0% (4.1%) | 0.9% / 13.0% (3.6%) | 1.8% / 12.4% (3.5%) |
+| regret > 50% (online-3) | 0 of 27 (+0 unscored) | 0 of 27 (+0 unscored) | 0 of 27 (+0 unscored) | 16 of 26 (+1 unscored) | 13 of 27 (+0 unscored) | 13 of 26 (+1 unscored) | 13 of 27 (+0 unscored) | 0 of 27 (+0 unscored) | 0 of 27 (+0 unscored) | 0 of 27 (+0 unscored) | 0 of 27 (+0 unscored) |
 
-Regime split by the screen oracle (n shapes >= 50 us / < 50 us): 3080-v1 16 / 11; 3080-v2 16 / 11; 2060-retrained 21 / 6; 2060-zs-v1-as_is 20 / 6; 2060-zs-v1-native 21 / 6; 2060-zs-v2-as_is 21 / 5; 2060-zs-v2-native 21 / 6
+Regime split by the screen oracle (n shapes >= 50 us / < 50 us): 3080-v1 16 / 11; 3080-v2 16 / 11; 2060-retrained 21 / 6; 2060-zs-v1-as_is 20 / 6; 2060-zs-v1-native 21 / 6; 2060-zs-v2-as_is 21 / 5; 2060-zs-v2-native 21 / 6; 3090-zs-v1-as_is 15 / 12; 3090-zs-v1-native 15 / 12; 3090-zs-v2-as_is 15 / 12; 3090-zs-v2-native 15 / 12
 
 Paired bootstrap, online-3, 3080-v2 minus 3080-v1 (n = 27, 5,000 resamples): mean -0.8 points [-1.8, -0.0], median -0.7 points [-1.8, +0.0], p90 -3.0 points [-5.4, +2.0]; shapes over 5% regret 2 vs 6.
 Paired bootstrap, online-3, 2060-retrained minus 3080-v1 (n = 27, 5,000 resamples): mean -0.1 points [-1.7, +1.6], median -0.8 points [-2.1, +1.8], p90 -0.4 points [-3.6, +5.5]; shapes over 5% regret 6 vs 6.
@@ -19,14 +19,18 @@ Paired bootstrap, online-3, 2060-zs-v1-as_is minus 3080-v1 (n = 26, 5,000 resamp
 Paired bootstrap, online-3, 2060-zs-v1-native minus 3080-v1 (n = 27, 5,000 resamples): mean +154.7 points [+75.2, +243.4], median +42.0 points [+5.4, +94.7], p90 +590.3 points [+130.2, +636.0]; shapes over 5% regret 22 vs 6.
 Paired bootstrap, online-3, 2060-zs-v2-as_is minus 3080-v1 (n = 26, 5,000 resamples): mean +267.7 points [+71.6, +606.4], median +57.2 points [+22.0, +147.0], p90 +338.5 points [+195.4, +2396.7]; shapes over 5% regret 23 vs 5.
 Paired bootstrap, online-3, 2060-zs-v2-native minus 3080-v1 (n = 27, 5,000 resamples): mean +78.0 points [+36.6, +137.1], median +41.3 points [+10.4, +58.6], p90 +181.2 points [+70.6, +410.0]; shapes over 5% regret 22 vs 6.
+Paired bootstrap, online-3, 3090-zs-v1-as_is minus 3080-v1 (n = 27, 5,000 resamples): mean +3.5 points [+1.1, +6.4], median +3.9 points [-0.1, +6.8], p90 +6.9 points [+1.5, +15.8]; shapes over 5% regret 14 vs 6.
+Paired bootstrap, online-3, 3090-zs-v1-native minus 3080-v1 (n = 27, 5,000 resamples): mean +1.8 points [-0.0, +3.8], median +2.2 points [-0.4, +4.7], p90 +3.1 points [-0.9, +8.6]; shapes over 5% regret 12 vs 6.
+Paired bootstrap, online-3, 3090-zs-v2-as_is minus 3080-v1 (n = 27, 5,000 resamples): mean +1.4 points [-0.7, +3.6], median -0.6 points [-2.5, +4.7], p90 +5.1 points [-0.0, +9.1]; shapes over 5% regret 10 vs 6.
+Paired bootstrap, online-3, 3090-zs-v2-native minus 3080-v1 (n = 27, 5,000 resamples): mean +0.5 points [-1.1, +2.1], median +0.3 points [-1.8, +2.5], p90 +1.6 points [-2.4, +5.8]; shapes over 5% regret 7 vs 6.
 
 ## Stage 2: online top-3 (Triton only) vs B3+
 
-| group | 3080-v1 | 3080-v2 | 2060-retrained | 2060-zs-v1-as_is | 2060-zs-v1-native | 2060-zs-v2-as_is | 2060-zs-v2-native |
-|---|---|---|---|---|---|---|---|
-| all | 1.005 [0.908, 1.177] (n=27; ahead 8, behind 12) | 1.005 [0.915, 1.177] (n=27; ahead 8, behind 10) | 0.434 [0.163, 0.907] (n=27; ahead 2, behind 24) | 1.354 [1.096, 1.613] (n=2; ahead 1, behind 0) | 1.031 [1.031, 1.031] (n=1; ahead 0, behind 0) | 0.447 [0.243, 1.428] (n=3; ahead 1, behind 2) | 0.739 [0.442, 1.481] (n=4; ahead 1, behind 2) |
-| >= 50 us | 0.967 [0.908, 1.010] (n=16; ahead 0, behind 9) | 0.985 [0.913, 1.008] (n=16; ahead 0, behind 8) | 0.242 [0.162, 0.712] (n=21; ahead 0, behind 21) | n/a | n/a | 0.319 [0.217, 0.422] (n=2; ahead 0, behind 2) | 0.443 [0.441, 0.446] (n=2; ahead 0, behind 2) |
-| < 50 us | 1.147 [0.925, 1.199] (n=11; ahead 8, behind 3) | 1.147 [0.927, 1.229] (n=11; ahead 8, behind 2) | 0.928 [0.600, 1.562] (n=6; ahead 2, behind 3) | 1.354 [1.096, 1.613] (n=2; ahead 1, behind 0) | 1.031 [1.031, 1.031] (n=1; ahead 0, behind 0) | 1.674 [1.674, 1.674] (n=1; ahead 1, behind 0) | 1.352 [1.095, 1.610] (n=2; ahead 1, behind 0) |
+| group | 3080-v1 | 3080-v2 | 2060-retrained | 2060-zs-v1-as_is | 2060-zs-v1-native | 2060-zs-v2-as_is | 2060-zs-v2-native | 3090-zs-v1-as_is | 3090-zs-v1-native | 3090-zs-v2-as_is | 3090-zs-v2-native |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| all | 1.005 [0.908, 1.177] (n=27; ahead 8, behind 12) | 1.005 [0.915, 1.177] (n=27; ahead 8, behind 10) | 0.434 [0.163, 0.907] (n=27; ahead 2, behind 24) | 1.354 [1.096, 1.613] (n=2; ahead 1, behind 0) | 1.031 [1.031, 1.031] (n=1; ahead 0, behind 0) | 0.447 [0.243, 1.428] (n=3; ahead 1, behind 2) | 0.739 [0.442, 1.481] (n=4; ahead 1, behind 2) | 0.984 [0.823, 1.171] (n=27; ahead 9, behind 12) | 0.977 [0.871, 1.171] (n=27; ahead 7, behind 15) | 0.990 [0.845, 1.171] (n=27; ahead 10, behind 10) | 0.998 [0.882, 1.171] (n=27; ahead 10, behind 12) |
+| >= 50 us | 0.967 [0.908, 1.010] (n=16; ahead 0, behind 9) | 0.985 [0.913, 1.008] (n=16; ahead 0, behind 8) | 0.242 [0.162, 0.712] (n=21; ahead 0, behind 21) | n/a | n/a | 0.319 [0.217, 0.422] (n=2; ahead 0, behind 2) | 0.443 [0.441, 0.446] (n=2; ahead 0, behind 2) | 0.984 [0.843, 1.026] (n=15; ahead 3, behind 7) | 0.970 [0.904, 0.986] (n=15; ahead 1, behind 11) | 0.984 [0.841, 1.026] (n=15; ahead 4, behind 7) | 0.980 [0.900, 1.026] (n=15; ahead 4, behind 8) |
+| < 50 us | 1.147 [0.925, 1.199] (n=11; ahead 8, behind 3) | 1.147 [0.927, 1.229] (n=11; ahead 8, behind 2) | 0.928 [0.600, 1.562] (n=6; ahead 2, behind 3) | 1.354 [1.096, 1.613] (n=2; ahead 1, behind 0) | 1.031 [1.031, 1.031] (n=1; ahead 0, behind 0) | 1.674 [1.674, 1.674] (n=1; ahead 1, behind 0) | 1.352 [1.095, 1.610] (n=2; ahead 1, behind 0) | 1.041 [0.818, 1.178] (n=12; ahead 6, behind 5) | 1.055 [0.829, 1.178] (n=12; ahead 6, behind 4) | 1.046 [0.863, 1.176] (n=12; ahead 6, behind 3) | 1.069 [0.864, 1.176] (n=12; ahead 6, behind 4) |
 
 n below the shared-shape count: the Triton picks of that side were not timed in its stage-2 session, so its Triton-only speed covers only a few shapes and is not comparable (the joint table below is). Run `python -m analysis.zero_shot picks` and its stage-2 commands for a full comparison.
 
@@ -41,6 +45,10 @@ n below the shared-shape count: the Triton picks of that side were not timed in 
 | 2060-zs-v1-native | 27 | 0.440 [0.164, 0.907] | 3/27 | 2 / 24 | 0.242 | 0.928 |
 | 2060-zs-v2-as_is | 27 | 0.440 [0.164, 0.907] | 3/27 | 2 / 24 | 0.242 | 0.928 |
 | 2060-zs-v2-native | 27 | 0.440 [0.164, 0.907] | 3/27 | 2 / 24 | 0.242 | 0.928 |
+| 3090-zs-v1-as_is | 27 | 1.008 [0.892, 1.171] | 24/27 | 11 / 9 | 0.989 | 1.103 |
+| 3090-zs-v1-native | 27 | 1.008 [0.892, 1.171] | 24/27 | 11 / 9 | 0.989 | 1.103 |
+| 3090-zs-v2-as_is | 27 | 1.008 [0.892, 1.171] | 24/27 | 11 / 9 | 0.989 | 1.103 |
+| 3090-zs-v2-native | 27 | 1.008 [0.892, 1.171] | 24/27 | 11 / 9 | 0.989 | 1.103 |
 
 ## Joint search (top-3 Triton + cuBLASLt top-16 in one pool) vs B3+
 
@@ -52,6 +60,10 @@ n below the shared-shape count: the Triton picks of that side were not timed in 
 | 2060-zs-v1-native | 27 | 24 | 25 | 0.979 / 0.770 | 16/25 |
 | 2060-zs-v2-as_is | 27 | 24 | 25 | 0.979 / 0.770 | 16/25 |
 | 2060-zs-v2-native | 27 | 24 | 26 | 0.983 / 0.772 | 17/26 |
+| 3090-zs-v1-as_is | 27 | 9 | 27 | 1.000 / 0.912 | 21/27 |
+| 3090-zs-v1-native | 27 | 7 | 27 | 0.986 / 0.930 | 23/27 |
+| 3090-zs-v2-as_is | 27 | 8 | 27 | 1.000 / 0.945 | 24/27 |
+| 3090-zs-v2-native | 27 | 5 | 27 | 1.000 / 0.941 | 22/27 |
 
 A Triton pick that the stage-2 session did not time has no full-protocol time and is left out of the speed columns (see `timed in the stage-2 session`).
 
@@ -64,5 +76,10 @@ A Triton pick that the stage-2 session did not time has no full-protocol time an
 - 2060-zs-v1-native: 10 distinct tiles over the shapes (top [('bm16_bn128_bk32', 6), ('bm64_bn64_bk16', 5), ('bm64_bn128_bk16', 4)]).
 - 2060-zs-v2-as_is: 14 distinct tiles over the shapes (top [('bm16_bn128_bk32', 4), ('bm64_bn64_bk32', 4), ('bm64_bn64_bk16', 3)]).
 - 2060-zs-v2-native: 14 distinct tiles over the shapes (top [('bm64_bn64_bk16', 5), ('bm16_bn128_bk16', 4), ('bm64_bn64_bk64', 3)]).
+- 3090-zs-v1-as_is: 13 distinct tiles over the shapes (top [('bm64_bn64_bk32', 5), ('bm16_bn128_bk32', 4), ('bm64_bn128_bk16', 4)]).
+- 3090-zs-v1-native: 14 distinct tiles over the shapes (top [('bm64_bn64_bk32', 7), ('bm16_bn128_bk16', 4), ('bm32_bn32_bk16', 3)]).
+- 3090-zs-v2-as_is: 13 distinct tiles over the shapes (top [('bm64_bn128_bk16', 4), ('bm16_bn128_bk64', 3), ('bm64_bn64_bk32', 3)]).
+- 3090-zs-v2-native: 13 distinct tiles over the shapes (top [('bm64_bn64_bk32', 7), ('bm16_bn64_bk64', 4), ('bm32_bn32_bk16', 3)]).
 - `data/rtx3080_sm86_68sms_10gb/online_triton_cache` (every run of that directory): 1886 compiled kernels, 1886 with mma.sync, 0 FMA-only (targets: sm_86 1886).
 - `data/rtx2060/quick-20261029-095746-v3/data/online_triton_cache` (every run of that directory): 571 compiled kernels, 0 with mma.sync, 571 FMA-only (targets: sm_75 571).
+- `data/rtx3090_sm86_82sms_24gb/online_triton_cache` (every run of that directory): 285 compiled kernels, 285 with mma.sync, 0 FMA-only (targets: sm_86 285).

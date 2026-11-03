@@ -4,6 +4,62 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-11-03: zero-shot arm on the RTX 3090 — the 3080 rankers transfer to a second tensor-core GPU (v2 within noise of the 3080), unlike the 2060
+
+**What ran.** The 3080's `lgbm_rank` (v1) and `lgbm_rank_v2`, no refit, on an RTX 3090 (`rtx3090_sm86_82sms_24gb`, Ampere sm_86, 82 SMs, 24 GB, SLURM job from `remoteGPU/zero_shot.sh`, `PER_SUITE=12`), `data/rtx3090_sm86_82sms_24gb/`. Harness `194f78b`, clean.
+- Oracle: the 3090's own held-out screen, 27 of 27 shapes complete (the same 27 as the 2060 run, a subset of the 3080's 86). Four row files (v1 / v2 × `as_is` / `native`), 27 shapes each, k = 5, cuBLASLt top-16 in the pool, 0 skipped, **0 invalid candidates**. Sessions: run `20261102-200011-fd8e1e` (v1), `20261102-200129-daabf1` (v2); stage 2 (`zero_shot picks` + benchmark) cold `20261102-200238-ac2917` (962 rows), graph `20261102-200849-5ce748` (429 rows, the 12 shapes under 50 µs).
+- **Not standard conditions.** The clock is **unlocked** (a job cannot run `nvidia-smi -lgc`), driver 590.48.01 (the study: 595.99.02), 95% of cold and 53% of graph stage-2 rows power-capped (throttle `0x4`). No noise study exists for this setup, so the 2% / 5% tie margins are borrowed from the 3080. Compare regret and ratios, never absolute times, with the 3080 / 2060 runs. The oracle was also screened unlocked: regrets of 1-3% are at its noise level.
+- All 285 compiled kernels in the run's Triton cache contain `mma.sync` (0 FMA-only; the 2060's 571 are all FMA-only): the confound of the 2060 update is absent here.
+
+**Zero-shot vs home GPU vs 2060** (27 shared shapes, regret vs each GPU's own screen oracle, median / p95 (mean); `analysis.cross_gpu`, full table in [`cross_gpu.md`](cross_gpu.md)):
+
+| pick | 3080 v1 | 3080 v2 | 3090 v1 as_is | 3090 v1 native | 3090 v2 as_is | 3090 v2 native | 2060 retrained | 2060 v1 native | 2060 v2 native |
+|---|---|---|---|---|---|---|---|---|---|
+| online top-1 | 1.9 / 12.5 (3.6) | 0.9 / 7.2 (2.4) | 6.0 / 23.1 (8.1) | 4.6 / 13.0 (5.0) | 1.7 / 18.9 (5.7) | 2.8 / 14.6 (4.9) | 0.7 / 9.1 (2.6) | 94 / 673 (303) | 203 / 2782 (471) |
+| online top-3 | 1.5 / 7.6 (2.6) | 0.8 / 6.9 (1.8) | 5.4 / 14.5 (6.1) | 3.7 / 13.0 (4.5) | 0.9 / 14.1 (4.0) | 1.8 / 9.0 (3.1) | 0.7 / 7.5 (2.5) | 43 / 604 (157) | 43 / 228 (81) |
+| online top-5 | 0.8 / 7.2 (2.3) | 0.8 / 6.9 (1.9) | 5.4 / 14.5 (6.1) | 2.8 / 13.0 (4.1) | 0.9 / 13.0 (3.6) | 1.8 / 12.4 (3.5) | 0.5 / 6.7 (2.1) | 19 / 598 (111) | 15 / 228 (72) |
+| top-3 picks > 50% off (of 27) | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 13 | 13 |
+| shapes over 5% regret (top-3) | 6 | 2 | 14 | 12 | 10 | 7 | 6 | 22 | 22 |
+
+Paired bootstrap vs the 3080's v1 (online top-3, mean difference in points, 5,000 resamples): 3090 v1 `as_is` **+3.5 [+1.1, +6.4]**, v1 `native` +1.8 [0.0, +3.8], v2 `as_is` +1.4 [-0.7, +3.6], v2 `native` +0.5 [-1.1, +2.1]. Regime split on the 3090 oracle: 15 shapes ≥ 50 µs / 12 below (3080: 16 / 11).
+
+**Stage 2 vs the searched cuBLASLt (B3+)** (speed = t_B3+ / t_pick, > 1 faster; all 27 shapes timed in one session, so unlike the 2060 the Triton-only picks are fully covered):
+- Joint search (top-3 Triton + cuBLASLt top-16): median 0.986-1.000, p10 0.91-0.95, within 5% of B3+ on 21-24 of 27 shapes (3080: 1.005 / 0.93-0.94 / 22; 2060 zero-shot: 0.98 / 0.77 / 16-17 of 25-26). cuBLASLt is chosen on 5-9 of 27 shapes (3080: 8-9; 2060: 24). Versus B2 (`ranker_compare.md`): median 0.944-0.958 (4-6% faster), faster on 12-17 of 27 and slower on 0-1 (> margin); first-use cost 0.64-1.13 s for top-3 + LT16.
+- Triton-only top-3: median 0.977-0.998; ≥ 50 µs 0.970-0.984 (3080 0.967-0.985), < 50 µs 1.04-1.07 (3080 1.15). Family ceiling (best Triton row of the session): median 1.008 [0.892, 1.171], 24 of 27 within 90% of B3+ (3080: 1.007, 25 of 27; 2060: 0.44, 3 of 27).
+
+**Findings.**
+- **Zero-shot transfer works across a same-architecture, different-size GPU.** No pick is > 50% off (0 of 27 in all four variants; the 2060: 13), and v2 `as_is` / `native` is statistically indistinguishable from the 3080's own v1 on the mean (+1.4 [-0.7, +3.6] and +0.5 [-1.1, +2.1] points). v1 `as_is` is measurably worse (+3.5 [+1.1, +6.4]). Combined with the 2060 update, the 2060 failure is now attributable to the missing tensor-core path in Triton on sm_75, not to a general inability of the ranker to cross GPUs.
+- **v2 is the more robust model** (analytic features): lower mean than v1 in both variants (4.0 / 3.1% vs 6.1 / 4.5%); `native` helps v1 (median 5.4 → 3.7%) and the v2 tail (p95 14.1 → 9.0%) but not v2's median (0.9 → 1.8%, within noise at n = 27).
+- **More candidates do not help much** (v1 `as_is` online-5 = online-3): the remaining error is ranker bias on this GPU, not too few candidates.
+- **Joint selection** behaves as on the 3080: ties B3+ at the median and is never slower than B2 beyond the margin on more than 1 shape. G4 (differentiation vs B3+ at ≥ 50 µs) is unchanged: it still fails.
+
+**Caveats.** n = 27 and variant differences (e.g. v2 `as_is` vs `native`) are inside their intervals. **No retrained 3090 ranker**, so the zero-shot gap cannot be separated from the unlocked-clock noise floor; a retrain would need a tune sweep (~10-17 h) on this GPU. Unlocked clock, other driver, power cap (above). The `RTX 3080 reference` table inside the generated `reports/zero_shot_rtx3090_sm86_82sms_24gb/k*/` files uses the 86-shape constants: do not compare it to these 27-shape numbers (use `cross_gpu.md`). 3090 regime mix (15 / 12) differs from the 3080's, so the < 50 µs comparison rests on 11-12 shapes per GPU.
+
+**Gates.** None changed. **Next steps.** (1) Optionally a locked-clock 3090 re-run of the stage 2 (or `--clock-lock` at ~1500-1600 MHz if the host allows) with a short noise study, to turn the borrowed 2% margin into a measured one. (2) Retrain on the 3090 only if the 5%-regret rate (7-14 of 27) matters: the 3080 ranker is 2-6 of 27. (3) An Ada / Hopper GPU would test a different tensor-core generation.
+
+Reproduce (CPU only; the run is `sbatch remoteGPU/zero_shot.sh`):
+```bash
+D9=data/rtx3090_sm86_82sms_24gb; R=reports/zero_shot_rtx3090_sm86_82sms_24gb
+python -m analysis.zero_shot score --data $D9 --report $R/k3 --k 3
+python -m analysis.zero_shot score --data $D9 --report $R/k5 --k 5
+python -m analysis.ranker_compare --data $D9 --report $R --results results_zero_shot.jsonl --graph-results results_zero_shot_graph.jsonl \
+  --online v1_as_is=zero_shot_v1_as_is.jsonl v1_native=zero_shot_v1_native.jsonl v2_as_is=zero_shot_v2_as_is.jsonl v2_native=zero_shot_v2_native.jsonl
+D3=data/rtx3080_sm86_68sms_10gb; Z=data/rtx2060/quick-20261029-095746-v3/data
+python -m analysis.cross_gpu \
+  --side 3080-v1 $D3 online_lgbm_rank_diverse.jsonl online_joint_diverse.jsonl results_lock1755_v2.jsonl results_lock1755_v2_graph.jsonl \
+  --side 3080-v2 $D3 online_joint_diverse_v2.jsonl online_joint_diverse_v2.jsonl results_lock1755_v2.jsonl results_lock1755_v2_graph.jsonl \
+  --side 2060-retrained $Z online_lgbm_rank_diverse.jsonl online_lgbm_rank_diverse.jsonl results_validate.jsonl results_validate_graph.jsonl \
+  --side 2060-zs-v1-as_is $Z zero_shot_v1_as_is.jsonl zero_shot_v1_as_is.jsonl results_validate.jsonl results_validate_graph.jsonl \
+  --side 2060-zs-v1-native $Z zero_shot_v1_native.jsonl zero_shot_v1_native.jsonl results_validate.jsonl results_validate_graph.jsonl \
+  --side 2060-zs-v2-as_is $Z zero_shot_v2_as_is.jsonl zero_shot_v2_as_is.jsonl results_validate.jsonl results_validate_graph.jsonl \
+  --side 2060-zs-v2-native $Z zero_shot_v2_native.jsonl zero_shot_v2_native.jsonl results_validate.jsonl results_validate_graph.jsonl \
+  --side 3090-zs-v1-as_is $D9 zero_shot_v1_as_is.jsonl zero_shot_v1_as_is.jsonl results_zero_shot.jsonl results_zero_shot_graph.jsonl \
+  --side 3090-zs-v1-native $D9 zero_shot_v1_native.jsonl zero_shot_v1_native.jsonl results_zero_shot.jsonl results_zero_shot_graph.jsonl \
+  --side 3090-zs-v2-as_is $D9 zero_shot_v2_as_is.jsonl zero_shot_v2_as_is.jsonl results_zero_shot.jsonl results_zero_shot_graph.jsonl \
+  --side 3090-zs-v2-native $D9 zero_shot_v2_native.jsonl zero_shot_v2_native.jsonl results_zero_shot.jsonl results_zero_shot_graph.jsonl
+```
+`env.json` of the run: `reports/snapshot/rtx3090_unlocked/env.json`.
+
 ## Update 2026-11-02 (later): zero-shot arm on the 2060 — the 3080 rankers do not transfer for Triton-only selection; a scorer bug had hidden it
 
 **What ran.** The 3080's `lgbm_rank` (v1) and `lgbm_rank_v2`, no refit, on the RTX 2060 (`rtx2060_sm75_30sms_6gb`, `--clock-lock 1755`, driver 595.99.02), run directory `data/rtx2060/quick-20261029-095746-v3/` (v2 plus the zero-shot rows; its `results_validate.jsonl` and retrained `online_lgbm_rank_diverse.jsonl` are byte-identical to v2's). `python -m analysis.zero_shot run --ranker v1=... v2=... --k 5 --lt-n 16 --fresh-cache`, variants `as_is` / `native`.
