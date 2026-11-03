@@ -114,6 +114,29 @@ pipeline/runs/<run>/
 The trained selector is `data/lgbm_rank.txt` + `.json`. Load it with
 `analysis.learned.Ranker.load(Path("<run>/data/lgbm_rank"))` and call `.rank(M, N, K, k=3, order="diverse")`.
 
+## Zero-shot transfer in one command: `pipeline/zero_shot.sh`
+
+Runs the saved RTX 3080 rankers (`lgbm_rank` v1 and `lgbm_rank_v2`, no refit) on the GPU in this machine and scores them
+against that GPU's own held-out screen. Same conventions as `run.sh` (stages, `--resume`, `--from`, `--only`, stamps, the shared
+`pipeline/.lock`, output under `pipeline/runs/zero_shot-<mode>-<timestamp>/`). The long form is `docs/zero_shot_runbook.md`.
+
+```bash
+pipeline/zero_shot.sh --quick --clock-lock 1755       # 27 held-out shapes; --smoke = 3 per suite, --full = all 86
+pipeline/zero_shot.sh --quick --clock-lock none --allow-unlocked --oracle <dir>/sweep_screen_heldout   # reuse an existing oracle
+```
+
+Needs the four 3080 model files (`lgbm_rank.{txt,json}`, `lgbm_rank_v2.{txt,json}`) in `data/src3080/` or
+`data/rtx3080_sm86_68sms_10gb/`, or anywhere with `--models DIR`; they are only read. Stages: `preflight install tests env sweep run score
+picks stage2_cold stage2_graph compare summary` (`--list-stages`). `sweep` (the oracle) dominates; `--oracle` copies a finished screen instead.
+`SUMMARY.md` has the regret table per variant (`v1` / `v2` x `as_is` / `native`) at k = 3 and k = 5; the reports are under `reports/k3`, `reports/k5`
+and `ranker_compare.md` (joint choice vs B2 / B3 / B3+).
+
+## On a SLURM cluster
+
+`sbatch remoteGPU/run.sh` runs this pipeline (`MODE=smoke|quick|full`) and `sbatch remoteGPU/zero_shot.sh` runs the zero-shot transfer.
+Both need the login-node setup in their headers (venv in `$REPO/.venv`, no sudo, so unlocked clocks by default), write to a fixed
+directory and continue where they stopped when resubmitted.
+
 ## Not included
 
 The comparison of all ten learned model families (`tune learned`, about 2 h of CPU for the full grid plus two
