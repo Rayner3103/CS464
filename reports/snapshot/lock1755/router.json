@@ -1,0 +1,45 @@
+{
+ "hw_id": "rtx3080_sm86_68sms_10gb",
+ "features": [
+  "lM",
+  "lN",
+  "lK",
+  "l_roofline_us",
+  "l_t_lt_over_roofline",
+  "l_ctas_per_sm",
+  "al_m",
+  "al_n",
+  "al_k",
+  "l_arith_intensity"
+ ],
+ "threshold": 0.02,
+ "loss_cap": 0.001,
+ "rounds": 150,
+ "params": {
+  "objective": "binary",
+  "learning_rate": 0.05,
+  "num_leaves": 8,
+  "min_data_in_leaf": 15,
+  "feature_fraction": 0.9,
+  "bagging_fraction": 0.8,
+  "bagging_freq": 1,
+  "lambda_l2": 5.0,
+  "verbose": -1,
+  "num_threads": 4,
+  "seed": 0
+ },
+ "n_tune_shapes": 477,
+ "oof_auc": 0.8226372449889965,
+ "importance_gain": {
+  "lM": 266.50396840274334,
+  "lN": 204.0083215534687,
+  "lK": 798.6667474061251,
+  "l_roofline_us": 536.2293581664562,
+  "l_t_lt_over_roofline": 440.71122676855884,
+  "l_ctas_per_sm": 68.21637296676636,
+  "al_m": 1.4823089838027954,
+  "al_n": 7.141115128993988,
+  "al_k": 22.4214448928833,
+  "l_arith_intensity": 414.9271373450756
+ }
+}

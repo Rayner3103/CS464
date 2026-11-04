@@ -25,9 +25,11 @@ def fake_search(monkeypatch):
     calls = Calls()
     calls_knn = calls.knn = []
     calls.rank = []
+    calls.router = []
 
-    def fake(ranker, M, N, K, k, dtype, order, lt_n, lt_knn=0, lt_rank=0):
+    def fake(ranker, M, N, K, k, dtype, order, lt_n, lt_knn=0, lt_rank=0, router=None, confirm=0):
         calls.append((M, N, K, k, lt_n))
+        calls.router.append(router)
         calls_knn.append(lt_knn)
         calls.rank.append(lt_rank)
         return {"rank_s": 0.1, "candidates": _cands(k, lt_n)}
@@ -177,3 +179,43 @@ def test_entry_without_proposals_is_a_miss_when_they_are_requested(tmp_path):
     wc.put(32, 32, 32, "fp16", k=3, lt_n=4, choice={"key": KEY, "family": "triton"})   # written before proposals existed
     assert wc.get(32, 32, 32, "fp16", k=3, lt_n=4)["choice"]["key"] == KEY
     assert wc.get(32, 32, 32, "fp16", k=3, lt_n=4, lt_knn=8) is None and wc.get(32, 32, 32, "fp16", k=3, lt_n=4, lt_rank=5) is None
+
+
+class _FakeBooster:
+    def __init__(self, p):
+        self.p = p
+
+    def predict(self, X):
+        return [self.p] * len(X)
+
+
+def _router(p, thr=0.02):
+    from tune.router import Router
+    return Router(_FakeBooster(p), {"threshold": thr, "hw_id": None, "n_tune_shapes": 1, "oof_auc": 0.8})
+
+
+def test_router_skips_triton_only_below_its_threshold():
+    assert _router(0.01).skip_triton(64, 64, 64, 10.0) == (True, 0.01)
+    skip, p = _router(0.30).skip_triton(64, 64, 64, 10.0)
+    assert skip is False and p == 0.30
+    from tune.router import FEATURES, features
+    assert len(features(64, 4096, 11008, 120.0)) == len(FEATURES)
+
+
+def test_router_is_on_only_when_the_bundle_does_not_serve_the_kernels(tmp_path, fake_search, monkeypatch):
+    import kernels.bundle as bundle
+    rt = _router(0.3)
+    monkeypatch.setattr("tune.router.router", lambda stem=None: rt)
+    kw = dict(use_bundle=True, lt_n=4)
+    monkeypatch.setattr(bundle, "install", lambda *a, **k: {"installed": True, "matches": True})
+    online.select_kernel(None, 64, 64, 64, cache=None, **kw)                       # bundle serves Triton: router off in auto
+    monkeypatch.setattr(bundle, "install", lambda *a, **k: {"installed": True, "matches": False, "mismatch": ["triton"]})
+    online.select_kernel(None, 64, 64, 65, cache=None, **kw)                       # bundle built for another Triton: compiles are real
+    monkeypatch.setattr(bundle, "install", lambda *a, **k: {"installed": False, "reason": "no bundle"})
+    online.select_kernel(None, 64, 64, 66, cache=None, **kw)
+    online.select_kernel(None, 64, 64, 67, cache=None, use_bundle=False, lt_n=0)   # Triton-only search: nothing to route
+    online.select_kernel(None, 64, 64, 68, cache=None, use_bundle=False, lt_n=4, router=False)
+    assert fake_search.router == [None, rt, rt, None, None]
+    monkeypatch.setattr(bundle, "install", lambda *a, **k: {"installed": True, "matches": True})
+    online.select_kernel(None, 64, 64, 69, cache=None, router=True, **kw)          # forced on even with a serving bundle
+    assert fake_search.router[-1] is rt

@@ -93,3 +93,15 @@ def test_ranker_features_shape_and_split_k_handling():
     i = FEATURES.index("k_per_split")
     assert f[0, i] == 10359 and f[1, i] == pytest.approx(10359 / 8)
     assert np.isnan(f[2, FEATURES.index("ctas_a")])                 # no tile dimensions -> unknown fill, not zero
+
+
+def test_choose_ranks_by_the_confirmed_time_when_present():
+    def c(key, us, conf=None):
+        x = {"config_key": key, "valid": True, "cold_us": us, "compile_s": 0.0, "time_s": 0.0, "family": "cublaslt"}
+        if conf is not None:
+            x["confirm_us"] = conf
+        return x
+    # a was fastest in the first pass only because it was timed first; the mean of both timings puts b ahead
+    cands = [c("a", 100.0, 106.0), c("b", 102.0, 103.0), c("c", 130.0, 130.0)]
+    assert online.choose(cands, 0, None)["key"] == "b"
+    assert online.choose([c("a", 100.0), c("b", 102.0)], 0, None)["key"] == "a"        # no confirmation: the first pass decides

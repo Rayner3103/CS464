@@ -200,7 +200,7 @@ def cmd_online(args):
     from tune.online import KPolicy
     policy = KPolicy(args.k, args.k_frequent, args.frequent_calls) if args.k_frequent else None
     path = run(_shapes(args.suite, args.shapes_file), Path(args.ranker or args.out / "lgbm_rank"), args.out, k=args.k,
-               dtype=args.dtype, order=args.order, out_name=out_name, session_id=args.session, lt_n=args.lt_n, lt_knn=args.lt_knn, lt_rank=args.lt_rank, policy=policy)
+               dtype=args.dtype, order=args.order, out_name=out_name, session_id=args.session, lt_n=args.lt_n, lt_knn=args.lt_knn, lt_rank=args.lt_rank, use_router=args.router, router_threshold=args.router_threshold, confirm=args.confirm, policy=policy)
     print(f"online -> {path}")
 
 
@@ -361,6 +361,14 @@ def main(argv=None):
     p.add_argument("--lt-rank", type=int, default=0,
                    help="with --lt-n: also time the M configs a learned cuBLASLt ranker (data/<hw>/lt_rank, baselines/cublaslt_rank.py) "
                         "predicts fastest among all valid configs; default 0 = off")
+    p.add_argument("--router", action="store_true",
+                   help="with --lt-n: time the cuBLASLt candidates first and skip the Triton half when the family router "
+                        "(tune/router.py) says Triton cannot win; recorded per shape in `router`")
+    p.add_argument("--router-threshold", type=float, default=None,
+                   help="override the router's skip threshold (0 = cuBLASLt first, never skip: the ordering control)")
+    p.add_argument("--confirm", type=int, default=0,
+                   help="re-time the N fastest candidates in reverse order after the pass and rank them by the mean of both "
+                        "timings (cancels the timing-order bias); default 0 = off")
     p.add_argument("--out-name", default=None, help="default online_lgbm_rank[_diverse].jsonl (online_joint_* with --lt-n)")
     p.add_argument("--fresh-cache", action="store_true", help="compile into an empty TRITON_CACHE_DIR under --out")
 
