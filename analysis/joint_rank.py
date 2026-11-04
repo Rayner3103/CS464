@@ -114,7 +114,7 @@ def main(argv=None):
     ref = rc.references(cold, hot)
     shapes = sorted(ref)
     small = np.array([ref[s]["small"] for s in shapes]); eps = np.where(small, 1.05, 1.02)
-    ORC, B3P = np.array([ref[s]["orc"] for s in shapes]), np.array([ref[s]["b3p"] for s in shapes])
+    ORC, B3P = np.array([ref[s]["orc_x"] for s in shapes]), np.array([ref[s]["b3p"] for s in shapes])
     rows = {(r["M"], r["N"], r["K"]): r for r in map(json.loads, open(d / a.online))}
 
     scored = {}

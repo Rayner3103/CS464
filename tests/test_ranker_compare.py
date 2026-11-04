@@ -48,3 +48,15 @@ def test_references_scores_and_paired(tmp_path):
     p = summary["paired"]["top-3 + LT16"]
     assert p["n"] == 2 and p["b_faster"] == 2 and p["geomean_ratio"] < 1     # v2 faster than v1 on both shapes
     assert "Paired: v2 vs v1" in out.read_text()
+
+
+def test_extended_oracle_sees_proposals():
+    """`orc_x` also covers k-NN / ranker proposals timed in the session, so a pool that picks one cannot get negative regret; `orc` is unchanged."""
+    s = (4096, 4096, 4096)
+    d = {s: {"tri": {"t0": 1000.0}, "lth": {"h0_a": 1000.0, "h1_a": 950.0}, "ltd": {"d0": 900.0},
+             "ltk": {"n0_a": 920.0}, "ltr": {"r0_a": 880.0, "r1_a": 940.0}}}
+    ref = rc.references(d, {})
+    assert ref[s]["b3p"] == 900.0 and ref[s]["orc"] == 900.0 and ref[s]["orc_x"] == 880.0
+    d[s]["ltr"] = {}
+    d[s]["ltk"] = {}
+    assert rc.references(d, {})[s]["orc_x"] == 900.0                       # no proposals timed: identical to orc

@@ -4,7 +4,7 @@ Every chosen config is looked up at its full-protocol time in ONE stage-2 sessio
 picks together with the baselines (torch, `triton:sweep:8`, `cublaslt:16`, `cublaslt_deep:20`), so the comparison is not
 confounded by session noise: cold times for shapes whose fastest candidate is >= 50 us, CUDA-graph amortized times
 below. References: B2 = cuBLASLt heuristic rank 0, B3 = best heuristic candidate, B3+ = best of B3 and the 20 s search;
-the joint oracle = best of every Triton config timed in that session and B3+. Ties are within EPS (5% below 50 us, 2% above).
+the joint oracle = best of every Triton config timed in that session, B3+ and any k-NN / ranker proposal the session timed (`orc_x`). Ties are within EPS (5% below 50 us, 2% above).
 
     python -m analysis.ranker_compare --data data/<hw> --online v1=online_joint_diverse.jsonl v2=online_joint_diverse_v2.jsonl
 """
@@ -45,6 +45,9 @@ def references(cold: dict, hot: dict) -> dict:
         out[s] = {"small": small, "b2": next(t for k, t in src["lth"].items() if k.startswith("h0_")), "b3": lth,
                   "b3p": min(lth, ltd), "tri_orc": min(src["tri"].values()), "src": src}
         out[s]["orc"] = min(out[s]["tri_orc"], out[s]["b3p"])
+        # extended oracle: also every k-NN / learned-ranker proposal the session timed (empty in sessions that did not time them).
+        # A pool that picks a proposal is otherwise scored against an oracle that cannot see it (negative regret).
+        out[s]["orc_x"] = min(out[s]["orc"], min(src["ltk"].values(), default=np.inf), min(src["ltr"].values(), default=np.inf))
     return out
 
 
@@ -86,7 +89,7 @@ def score(online: Path, ref: dict, cold: dict) -> dict:
     names_ = list(ct)
     shapes = ct[names_[0]]["shapes"]
     small = np.array([ref[s]["small"] for s in shapes])
-    R = {k: np.array([ref[s][k] for s in shapes]) for k in ("b2", "b3", "b3p", "orc", "tri_orc")}
+    R = {k: np.array([ref[s][k] for s in shapes]) for k in ("b2", "b3", "b3p", "orc", "orc_x", "tri_orc")}
     groups = {"all": (np.ones(len(small), bool), EPS["small"]), "< 50 us": (small, EPS["small"]), ">= 50 us": (~small, EPS["large"])}
     out = {}
     for name in names_:
@@ -98,7 +101,7 @@ def score(online: Path, ref: dict, cold: dict) -> dict:
             for ref_name in ("b2", "b3", "b3p"):
                 q = (t / R[ref_name])[m]
                 e[ref_name] = {**stats(q), "faster": int((q < 1 / eps).sum()), "slower": int((q > eps).sum())}
-            e["regret_joint"] = stats(t[m] / R["orc"][m] - 1)
+            e["regret_joint"] = stats(t[m] / R["orc_x"][m] - 1)
             e["regret_triton"] = stats(t[m] / R["tri_orc"][m] - 1)
             out[name][g] = e
     return {"scores": out, "times": {n: ct[n]["t"] for n in names_}, "shapes": shapes, "small": small.tolist()}

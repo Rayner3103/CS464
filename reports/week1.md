@@ -4,7 +4,126 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-11-04 (audit): the joint-search tables rescored against an oracle that sees the proposals — ranker top-5 is 0.5% / 5.5% / 1.4%, not 0.4% / 4.7% / 1.2%; its win over the heuristic stands, its win over k-NN8 is not shown
+
+**Why.** An audit of every number quoting the ranker's win (re-running `analysis.ranker_compare`, `lt_rank_ab`, `lt_knn_ab`, `confirm_ab` on the stored rows: all reproduce the earlier reports exactly) found one scoring flaw. The "joint oracle" of `lt_rank_ab`, `confirm_ab`, `analysis.router` and `analysis.joint_rank` was the best Triton config of the session and B3+. The stage-2 session also times the k-NN proposals and the learned ranker's top-16 (`cublaslt_knn:8`, `cublaslt_rank:16`), and those configs were not in the oracle, so a pool that picked one was scored against an oracle that cannot see it: **negative regret on 4 shapes for the ranker top-5 (worst −2.5%), 4 for k-NN8 (worst −4.9%)**. `lt_knn_ab` already printed an extended oracle next to the old one; the other scripts did not. The extended oracle (`orc_x` in `analysis.ranker_compare.references`) is now the one every script uses; it differs from the old one on 12 of 86 shapes and equals it in sessions that timed no proposals (`ranker_compare.md` is byte-identical). No measurement was re-run; this is a re-scoring of the same rows (cold `results_lock1755_rank16.jsonl`, graph `…_rank16_graph.jsonl`, online `online_joint_diverse_v2_knn8_rank16.jsonl`). `harness_dirty` is true on those rows, as before.
+
+**Corrected held-out table** (`python -m analysis.lt_rank_ab`; v2 top-3 + heuristic LT16 + the named proposals; regret vs the extended oracle, median / p95 / mean; the old value, vs the oracle without proposals, in brackets for the rows that moved):
+
+| pool | all | ≥ 50 µs (n = 30) | < 50 µs (n = 56) | shapes > 5% / > 10% off | vs B3+ faster / slower | first-use cost |
+|---|---|---|---|---|---|---|
+| heuristic top-16 only | 0.7% / 11.7% / 2.8% (0.6 / 11.6 / 2.6) | 0.6 / 14.0 / 3.1 | 0.7 / 10.9 / 2.7 | 14 / 7 (12 / 7) | 22 / 17 | 0.66 s |
+| + k-NN8 | 0.6% / 6.9% / 1.7% (0.6 / 6.8 / 1.6) | 0.5 / 5.3 / 1.6 | 0.7 / 7.2 / 1.8 | 9 / 0 | 23 / 13 | 0.77 s |
+| **+ ranker top-5** | **0.5% / 5.5% / 1.4%** (0.4 / 4.7 / 1.2) | 0.4 / 5.0 / 1.4 | 0.6 / 5.2 / 1.3 | **5** / 0 (4 / 0) | 23 / **7** | 0.80 s |
+| + ranker top-10 | 0.5% / 5.5% / 1.4% | same | same | 5 / 1 | 23 / 7 | 0.85 s |
+| + ranker top-16 | 0.5% / 5.5% / 1.3% | same | same | 5 / 1 | 23 / 7 | 0.92 s |
+| + k-NN8 + ranker top-5 | 0.5% / 4.7% / 1.3% (0.5 / 4.7 / 1.1) | 0.5 / 3.7 / 1.1 | 0.6 / 5.2 / 1.3 | 4 / 0 | 24 / 8 | 0.90 s |
+
+The "> 10%" column is on a knife edge: the top-5 and top-10 pools pick the same config on 68×6420×10359, which is 9.93% off in one and 10.06% in the other. Read "0 vs 1" as no difference. A fifth shape is now > 5% off for the ranker (1×709×521, 7.4%; the old oracle hid it because the best time there is a proposal that was timed in stage 2 but not chosen, which the old oracle could not see). The shapes still > 5% off: 68×6420×10359 10.1%, 226×2141×1139 8.2%, 1×709×521 7.4%, 1316×272×100 6.8%, 2048×4096×11008 5.7%.
+
+**Is the ranker's win real?** Paired bootstrap of the regret difference a − b over the 86 shapes (4000 resamples, 95% interval, points; new in `lt_rank_ab`):
+
+| a − b | mean | p95 |
+|---|---|---|
+| k-NN8 − heuristic | −1.08 [−1.96, −0.35] | −5.65 [−13.9, −1.2] |
+| **ranker top-5 − heuristic** | **−1.44 [−2.44, −0.65]** | **−6.81 [−13.8, −1.7]** |
+| ranker top-5 − k-NN8 | −0.35 [−0.82, +0.09] | −1.16 [−3.35, +1.26] |
+| k-NN8 + ranker top-5 − k-NN8 | −0.45 [−0.81, −0.16] | −1.82 [−3.56, −0.03] |
+
+- **Ranker vs the heuristic joint search: a real win**, in the mean and in the tail (also the paired time ratio 0.987 [0.978, 0.994], 11 faster / 1 slower).
+- **Ranker alone vs k-NN8: not shown.** Both intervals include 0; the earlier "p95 4.7% vs 6.8%" is 5.5% vs 6.9% on the extended oracle, and the p95 of 86 shapes is the 4th-5th worst shape. The case for the ranker over k-NN rests on the tune cross-validation (78% vs 71% of the gap closed at ~10 candidates) and on the shapes > 5% off (5 vs 9), not on a held-out mean.
+- **The union is better than k-NN8 alone** (mean −0.45 [−0.81, −0.16], p95 borderline), at +0.13 s; shipping the ranker only is a cost choice, not a measured quality choice.
+- Gap recovery against the earlier ceiling (heuristic + the best deep config: 0.4% mean / 2.4% p95, measured in another session): ranker 58% of the mean gap and 67% of the p95 gap (was 64% / 75%), k-NN8 46% / 52% (was 45% / 52%). The ceiling comes from a different session and oracle, so these are indicative.
+
+**Where the win over cuBLAS is** (geometric-mean time ratio to B3+ of the chosen config; shapes faster / slower by the tie margin):
+
+| pool | all (86) | ≥ 50 µs (30) | < 50 µs (56, graph-amortized) |
+|---|---|---|---|
+| heuristic top-16 | 0.981, 22 / 17 | 1.016, 3 / 10 | 0.963, 19 / 7 |
+| + k-NN8 | 0.972, 23 / 13 | 1.002, 3 / 7 | 0.956, 20 / 6 |
+| + ranker top-5 | 0.968, 23 / 7 | **1.001, 4 / 6** | 0.951, 19 / 1 |
+
+At ≥ 50 µs the ranker pool ties B3+ (G4 unchanged); the advantage over B3+ sits in the 56 sub-50 µs shapes, which are graph-timed with the assumed 5% margin and have no graph-mode noise study (§9 item 4). The "faster than B2 / B3 on 49 / 30 shapes, slower on 0" counts of `ranker_compare.md` are partly by construction (B2 and B3's candidates are in the pool); the ranker's own contribution is the paired comparison above.
+
+**Router and confirmation tables, rescored** (`python -m analysis.confirm_ab`, same runs and pools as the evening entry; the paired time ratios, the skipped counts and the costs are unchanged because they do not use the oracle):
+
+| run | regret median / p95 / mean (old) | shapes > 5% / > 10% | slower than B3+ |
+|---|---|---|---|
+| reference: Triton first, no router, no confirm | 0.5 / 5.5 / 1.4 (0.4 / 4.7 / 1.2) | 5 / 0 (4 / 0) | 7 |
+| router, no confirm | 0.6 / 7.3 / 1.8 (0.5 / 6.7 / 1.7) | 8 / 1 (7 / 1) | 9 |
+| LT first, never skip, no confirm | 0.6 / 7.3 / 1.7 (0.6 / 6.5 / 1.5) | 8 / 0 (7 / 0) | 9 |
+| A: Triton first, confirm 3 | 0.6 / 5.1 / 1.3 (0.5 / 4.5 / 1.2) | 5 / 0 (4 / 0) | 6 |
+| B: LT first, never skip, confirm 3 | 0.6 / 6.4 / 1.5 (0.6 / 4.7 / 1.4) | 5 / 0 (4 / 0) | 7 |
+| **C: router, confirm 3** | **0.4 / 4.9 / 1.3** (0.3 / 4.6 / 1.1) | **4** / 0 (3 / 0) | **5** |
+
+Conclusions of the evening entry are unchanged: the router with confirmation is quality-neutral (C vs A worse on 0, better on 1) and saves 0.10 s (−13%) without the bundle; the cuBLASLt-first order bias is still there (B vs A: worse on 3, better on 1). `analysis.router score` (simulation, never skip → router at the rule threshold): 0.5 / 5.5 / 1.4% → 0.5 / 4.7 / 1.3%. The single-score negative result (`analysis.joint_rank`) is unchanged in kind: fixed pool 0.5 / 5.5 / 1.4% (5 / 0 shapes) against joint top-10 0.8 / 9.1 / 2.4% (7 / 4), top-16 0.6 / 8.1 / 2.2% (6 / 4), top-24 0.6 / 5.5 / 1.4% (5 / 1).
+
+**Other items from the audit.**
+- *Triton-only ranker vs the trivial selectors.* The held-out win holds (screen, top-1: 3.6 / 18.1 / 5.5% for lgbm_rank vs 4.1 / 27.3 / 7.8% for knnf and 48 / 487 / 114% for b6). But the headline top-3 numbers compare a search that compiles and short-times 3 candidates (~0.4 s) with a zero-cost lookup; the equal-budget comparison is top-1, where the medians tie (2.4% vs 2.5%) and the gain is in the tail and mean. A rough paired recomputation from `results_lock1755_topki*.jsonl` (not the report's exact oracle, so only the direction is meaningful) gave a geometric-mean time ratio lgbm top-1 / knnf of about 0.97, interval about [0.95, 0.99], faster on 23 shapes and slower on 8 by 5%; it is not part of `learned_topk.md` and should be produced by the harness before it is quoted. The Triton-only selector is still slower than B3+ on 35 of 86 shapes (v2).
+- *Session spread.* The same Triton diverse top-3 reads 1.0 / 9.9 / 2.7% (`topkd` session, quoted in AGENTS.md) and 1.1 / 9.1 / 2.6% (`topki`, the current `learned_topk.md`); the heuristic-only joint pool reads p95 10.4%, 10.7%, 11.6% in three sessions. A/B differences are valid within one session; a difference of 0.1-0.2 points in a median is noise (about 10% of online picks change between identical runs).
+- *Held-out use in choices.* Tune CV named the ranker top-10 the primary pool; shipping top-5 was chosen after the held-out table showed top-5, 10 and 16 equal. The tail suite excluded every shape sharing two dimensions with a held-out shape, the cuBLASLt screen did not (73 of its 652 shapes share two positional dimensions with one); neither fit read a held-out label.
+- *Leakage checked:* `lt_screen` shapes ∩ held-out = 0; tail ∩ held-out = 0; `lt_search` holds the held-out shapes only as the B3+ baseline (the k-NN table reads the tune ones, asserted by a test).
+
+**Changed.** `analysis/ranker_compare.py` (`orc_x`), `analysis/lt_rank_ab.py` (extended oracle as the headline, old oracle shown once, regret bootstrap, speed by size), `analysis/confirm_ab.py`, `analysis/router.py`, `analysis/joint_rank.py` (all score against `orc_x`), `tests/test_ranker_compare.py` (one new test). Earlier entries below keep their original tables; where they quote a regret against the old oracle they carry a pointer to this entry.
+
+**Reproduce** (CPU only):
+```bash
+D=data/rtx3080_sm86_68sms_10gb
+python -m analysis.lt_rank_ab --data $D && python -m analysis.confirm_ab --data $D
+python -m analysis.router score --data $D --model $D/router && python -m analysis.joint_rank --data $D
+python -m analysis.ranker_compare --data $D --online v1=online_joint_diverse.jsonl v2=online_joint_diverse_v2.jsonl   # unchanged
+```
+
+## Update 2026-11-05: the shipped selector on 60 fresh shapes — the learned cuBLASLt ranker and the router replicate, and the ranking heuristic < k-NN < ranker holds
+
+**Why.** Every choice behind the learned cuBLASLt ranker, the router and the confirmation pass was evaluated on the same 86 held-out shapes (the router's threshold and the ranker's model were fixed from tune data, but the pool comparisons and the order-bias finding were read off held-out). A fresh set tests the frozen systems on shapes nothing was fit, screened, selected or reported on.
+
+**The set** (`python -m suites.fresh`, seed 465, `suites/fresh/fresh465.json`, split `fresh`): 30 `fresh_random` shapes (log-uniform M, N, K in [1, 16384], like S7) and 30 `fresh_llm` shapes (linear-layer dimensions of Qwen2-7B, Gemma-2-9B, Phi-3-mini, Mistral-Nemo-12B and Yi-6B, none in S2, with token counts {3, 24, 96, 300, 1000, 3000, 6000}, none in S2's list). Each shape is in no `suites/v1` suite, shares two of M, N, K with **no tune-split shape** (the grouping the cross-validation uses) and is ≤ 1200 GFLOP, so a Triton screen oracle exists as for the held-out shapes; `tests/test_fresh_suite.py` asserts this. The set was generated before any result on it existed. **Nothing was refit, re-thresholded or re-chosen**: v2 Triton ranker, learned cuBLASLt ranker (top-5), k-NN proposals (8 x 2), router (threshold 0.02) and `confirm = 3` are exactly the shipped objects.
+
+**What ran.** Triton oracle: `tune sweep --shapes-file suites/fresh/fresh465.json --screen-dir sweep_screen_fresh` (60 shapes, 4,828 s, 0 skipped). Four online runs (v2 diverse k = 5, heuristic top-16): `online_fresh_all` (+ k-NN8 + ranker top-16, tagged, `20261105-000806-3ddb28`), `online_fresh_confirm3` (Triton first, `…-000957-ccbe89`), `online_fresh_router0_confirm3` (cuBLASLt first, never skip, `…-001123-863cb7`), `online_fresh_router_confirm3` (the shipped router configuration, `…-001251-7f3bd0`). ONE stage-2 session times every candidate (`torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20,cublaslt_knn:8,cublaslt_rank:16`): cold `results_lock1755_fresh.jsonl` `20261105-001429-7498f1` (3,117 rows, 0 invalid, 0 not converged, 52% power-capped) and graph `results_lock1755_fresh_graph.jsonl` `20261105-003339-1ac6d3` (31 shapes < 50 µs, 1,637 rows, 0 invalid, 50% power-capped). `harness_dirty` is true on every row, clock locked at 1755.
+
+**Pools** (`analysis.lt_rank_ab`; v2 top-3 Triton + heuristic top-16 + the named proposals; regret vs the joint oracle of the session = best Triton of the screen top-8 and the picks, and B3+; each pick looked up at its stage-2 time):
+
+| pool | regret median / p95 / mean | shapes > 5% / > 10% off | slower than B3+ | `fresh_random` p95 | `fresh_llm` p95 |
+|---|---|---|---|---|---|
+| heuristic top-16 only | 1.0% / 17.4% / 3.3% | 9 / 4 | 14 | 6.2% | 17.7% |
+| + k-NN8 | 1.0% / 6.7% / 2.5% | 7 / 2 | 13 | 5.0% | 13.0% |
+| **+ ranker top-5** (shipped) | **0.6% / 5.6% / 1.6%** | **4 / 1** | 10 | 5.0% | **7.4%** |
+| + k-NN8 + ranker top-5 | 0.6% / 5.6% / 1.6% | 4 / 1 | 11 | — | — |
+
+(The held-out numbers of the same pools: 0.6 / 11.6 / 2.6% → 0.6 / 6.8 / 1.6% → 0.4 / 4.7 / 1.2%; 12 / 9 / 4 shapes > 5% off.) Against the extended oracle that also contains the proposals (the proposals can then be the oracle): ranker top-5 0.7% / 5.6% / 1.8%. Paired geometric-mean time ratios (95% bootstrap): ranker top-5 vs heuristic only **0.9851 [0.9692, 0.9973]**, faster on 5 shapes, slower on 0; k-NN8 vs heuristic only 0.9922 [0.9813, 1.0005], 4 / 2; ranker top-10 vs k-NN8 0.9929 [0.9795, 1.0020], 4 / 1 (the interval contains 1, as on held-out). Top-5, 10 and 16 give the same online choice again. By group: the ranker's gain is concentrated on the LLM-layer shapes (p95 17.7% → 7.4%, mean 4.4% → 2.2%); on the random shapes both proposal sources reach the same 5.0% p95.
+
+**Against the vendor baselines** (shipped pool, speed = t_pick / t_baseline, < 1 faster; faster / slower by the tie margin): B2 median 0.924, p10 0.754, **42 / 1**; B3 median 0.981, 25 / 3; B3+ median 1.000, p10 0.871, 11 / 10 (≥ 50 µs: 1.007, < 50 µs: 0.998). Remaining misses (> 5% off the oracle): 96×5120×14336 (17.9%, the oracle is 16% faster than B3+ there), 24×1024×5120 (9.5%), 180×825×258 (6.7%), 469×15832×13 (5.5%). G4 is unchanged: nothing is faster than B3+ by more than the margin where the deep search is the bar.
+
+**Router and confirmation** (`analysis.confirm_ab`, same pools, ranker top-5, k = 3 choice): the router skipped 15 of 60 shapes.
+
+| run | regret median / p95 / mean | > 5% / > 10% | slower than B3+ | first-use cost (no bundle) | skipped |
+|---|---|---|---|---|---|
+| reference: Triton first, no router, no confirm | 0.7% / 5.6% / 1.8% | 4 / 1 | 10 | 0.954 s | 0 |
+| A: Triton first, confirm 3 | 0.5% / 5.6% / 1.7% | 5 / 1 | 9 | 1.005 s | 0 |
+| B: cuBLASLt first, never skip, confirm 3 | 0.8% / 6.4% / 1.9% | 5 / 1 | 7 | 1.020 s | 0 |
+| **C: router, confirm 3** | **0.5% / 5.2% / 1.6%** | 4 / 1 | 8 | **0.855 s (−10%)** | 15 |
+
+C vs the reference 0.9977 [0.9955, 0.9998] (worse on 1, better on 2); C vs A 0.9996 [0.9973, 1.0016] (1 / 1); C vs B 0.9977 [0.9951, 0.9999] (0 / 2); B vs A 1.0019 [0.9997, 1.0042] (the timing-order effect, worse on 2, better on 1, smaller than on held-out but the same direction). On the 15 skipped shapes the C / A time ratio has geometric mean 0.9978, worst 1.024 (6000×3072×8192: 5001 → 5121 µs, P(win) 0.012). The router's P(win) separates the shapes where Triton's oracle beats B3+ by more than the margin (12 of 60) with **AUC 0.861** (tune out-of-fold 0.823), and none of the 15 skipped shapes was one of them.
+
+**Reading.** All three results replicate on shapes none of the models, thresholds or conclusions had seen: the ranker beats the heuristic-only pool with a paired interval that excludes 1 and is better than k-NN8 on the tail but not significantly in the mean; the router at the rule threshold saves ~10% of the no-bundle first-use cost at no measurable quality cost; the confirmation pass keeps the ordering effect small. The tail is a little heavier than on held-out (p95 5.6% vs 4.7%, one shape > 10% off vs none), mostly one large LLM-layer shape. **Limits.** 60 shapes (31 graph-amortized), one GPU, harness dirty, ~50% of the stage-2 samples power-capped; the cost column is the no-bundle regime (where the router is on); the 3080's models are the only ones exercised.
+
+**Reproduce.**
+```bash
+python -m suites.fresh                                                    # suites/fresh/fresh465.json
+python -m tune --clock-lock 1755 sweep --shapes-file suites/fresh/fresh465.json --screen-dir sweep_screen_fresh
+# online: all (--lt-knn 8 --lt-rank 16), confirm3 (--lt-rank 5 --confirm 3), router0_confirm3 (+ --router --router-threshold 0), router_confirm3 (+ --router)
+#   python -m tune --clock-lock 1755 online --shapes-file suites/fresh/fresh465.json --ranker $D/lgbm_rank_v2 --k 5 --order diverse --lt-n 16 --fresh-cache --out-name online_fresh_<name>.jsonl ...
+# stage 2: TUNE_SWEEP_DIR=$D/sweep_screen_fresh TUNE_PICKS=$D/fresh_stage2_picks.json (union of the runs' Triton candidates), backends as above;
+#   cold on the whole file, graph (--cache-modes hot --graph-batch 50) on the shapes with a best time < 50 us
+python -m analysis.lt_rank_ab --online online_fresh_all.jsonl --results results_lock1755_fresh.jsonl --graph-results results_lock1755_fresh_graph.jsonl
+python -m analysis.confirm_ab --reference online_fresh_all.jsonl --results results_lock1755_fresh.jsonl --graph-results results_lock1755_fresh_graph.jsonl \
+  --run "A: Triton first, confirm 3=online_fresh_confirm3.jsonl" --run "B: LT first, never skip, confirm 3=online_fresh_router0_confirm3.jsonl" --run "C: router, confirm 3=online_fresh_router_confirm3.jsonl"
+```
+
 ## Update 2026-11-04 (evening): a cost-only family router works once the timing-order bias is cancelled; a single additive score across families does not
+
+*Regret figures in this entry are against the oracle without the proposals; the extended-oracle values are in the audit entry above (reference 0.5 / 5.5 / 1.4%, C 0.4 / 4.9 / 1.3%).*
 
 **Questions.** (1) Can the Triton half of the online search (rank, compile or bundle load, validate, time) be skipped when cuBLASLt is clearly ahead? (2) Can one score on one scale rank Triton and cuBLASLt candidates together, so that a joint top-m pool replaces the fixed pool (3 Triton + heuristic 16 + learned-ranker 5)?
 
@@ -43,6 +162,8 @@ python -m analysis.joint_rank                                                   
 (The picks of every run are looked up in the stage-2 session of the previous entry; no new stage 2 was needed because the pools are subsets of the candidates it timed.)
 
 ## Update 2026-11-04 (later): a learned ranker over all valid cuBLASLt configs beats the k-NN proposals — joint search regret p95 11.6% → 4.7%, 7 shapes slower than B3+ (was 17)
+
+*Audit correction (entry above): against an oracle that includes the proposals' own timings the held-out row for the ranker top-5 reads 0.5% / 5.5% / 1.4% (not 0.4 / 4.7 / 1.2) and the heuristic row 0.7 / 11.7 / 2.8. The win over the heuristic holds; the ranker's edge over k-NN8 is not significant (mean −0.35 [−0.82, +0.09] points, p95 −1.2 [−3.4, +1.3]).*
 
 **What ran.** (1) A full per-config screen of the 652 tune-split shapes (`python -m baselines.cublaslt_screen`, session log `data/<hw>/logs/lt_screen.log`, 4,266 s, 1,291,554 (shape, config) rows, 624 of 652 shapes screened completely within the 40 s budget; hot-L2 screen timing, 1.0 µs grid, clock lock 1755 declared). (2) A LightGBM regressor of log(t / t_best_of_shape) per (shape, config) on those rows (`python -m analysis.lt_rank`; features: shape, config parameters with algo / tile / stages as categoricals, CTA count / padding / waves from the tile dimensions in both orientations, K per split; near-top rows weighted 3x; 300 rounds, no tuning). (3) The held-out run: the v2 Triton ranker's top-3 + the heuristic top-16 + the k-NN proposals (8 x 2) + the learned ranker's top-16 in one short-timed pool (`online_joint_diverse_v2_knn8_rank16.jsonl`, session `20261104-193204-66b37b`, 86 shapes), then ONE stage-2 session that times every candidate: cold `results_lock1755_rank16.jsonl` `20261104-193409-429243` (86 shapes, 4,828 rows incl. 1,376 ranker rows, 0 invalid, 7 not converged, 34% power-capped) and graph `results_lock1755_rank16_graph.jsonl` `20261104-194744-a4fa21` (56 shapes < 50 µs, 0 invalid, 46% power-capped). `harness_dirty` is true on every row (uncommitted changes), clock locked at 1755, driver 595.99.02.
 

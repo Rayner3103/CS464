@@ -7,7 +7,8 @@ below 50 us), so the pools share the run's timing noise and differ only in what 
 time in the stage-2 session that timed everything (`cublaslt_knn:8`, `cublaslt_rank:16`, `cublaslt_deep:20`, ...). A proposal's key carries its
 rank among the kept proposals, which differs between the online run and stage 2, so it is matched on its config part.
 
-Prints, per pool: regret vs the joint oracle (every Triton config of the session and B3+), speed vs B3+, shapes > 5% / > 10% off, the first-use
+Prints, per pool: regret vs the joint oracle (every Triton config of the session, B3+ and every k-NN / ranker proposal the session timed: the
+extended oracle `orc_x`; the oracle without the proposals is printed once for comparison, it gives a pool that picks a proposal negative regret), speed vs B3+, shapes > 5% / > 10% off, the first-use
 cost (compile + timing of the pool's candidates + ranking) and paired comparisons.
 
     python -m analysis.lt_rank_ab [--results results_lock1755_rank16.jsonl --graph-results ..._graph.jsonl --online online_joint_diverse_v2_knn8_rank16.jsonl]
@@ -95,9 +96,9 @@ def main(argv=None):
     shapes = sorted(ref)
     small = np.array([ref[s]["small"] for s in shapes])
     eps = np.where(small, 1.05, 1.02)
-    B3, B3P, ORC = (np.array([ref[s][k] for s in shapes]) for k in ("b3", "b3p", "orc"))
+    B3, B3P, ORC, ORC0 = (np.array([ref[s][k] for s in shapes]) for k in ("b3", "b3p", "orc_x", "orc"))
     rows = {(r["M"], r["N"], r["K"]): r for r in map(json.loads, open(D / a.online))}
-    print(f"n = {len(shapes)} held-out shapes ({small.sum()} graph-amortized); joint oracle = best Triton of the session and B3+")
+    print(f"n = {len(shapes)} held-out shapes ({small.sum()} graph-amortized); joint oracle = best Triton of the session, B3+ and every proposal timed (extended); the old one without proposals differs on {(ORC < ORC0 / 1.0001).sum()} shapes")
 
     # proposer ceilings: the best config each source proposes, full protocol
     for lab, fam in (("k-NN8 proposals", "ltk"), ("ranker top-16", "ltr")):
@@ -127,6 +128,31 @@ def main(argv=None):
         print(f"{label:26s} {st(g):>22s} {st(g[~small]):>22s} {st(g[small]):>22s} | {(g > 0.05).sum():3d} {(g > 0.10).sum():3d} | "
               f"{(t < B3P / eps).sum():3d} / {(t > B3P * eps).sum():2d}            | {cost.mean():.2f}s {100 * np.mean(fam == 'cublaslt_knn'):3.0f}% / {100 * np.mean(fam == 'cublaslt_rank'):3.0f}%")
 
+    print("\n== the same, against the oracle WITHOUT the proposals (the earlier reports): negative regret = the pool picked a config the oracle cannot see ==")
+    for label, _, _ in POOLS:
+        g0 = res[label][0] / ORC0 - 1
+        print(f"{label:26s} {st(g0):>22s} | >5% {(g0 > 0.05).sum():3d} >10% {(g0 > 0.10).sum():3d} | shapes with negative regret {(g0 < -1e-9).sum():2d}, worst {100 * g0.min():5.1f}%")
+
+    print("\n== paired bootstrap of the regret difference a - b (points; 4000 resamples of the shapes, 95% interval): mean and p95 ==")
+    rb = np.random.default_rng(1)
+    def regret_diff(a_lab, b_lab):
+        ga, gb = res[a_lab][0] / ORC - 1, res[b_lab][0] / ORC - 1
+        ix = rb.integers(0, len(ga), (4000, len(ga)))
+        dm = 100 * (ga[ix].mean(1) - gb[ix].mean(1))
+        dp = 100 * (np.percentile(ga[ix], 95, axis=1) - np.percentile(gb[ix], 95, axis=1))
+        f = lambda x: f"{x.mean():+6.2f} [{np.percentile(x, 2.5):+6.2f}, {np.percentile(x, 97.5):+6.2f}]"
+        print(f"  {a_lab:26s} - {b_lab:22s} mean {f(dm)}   p95 {f(dp)}")
+    regret_diff("+ kNN8 proposals", "heuristic LT16 only")
+    regret_diff("+ ranker top-5", "heuristic LT16 only")
+    regret_diff("+ ranker top-5", "+ kNN8 proposals")
+    regret_diff("+ kNN8 + ranker top-5", "+ kNN8 proposals")
+
+    print("\n== speed vs B3+ by size (geometric-mean ratio; faster / slower by the margin) ==")
+    for label in ("heuristic LT16 only", "+ kNN8 proposals", "+ ranker top-5"):
+        t = res[label][0]
+        for nm, m in (("all", np.ones_like(small)), (">= 50 us", ~small), ("< 50 us", small)):
+            print(f"  {label:22s} {nm:9s} n={m.sum():2d}  {np.exp(np.log(t[m] / B3P[m]).mean()):.3f}   {(t[m] < B3P[m] / eps[m]).sum():2d} / {(t[m] > B3P[m] * eps[m]).sum():2d}")
+
     print("\n== paired: geometric-mean time ratio (a / b), 95% bootstrap interval, shapes a faster / slower than b by the margin ==")
     base = res["heuristic LT16 only"][0]
     rng = np.random.default_rng(0)
@@ -143,7 +169,7 @@ def main(argv=None):
     paired(res["+ kNN8 + ranker top-10"][0], res["+ kNN8 proposals"][0], "+ kNN8 + ranker top-10 vs + kNN8")
     paired(res["+ kNN8 + ranker top-5"][0], res["+ kNN8 proposals"][0], "+ kNN8 + ranker top-5 vs + kNN8")
 
-    print("\n== shapes still > 10% off the joint oracle with + ranker top-10 ==")
+    print("\n== shapes still > 5% off the joint oracle with + ranker top-10 ==")
     t = res["+ ranker top-10"][0]
     for i in np.argsort(-(t / ORC))[:6]:
         if t[i] / ORC[i] - 1 > 0.05:
