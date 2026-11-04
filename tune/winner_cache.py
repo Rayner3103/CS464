@@ -90,21 +90,23 @@ class WinnerCache:
     def __len__(self) -> int:
         return len(self._rows)
 
-    def get(self, M: int, N: int, K: int, dtype: str = "fp16", *, k: int = 1, lt_n: int = 0) -> dict | None:
-        """The stored entry if its search was at least as wide as (k, lt_n), else None."""
+    def get(self, M: int, N: int, K: int, dtype: str = "fp16", *, k: int = 1, lt_n: int = 0, lt_knn: int = 0,
+            lt_rank: int = 0) -> dict | None:
+        """The stored entry if its search was at least as wide as (k, lt_n, lt_knn), else None (entries written before the
+        kNN proposals existed have lt_knn 0)."""
         r = self._rows.get(self._key(M, N, K, dtype))
-        if r is None or r["k"] < k or r["lt_n"] < lt_n:
+        if r is None or r["k"] < k or r["lt_n"] < lt_n or r.get("lt_knn", 0) < lt_knn or r.get("lt_rank", 0) < lt_rank:
             return None
         return r
 
     def put(self, M: int, N: int, K: int, dtype: str, *, k: int, lt_n: int, choice: dict, candidates: list[dict] | None = None,
-            order: str | None = None, ranker: str | None = None) -> dict | None:
+            order: str | None = None, ranker: str | None = None, lt_knn: int = 0, lt_rank: int = 0) -> dict | None:
         """Store a search result's winner. Searches that found no valid kernel are not stored. Returns the entry."""
         if not choice or choice.get("key") is None:
             return None
         win = next((c for c in (candidates or []) if c.get("config_key") == choice["key"]), {})
         row = {"schema": SCHEMA, "env": self.env, "M": int(M), "N": int(N), "K": int(K), "dtype": dtype, "k": int(k),
-               "lt_n": int(lt_n), "order": order, "ranker": ranker,
+               "lt_n": int(lt_n), "lt_knn": int(lt_knn), "lt_rank": int(lt_rank), "order": order, "ranker": ranker,
                "choice": {x: choice.get(x) for x in ("key", "family", "mode", "rank", "compile_s", "time_s")},
                "winner_us": win.get("graph_us") if choice.get("mode") == "graph" else win.get("cold_us"),
                "timestamp": time.time()}
@@ -130,5 +132,8 @@ def backend_for(choice: dict, M: int, N: int, K: int, dtype=None, lt_n: int = 16
         from kernels.triton_matmul import TritonMatmul
         from tune.sweep import parse_key
         return TritonMatmul(parse_key(choice["key"]))
+    if choice.get("family") in ("cublaslt_knn", "cublaslt_rank"):
+        from baselines.cublaslt_knn import from_key
+        return from_key(choice["key"], M, N, K, dtype)
     from baselines.cublaslt import candidates as lt_candidates
     return next((c for c in lt_candidates(M, N, K, dtype, max(lt_n, 1)) if c.key == choice["key"]), None)

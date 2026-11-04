@@ -114,7 +114,7 @@ def test_kpolicy_k_for():
 
 
 def _fake_search(calls):
-    def fake(ranker, M, N, K, k, dtype, order, lt_n):
+    def fake(ranker, M, N, K, k, dtype, order, lt_n, lt_knn=0, lt_rank=0):
         calls.append((M, N, K, k, lt_n))
         c = [{"config_key": f"c{i}", "valid": True, "compile_s": 0.1, "time_s": 0.01, "cold_us": 100.0 - i, "graph_us": None}
              for i in range(k)]

@@ -20,10 +20,16 @@ def _cands(k=3, lt=0, winner=KEY):
 
 @pytest.fixture
 def fake_search(monkeypatch):
-    calls = []
+    class Calls(list):
+        knn: list
+    calls = Calls()
+    calls_knn = calls.knn = []
+    calls.rank = []
 
-    def fake(ranker, M, N, K, k, dtype, order, lt_n):
+    def fake(ranker, M, N, K, k, dtype, order, lt_n, lt_knn=0, lt_rank=0):
         calls.append((M, N, K, k, lt_n))
+        calls_knn.append(lt_knn)
+        calls.rank.append(lt_rank)
         return {"rank_s": 0.1, "candidates": _cands(k, lt_n)}
     monkeypatch.setattr(online, "search_shape", fake)
     return calls
@@ -107,7 +113,8 @@ def test_a_broken_cache_never_breaks_selection(tmp_path, fake_search):
 
 def test_stale_cublaslt_winner_is_a_miss(tmp_path, fake_search, monkeypatch):
     wc = WinnerCache(tmp_path / "w.jsonl", env=ENV)
-    wc.put(64, 64, 64, "fp16", k=3, lt_n=4, choice={"key": "h0_a9_t9_s9_sk1_r0_sw0_c0", "family": "cublaslt"})
+    wc.put(64, 64, 64, "fp16", k=3, lt_n=4, lt_knn=online.KNN_DEFAULT,
+           choice={"key": "h0_a9_t9_s9_sk1_r0_sw0_c0", "family": "cublaslt"})
     monkeypatch.setattr("tune.winner_cache.backend_for", lambda *a, **k: None)  # the library no longer returns that key
     sel = online.select_kernel(None, 64, 64, 64, cache=wc, use_bundle=False, lt_n=4)
     assert not sel["cached"] and len(fake_search) == 1
@@ -125,3 +132,48 @@ def test_entry_is_plain_json(tmp_path):
            candidates=[{"config_key": KEY, "graph_us": 4.2, "cold_us": 9.0}], order="diverse", ranker="lgbm_rank/v2")
     row = json.loads((tmp_path / "w.jsonl").read_text())
     assert row["winner_us"] == 4.2 and row["ranker"] == "lgbm_rank/v2" and row["env"] == ENV
+
+
+@pytest.fixture
+def no_lt_ranker(monkeypatch):
+    monkeypatch.setattr("baselines.cublaslt_rank.ranker", lambda stem=None: None)
+
+
+@pytest.fixture
+def with_lt_ranker(monkeypatch):
+    monkeypatch.setattr("baselines.cublaslt_rank.ranker", lambda stem=None: object())
+
+
+def test_without_a_ranker_model_the_default_search_uses_knn_proposals(tmp_path, fake_search, no_lt_ranker):
+    wc = WinnerCache(tmp_path / "w.jsonl", env=ENV)
+    assert online.KNN_DEFAULT == 8 and online.RANK_DEFAULT == 5
+    online.select_kernel(None, 64, 64, 64, cache=wc, use_bundle=False, lt_n=4)
+    assert fake_search.knn == [8] and fake_search.rank == [0]
+    assert wc.get(64, 64, 64, "fp16", k=3, lt_n=4, lt_knn=8) and wc.get(64, 64, 64, "fp16", k=3, lt_n=4, lt_knn=5)
+
+
+def test_with_a_ranker_model_the_default_search_uses_it_instead_of_knn(tmp_path, fake_search, with_lt_ranker):
+    wc = WinnerCache(tmp_path / "w.jsonl", env=ENV)
+    online.select_kernel(None, 64, 64, 64, cache=wc, use_bundle=False, lt_n=4)
+    assert fake_search.knn == [0] and fake_search.rank == [5]
+    assert wc.get(64, 64, 64, "fp16", k=3, lt_n=4, lt_rank=5) and wc.get(64, 64, 64, "fp16", k=3, lt_n=4, lt_rank=3)
+    assert wc.get(64, 64, 64, "fp16", k=3, lt_n=4, lt_rank=8) is None            # a wider ranker search was asked for
+    online.select_kernel(None, 64, 64, 64, cache=wc, use_bundle=False, lt_n=4)    # served from the cache
+    assert len(fake_search) == 1
+    online.select_kernel(None, 64, 64, 64, cache=wc, use_bundle=False, lt_n=4, lt_rank=0, lt_knn=8)  # opt into the proposals
+    assert fake_search.knn == [0, 8] and fake_search.rank == [5, 0]
+
+
+def test_knn_and_ranker_are_off_for_a_triton_only_search(tmp_path, fake_search, with_lt_ranker):
+    wc = WinnerCache(tmp_path / "w.jsonl", env=ENV)
+    online.select_kernel(None, 128, 64, 64, cache=wc, use_bundle=False, lt_n=0)
+    assert fake_search.knn == [0] and fake_search.rank == [0]
+    online.select_kernel(None, 128, 64, 64, cache=wc, use_bundle=False, lt_n=0)
+    assert len(fake_search) == 1                                                  # served from the cache
+
+
+def test_entry_without_proposals_is_a_miss_when_they_are_requested(tmp_path):
+    wc = WinnerCache(tmp_path / "w.jsonl", env=ENV)
+    wc.put(32, 32, 32, "fp16", k=3, lt_n=4, choice={"key": KEY, "family": "triton"})   # written before proposals existed
+    assert wc.get(32, 32, 32, "fp16", k=3, lt_n=4)["choice"]["key"] == KEY
+    assert wc.get(32, 32, 32, "fp16", k=3, lt_n=4, lt_knn=8) is None and wc.get(32, 32, 32, "fp16", k=3, lt_n=4, lt_rank=5) is None

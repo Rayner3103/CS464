@@ -4,6 +4,113 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-11-04 (later): a learned ranker over all valid cuBLASLt configs beats the k-NN proposals — joint search regret p95 11.6% → 4.7%, 7 shapes slower than B3+ (was 17)
+
+**What ran.** (1) A full per-config screen of the 652 tune-split shapes (`python -m baselines.cublaslt_screen`, session log `data/<hw>/logs/lt_screen.log`, 4,266 s, 1,291,554 (shape, config) rows, 624 of 652 shapes screened completely within the 40 s budget; hot-L2 screen timing, 1.0 µs grid, clock lock 1755 declared). (2) A LightGBM regressor of log(t / t_best_of_shape) per (shape, config) on those rows (`python -m analysis.lt_rank`; features: shape, config parameters with algo / tile / stages as categoricals, CTA count / padding / waves from the tile dimensions in both orientations, K per split; near-top rows weighted 3x; 300 rounds, no tuning). (3) The held-out run: the v2 Triton ranker's top-3 + the heuristic top-16 + the k-NN proposals (8 x 2) + the learned ranker's top-16 in one short-timed pool (`online_joint_diverse_v2_knn8_rank16.jsonl`, session `20261104-193204-66b37b`, 86 shapes), then ONE stage-2 session that times every candidate: cold `results_lock1755_rank16.jsonl` `20261104-193409-429243` (86 shapes, 4,828 rows incl. 1,376 ranker rows, 0 invalid, 7 not converged, 34% power-capped) and graph `results_lock1755_rank16_graph.jsonl` `20261104-194744-a4fa21` (56 shapes < 50 µs, 0 invalid, 46% power-capped). `harness_dirty` is true on every row (uncommitted changes), clock locked at 1755, driver 595.99.02.
+
+**Tune-only grouped cross-validation, exact times** (`analysis.lt_rank`, 5 folds over shapes grouped by "shares two of M, N, K", no held-out shape read; pool = the best heuristic-seeded config of that shape's own search + the method's proposals; 250 of 652 shapes improve on the seeds by > 5%; "captured" = share of the gap between the best heuristic-seeded config and the screen winner that the pool closes):
+
+| method | pool | captured | closes fully (≤ 2% of screen best) | mean regret vs screen best | p95 |
+|---|---|---|---|---|---|
+| heuristic seeds only | 0 | 0% | 0% | 6.5% | 24.8% |
+| k-NN 5 x 2 | 7.8 | 63.7% | 46% | 2.2% | 11.4% |
+| **k-NN 8 x 2** (shipped before) | 11.3 | 70.7% | 55% | 1.8% | 10.0% |
+| ranker top-5 | 5 | 69.4% | 49% | 1.8% | 8.5% |
+| **ranker top-10** | 10 | **78.3%** | 61% | 1.3% | 7.3% |
+| ranker top-16 | 16 | 85.5% | 72% | 0.9% | 4.8% |
+| k-NN 8 x 2 + ranker top-10 | 19.2 | 89.2% | 78% | 0.7% | 3.7% |
+
+The k-NN row reproduces the earlier leave-one-out scan (70.7% vs 71.4%). The screen's best config is in the ranker's top 10 for 47% of shapes (median rank 13 of ~1,980 valid configs); by gain the model uses the algorithm, tile, the CTA counts and K per split. At equal pool size the ranker closes more of the gap than the neighbours (+7.6 points at ~10 candidates), and the ranker's top-5 matches k-NN 8 x 2 with half the candidates. **The held-out comparison and the primary pools (ranker top-10 vs k-NN8 at matched size, and the union) were fixed from this table before the held-out run; no hyperparameter was tuned.**
+
+**Held-out A/B** (`analysis.lt_rank_ab`; 86 shapes, 56 timed graph-amortized; every pool = v2 top-3 Triton + heuristic top-16 + the named proposals, re-chosen with `tune.online.choose` from the one run's candidates, each pick looked up at its full-protocol time in the one stage-2 session; regret vs the joint oracle = best Triton of the session and B3+):
+
+| pool | regret median / p95 / mean | ≥ 50 µs p95 | < 50 µs p95 | shapes > 5% / > 10% off | vs B3+ faster / slower | first-use cost | picks proposal |
+|---|---|---|---|---|---|---|---|
+| heuristic top-16 only | 0.6% / 11.6% / 2.6% | 13.7% | 10.9% | 12 / 7 | 22 / 17 | 0.66 s | none |
+| + k-NN8 | 0.6% / 6.8% / 1.6% | 5.2% | 7.2% | 9 / 0 | 23 / 13 | 0.77 s | 22% |
+| + ranker top-5 | **0.4% / 4.7% / 1.2%** | 4.8% | 4.6% | **4 / 0** | 23 / **7** | 0.80 s | 23% |
+| + ranker top-10 | 0.4% / 4.7% / 1.2% | 4.8% | 4.6% | 4 / 1 | 23 / 7 | 0.85 s | 23% |
+| + ranker top-16 | 0.4% / 4.7% / 1.2% | 4.8% | 4.6% | 4 / 1 | 23 / 7 | 0.92 s | 23% |
+| + k-NN8 + ranker top-5 | 0.5% / 4.7% / 1.1% | **3.7%** | 5.2% | 4 / 0 | 24 / 8 | 0.90 s | 15% k-NN, 14% ranker |
+| + k-NN8 + ranker top-10 | 0.5% / 4.7% / 1.1% | 3.7% | 5.2% | 4 / 0 | 24 / 8 | 0.96 s | same |
+
+Paired geometric-mean time ratio (a / b, 95% bootstrap interval, shapes a faster / slower by the tie margin): ranker top-5 vs heuristic only **0.987 [0.978, 0.994]**, 11 / 1; k-NN8 vs heuristic only 0.990 [0.982, 0.997], 9 / 1; **ranker top-10 vs k-NN8 0.9966 [0.9925, 1.0007], 8 / 4 (not significant)**; k-NN8 + ranker top-10 vs k-NN8 0.9956 [0.9922, 0.9985], 6 / 1. The proposers' ceilings (best proposed config, full protocol): ranker top-16 is within the tie margin of B3+ on 58 of 86 shapes, beats it by more than the margin on 2, and closes the B3+ gap fully on 21 of the 26 shapes where B3+ beats the heuristic (≥ half way on 22); k-NN8 closes 12 (16). Top-5, 10 and 16 give the same online choice (the short timing never picks a rank 6-16 config), so the top-5 is enough. Remaining misses: 68×6420×10359 (10.1% off the oracle), 226×2141×1139 (8.2%), 1316×272×100 (6.8%, a 5.7 µs shape where the best is Triton and B3+ is 1.09x), 2048×4096×11008 (5.7%).
+
+**Reading.** The learned ranker recovers about 64% of the mean gap and 75% of the p95 gap between the heuristic-only joint search and the oracle ceiling (0.4% / 2.4% mean / p95), against 45% / 52% for the k-NN8 proposals; the shapes slower than B3+ drop from 17 to 7. On the paired test it is **not** significantly faster than the k-NN8 pool (the interval touches 1), only clearly better on the tail counts (shapes > 5% off: 4 vs 9, p95 4.7% vs 6.8%), so the evidence for choosing it over k-NN is the tune cross-validation plus the tail, not a held-out mean difference. Cost: +0.14 s at top-5 (0.80 s vs 0.66 s), of which the enumeration of the valid configs (thousands of `cublasLtMatmulAlgoCheck` calls, ≈0.1-0.2 s) is the bulk and the model prediction a few ms; k-NN8 costs +0.11 s. G4 (differentiation vs B3+) is unchanged: the joint search is within the margin of B3+ on most shapes and faster on 23, but nothing is faster than B3+ by a margin that beats the deep search offline.
+
+**Shipped.** `tune.online.select_kernel(lt_rank=5)` is now the default cuBLASLt proposal source; the k-NN proposals (`lt_knn`, 8 neighbours) are used instead only when the ranker is off or has no model for this GPU (automatic, `lt_knn=None`); `lt_knn=8, lt_rank=0` or the reverse force either. The model (1.8 MB) is committed as `reports/snapshot/lock1755/lt_rank.txt/.json` (`data/<hw>/lt_rank` wins if present); it is tagged with `hw_id` and loads only on that GPU (the CTA features also hard-code 68 SMs, so the 3090's 82 SMs need a retrained model, as the cuBLASLt tile and algorithm ids already require). The winner cache stores `lt_rank` next to `lt_knn` and treats an entry from a narrower search as a miss. The tile-id table (ids 1-33) was checked against `cublasLt.h`; ids above 33 do not occur in the screen. Tests: 187 pass.
+
+**Limits.** One GPU; the held-out region is out of distribution for the tune shapes (k-NN8 closes the gap fully on 55% of tune-CV shapes but on 12 of the 26 held-out shapes where B3+ beats the heuristic), so the ranker's held-out advantage over k-NN8 has to be read with the paired test above. The screen labels are 3-launch hot-L2 timings with a 1.0 µs grid, so below ~10 µs the labels, and the 5% tie margin, are close to noise; 28 of the 652 tune shapes hit the 40 s budget before every config was screened. The runtime needs `lightgbm` (pinned) and the config enumeration. A new GPU needs the full screen (~70 min on the 3080) and `python -m analysis.lt_rank --save`.
+
+**Next.** A cost-only router (skip the Triton compiles when the ranker's best cuBLASLt prediction is clearly ahead; without the bundle the compiles are about two thirds of the first-use cost); a ranker that scores Triton and cuBLASLt configs in one model (the families' regrets are now on one scale); the 3090 with its own screen and snapshot.
+
+**Reproduce.**
+```bash
+TUNE_CLOCK_LOCK=1755 python -m baselines.cublaslt_screen --budget-s 40         # ~70 min, GPU idle
+python -m analysis.lt_rank --folds 5 --save $D/lt_rank                         # CPU, ~1 min; copy lt_rank.txt/.json to reports/snapshot/lock1755/
+python -m tune --clock-lock 1755 online --shapes-file $D/sweep_screen_heldout/subset.json --ranker $D/lgbm_rank_v2 --k 5 \
+  --order diverse --lt-n 16 --lt-knn 8 --lt-rank 16 --fresh-cache --out-name online_joint_diverse_v2_knn8_rank16.jsonl
+# stage 2 (cold, then the subset_lt50us.json graph run with --cache-modes hot --graph-batch 50), as in the entry below with
+#   --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20,cublaslt_knn:8,cublaslt_rank:16
+python -m analysis.lt_rank_ab
+```
+
+## Update 2026-11-04: cuBLASLt k-NN proposals — the deep-search winners of the nearest tune shapes close about half of the joint search's gap to B3+
+
+**Why.** The joint search (Triton top-3 + cuBLASLt heuristic top-16) loses to B3+ only where the 20 s deep search finds a cuBLASLt config the heuristic never lists. Ceiling (`analysis.lt_ceiling`, v2 top-3 + LT16, 86 held-out shapes): the oracle winner is the heuristic list on 31 shapes, Triton on 35, a deep-search-only cuBLASLt config on **20**; adding the best deep config to the pool would take regret from 0.4% / 10.4% / 2.7% (median / p95 / mean) to 0.0% / 2.4% / 0.4%, perfect Triton only to 0.0% / 10.4% / 2.1%. Of the 22 shapes with regret over the tie margin, 21 are fixed by the deep config, 2 by perfect Triton. So the headroom is on the cuBLASLt side.
+
+**Structure of the winners** (`analysis.lt_clusters`, 565 cached searches; 183 of 464 tune and 30 of 86 held-out shapes improve by > 5% over the best heuristic-seeded config). Algorithms 24 / 21 / 35 cover 71% of the 213 deep-needed winners and split-K > 1 is 42%, but the full config has 116 distinct values (top 5 cover 45): the winners cluster by regime (small M·N and skinny: GEMV-like algorithms 0 / 1 / 13; large K and skinny + large K: split-K with 21 / 24 / 35; regular: 35 / 21) without being a small set of recurring answers. Static portfolios fail (the 3 most frequent winners are in 30% of held-out shapes' top-8); shape-conditioned proposals work (below).
+
+**What was built.** `baselines/cublaslt_knn.py`: for a shape, the top 2 configs of each of its k nearest tune shapes (features log2 M, N, K, 128x128 CTA fill on 68 SMs, 8-alignment, standardized on the tune shapes), rebuilt with `build_algo` (`cublasLtMatmulAlgoCheck` rejects what is invalid), no compile. Table = TUNE-split `lt_search/` caches only (478 shapes), never the shape itself; a test asserts the tune and held-out shape sets are disjoint. Wiring: `tune online --lt-knn N`, backend spec `cublaslt_knn[:k]`, family `cublaslt_knn` (key prefix `n`; counts toward no `lt_n`, so `choice_lt["<k>_lt16"]` is the heuristic-only search and `choice` the full pool), `select_kernel(lt_knn=8)` (default), winner-cache `lt_knn` field. Committed snapshot of the table: `reports/snapshot/lock1755/lt_knn_table.json` (84 KiB, GPU-tagged; other GPUs get no proposals and one warning).
+
+**Choosing (k, per-neighbour) on tune shapes only** (`analysis.lt_knn_scan`, grouped leave-one-out: no neighbour sharing two of M, N, K; 188 of 478 tune shapes improve by > 5%; a proposal outside the shape's stored top-8 counts as no gain, so these are lower bounds). captured = share of the gap between the best heuristic-seeded config and the search winner that the pool closes.
+
+| k, per | pool | captured (mean) | closes fully | mean regret vs search winner | p95 |
+|---|---|---|---|---|---|
+| heuristic seeds only | 0 | 0% | 0% | 6.3% | 23.3% |
+| 3, 2 | 4.9 | 55.8% | 51% | 2.8% | 15.5% |
+| 5, 2 | 7.3 | 64.8% | 61% | 2.3% | 14.0% |
+| 10, 1 | 7.0 | 66.2% | 61% | 2.3% | 14.4% |
+| **8, 2** | 10.6 | **71.4%** | 67% | 1.9% | 12.5% |
+| 15, 1 | 9.9 | 72.4% | 68% | 1.8% | 11.1% |
+| 10, 2 | 12.5 | 75.1% | 71% | 1.7% | 9.9% |
+| 15, 3 | 24.4 | 85.3% | 81% | 1.0% | 5.3% |
+
+Gains per added candidate fall off (31 points for the first neighbour, 9 for 3 → 5, 6.6 for 5 → 8, 3.7 for 8 → 10) but have no plateau by k = 20. Split-half selection over the grid with a pool ≤ 12 picked (15, 1) 119 times of 200, (8, 2) 71, never (5, 2). Ungrouped leave-one-out inflates capture by ~10 points. **(8, 2) was fixed from this table before its held-out run**; the first held-out run used (5, 2), whose k had been picked after looking at held-out hit rates (`analysis.lt_clusters` prints them), so that run is not an out-of-sample number and is kept only as a cross-check.
+
+**Held-out A/B** (`analysis.lt_knn_ab`; 86 held-out shapes, 56 timed graph-amortized; v2 ranker, diversified top-3 + LT16 vs + proposals, both looked up at their full-protocol time in ONE stage-2 session: cold `results_lock1755_knn8.jsonl` `20261104-141749-c8bb44`, 3,452 rows, 0 invalid, 14 not converged, 40% power-capped; graph `results_lock1755_knn8_graph.jsonl` `20261104-142752-a96cd4`, 2,279 rows, 0 invalid, 48% power-capped; online `online_joint_diverse_v2_knn8.jsonl` `20261104-141605-1df6e7`. `harness_dirty` is true on every row (changes uncommitted), clock locked at 1755):
+
+| v2 top-3 + LT16 | heuristic only | + kNN8 proposals |
+|---|---|---|
+| regret vs joint oracle, median / p95 / mean | 0.9% / 10.7% / 2.6% | **0.4% / 6.0% / 1.5%** |
+| shapes > 5% / > 10% off | 12 / 6 | **8 / 0** |
+| ≥ 50 µs (n = 30), median / p95 / mean | 1.7% / 13.5% / 3.1% | 0.5% / 4.4% / 1.4% |
+| < 50 µs (n = 56), median / p95 / mean | 0.4% / 10.3% / 2.4% | 0.4% / 7.6% / 1.6% |
+| vs B3+ (median; faster / slower by the margin) | 1.000; 22 / 19 | 1.000; 22 / 15 |
+| first-use cost | 0.66 s | 0.77 s |
+| picks a proposal | none | 20% of shapes |
+
+Paired (proposals / heuristic only, chosen config's stage-2 time): geometric-mean ratio **0.990 [0.982, 0.997]**, faster on 7 shapes, slower on 0; top-5 Triton gives the same (0.5% / 10.7% / 2.5% → 0.3% / 6.0% / 1.4%, ratio 0.990 [0.983, 0.997]). Biggest changes: 51×324×5709 17.7 → 14.9 µs, 68×6420×10359 412 → 347 µs, 443×4723×393 51.3 → 44.0 µs, 380×6978×216 40.0 → 34.8 µs. The proposals alone (`cublaslt_knn:8`, all timed in full): never faster than B3+ by more than the margin, within it on 44 shapes; on the 27 shapes where B3+ beats the heuristic by more than the margin they close the gap fully on 13 and at least halfway on 18. The earlier (5, 2) run (session `20261104-120725-8651eb`, 0.7% / 10.5% / 2.6% → 0.4% / 7.1% / 1.6%, ratio 0.991 [0.983, 0.997], 8 faster / 1 slower, one 6% loss on 512×4096×11008) is in a different session; the baseline column moved by ~0.2 points between the sessions, so (8, 2) vs (5, 2) is "at least as good", not a measured difference.
+
+**Gates and limits.** G4 (differentiation vs B3+ at ≥ 50 µs) is unchanged: no pick beats B3+ by more than the margin and the joint search is still slower than B3+ on 15 shapes (was 19). About half of the ceiling's gap is recovered (mean 2.6% → 1.5% vs the 0.4% ceiling; p95 10.7% → 6.0% vs 2.4%); 8 shapes remain > 5% off, mostly split-K magnitude differing from every neighbour's winner. One GPU: the table is 3080 / sm_86 data and cuBLASLt ids are per architecture; the 3090 and 2060 need their own searches. Proposals carry no compile, so the cost is validation + short timing (+0.10 s for ~6 extra candidates). The screen timings behind the table are hot-L2, 3 launches, 1.0 µs grid, and 39 of 565 searches hit the 20 s budget before screening every config.
+
+**Next.** A LightGBM ranker over (shape, cuBLASLt config) trained on a full per-config screen of the tune shapes (`baselines/cublaslt_screen.py`, which keeps every config's time; the stored top-8 cannot train a ranker or score a proposer exactly); the k-NN result above is the bar.
+
+**Reproduce.**
+```bash
+D=data/rtx3080_sm86_68sms_10gb
+python -m analysis.lt_ceiling && python -m analysis.lt_clusters && python -m analysis.lt_knn_scan     # CPU only
+python -m baselines.cublaslt_knn --snapshot                                                          # reports/snapshot/lock1755/lt_knn_table.json
+python -m tune --clock-lock 1755 online --shapes-file $D/sweep_screen_heldout/subset.json --ranker $D/lgbm_rank_v2 --k 5 \
+  --order diverse --lt-n 16 --lt-knn 8 --fresh-cache --out-name online_joint_diverse_v2_knn8.jsonl
+export TUNE_SWEEP_DIR=$D/sweep_screen_heldout TUNE_PICKS=$D/v2_stage2_picks.json
+python -m tune --clock-lock 1755 benchmark --shapes-file $D/sweep_screen_heldout/subset.json \
+  --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20,cublaslt_knn:8 --cache-modes cold --out-name results_lock1755_knn8.jsonl
+python -m tune --clock-lock 1755 benchmark --shapes-file $D/sweep_screen_heldout/subset_lt50us.json \
+  --backends torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20,cublaslt_knn:8 --cache-modes hot --graph-batch 50 --out-name results_lock1755_knn8_graph.jsonl
+python -m analysis.lt_knn_ab
+```
+
 ## Update 2026-11-03: zero-shot arm on the RTX 3090 — the 3080 rankers transfer to a second tensor-core GPU (v2 within noise of the 3080), unlike the 2060
 
 **What ran.** The 3080's `lgbm_rank` (v1) and `lgbm_rank_v2`, no refit, on an RTX 3090 (`rtx3090_sm86_82sms_24gb`, Ampere sm_86, 82 SMs, 24 GB, SLURM job from `remoteGPU/zero_shot.sh`, `PER_SUITE=12`), `data/rtx3090_sm86_82sms_24gb/`. Harness `194f78b`, clean.

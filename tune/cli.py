@@ -200,7 +200,7 @@ def cmd_online(args):
     from tune.online import KPolicy
     policy = KPolicy(args.k, args.k_frequent, args.frequent_calls) if args.k_frequent else None
     path = run(_shapes(args.suite, args.shapes_file), Path(args.ranker or args.out / "lgbm_rank"), args.out, k=args.k,
-               dtype=args.dtype, order=args.order, out_name=out_name, session_id=args.session, lt_n=args.lt_n, policy=policy)
+               dtype=args.dtype, order=args.order, out_name=out_name, session_id=args.session, lt_n=args.lt_n, lt_knn=args.lt_knn, lt_rank=args.lt_rank, policy=policy)
     print(f"online -> {path}")
 
 
@@ -355,6 +355,12 @@ def main(argv=None):
                    help="launches at which a shape counts as frequently called (default: the held-out 3 -> 5 break-even)")
     p.add_argument("--lt-n", type=int, default=0,
                    help="also time cuBLASLt's heuristic top N in the same pool (joint selection); default 0 = Triton only")
+    p.add_argument("--lt-knn", type=int, default=0,
+                   help="with --lt-n: also time the cuBLASLt configs the deep searches of the N nearest tune shapes found "
+                        "(baselines/cublaslt_knn.py; top 2 each); default 0 = off")
+    p.add_argument("--lt-rank", type=int, default=0,
+                   help="with --lt-n: also time the M configs a learned cuBLASLt ranker (data/<hw>/lt_rank, baselines/cublaslt_rank.py) "
+                        "predicts fastest among all valid configs; default 0 = off")
     p.add_argument("--out-name", default=None, help="default online_lgbm_rank[_diverse].jsonl (online_joint_* with --lt-n)")
     p.add_argument("--fresh-cache", action="store_true", help="compile into an empty TRITON_CACHE_DIR under --out")
 

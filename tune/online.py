@@ -81,6 +81,11 @@ def shape_k(shape: dict, k: int, policy: KPolicy | None) -> int:
     return policy.k_for(shape.get("calls"), shape.get("frequent")) if policy else k
 
 
+PROPOSAL_FAMILIES = ("cublaslt_knn", "cublaslt_rank")   # cuBLASLt candidates that are not the heuristic's
+RANK_DEFAULT = 5   # learned cuBLASLt ranker picks per search (held-out: top-5 = top-10 = top-16 in the online choice; reports/week1.md 2026-11-04)
+KNN_DEFAULT = 8   # nearest tune shapes for the cuBLASLt proposals: chosen on a tune-only leave-one-out scan (reports/week1.md 2026-11-04)
+
+
 def short_configs():
     from tune.timing import TimingConfig
     cold = TimingConfig(cache_mode="cold", warmup_ms=SHORT_WARMUP_MS, min_warmup_iters=1, min_reps=SHORT_REPS,
@@ -96,11 +101,16 @@ def _is_lt(x: dict) -> bool:
 
 
 def _subset(cands: list[dict], k: int, lt_n: int | None) -> list[dict]:
-    """The first k Triton candidates plus the first lt_n cuBLASLt ones (all of them for None); rows written before
-    cuBLASLt candidates existed have no "family" and are all Triton, so this is cands[:k] for them."""
+    """The first k Triton candidates plus the first lt_n cuBLASLt heuristic ones (all of them for None); rows written
+    before cuBLASLt candidates existed have no "family" and are all Triton, so this is cands[:k] for them. kNN proposals
+    (family "cublaslt_knn", `--lt-knn`) are not heuristic candidates: they count toward no lt_n and join only when
+    lt_n is None, so `choice_lt[j_lt<n>]` stays the heuristic-only search and `choice` is the full pool."""
     out, n_tri, n_lt = [], 0, 0
     for x in cands:
-        if _is_lt(x):
+        if x.get("family") in PROPOSAL_FAMILIES:
+            if lt_n is None:
+                out.append(x)
+        elif _is_lt(x):
             n_lt += 1
             if lt_n is None or n_lt <= lt_n:
                 out.append(x)
@@ -137,10 +147,14 @@ def all_choices(cands: list[dict], k: int, lt_n: int) -> dict:
 
 
 def search_shape(ranker, M: int, N: int, K: int, k: int, dtype=torch.float16, order: str = "plain",
-                 lt_n: int = 0) -> dict:
+                 lt_n: int = 0, lt_knn: int = 0, lt_rank: int = 0) -> dict:
     """Rank (plain or diverse top-k, Ranker.rank), then compile + validate + short-time the top k on one placement.
     lt_n > 0 also times cuBLASLt's heuristic top lt_n (no compile; same validate + short timing) in the same pool, so
-    the choice is joint over both families. Returns the per-candidate record."""
+    the choice is joint over both families. lt_knn > 0 (needs lt_n > 0) adds the cuBLASLt configs that the deep searches
+    of the lt_knn nearest tune shapes found (`baselines/cublaslt_knn.py`, top 2 each, minus those the heuristic already
+    returned), validated and short-timed like the rest. lt_rank > 0 (needs lt_n > 0) adds the lt_rank configs a learned
+    ranker over all valid cuBLASLt configs predicts fastest (`baselines/cublaslt_rank.py`; family "cublaslt_rank", not
+    deduplicated against the k-NN proposals so subsets of the pool can be scored from one run). Returns the per-candidate record."""
     from kernels.triton_matmul import TritonMatmul
     from tune.timing import benchmark
     cold_cfg, graph_cfg = short_configs()
@@ -162,6 +176,22 @@ def search_shape(ranker, M: int, N: int, K: int, k: int, dtype=torch.float16, or
         lts = lt_candidates(M, N, K, dtype, lt_n)
         lt_setup_s = time.perf_counter() - t
         backends += [("cublaslt", c.key, c, lt_setup_s if i == 0 else 0.0) for i, c in enumerate(lts)]
+        if lt_knn > 0:
+            from baselines.cublaslt_knn import candidates as knn_candidates, cfg_tuple
+            t = time.perf_counter()
+            known = {cfg_tuple(c.cfg) for c in lts}
+            knn = knn_candidates(M, N, K, dtype, lt_knn, problem=lts[0].problem if lts else None, skip=known)
+            knn_setup_s = time.perf_counter() - t
+            backends += [("cublaslt_knn", c.key, c, knn_setup_s if i == 0 else 0.0) for i, c in enumerate(knn)]
+        if lt_rank > 0:
+            from baselines.cublaslt import _CUDA_DTYPE
+            from baselines.cublaslt_rank import candidates as rank_candidates
+            from baselines.cublaslt_knn import cfg_tuple
+            t = time.perf_counter()
+            known = {cfg_tuple(c.cfg) for c in lts}
+            ranked = rank_candidates(M, N, K, dtype, lt_rank, problem=lts[0].problem if lts else None, skip=known)
+            rank_setup_s = time.perf_counter() - t
+            backends += [("cublaslt_rank", c.key, c, rank_setup_s if i == 0 else 0.0) for i, c in enumerate(ranked)]
     cands, bk = [], {}
     for family, key, backend, extra_s in backends:
         t = time.perf_counter()
@@ -185,7 +215,8 @@ def search_shape(ranker, M: int, N: int, K: int, k: int, dtype=torch.float16, or
             x["time_s"] += time.perf_counter() - t
     del a, b, ref
     torch.cuda.empty_cache()
-    return {"rank_s": rank_s, "candidates": cands, **({"lt_setup_s": lt_setup_s} if lt_n > 0 else {})}
+    return {"rank_s": rank_s, "candidates": cands, **({"lt_setup_s": lt_setup_s} if lt_n > 0 else {}),
+            **({"lt_knn": lt_knn} if lt_knn > 0 else {}), **({"lt_rank": lt_rank} if lt_rank > 0 else {})}
 
 
 _DTYPE_NAMES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
@@ -193,10 +224,14 @@ _DTYPE_NAMES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
 
 def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, frequent: bool | None = None,
                   policy: KPolicy = KPolicy(), lt_n: int = 16, order: str = "diverse", dtype=torch.float16,
-                  cache=True, use_bundle: bool = True) -> dict:
+                  cache=True, use_bundle: bool = True, lt_knn: int | None = None, lt_rank: int = RANK_DEFAULT) -> dict:
     """First-use kernel selection for one shape with the call-count-aware k policy. `calls` (expected launches) or
     `frequent` (explicit) come from the caller; the ranker cannot know them. Searches the policy's k Triton candidates
-    plus cuBLASLt's heuristic top lt_n (0 = Triton only) and returns {"k", "reason", "choice", "candidates", "rank_s",
+    plus cuBLASLt's heuristic top lt_n (0 = Triton only) plus, with lt_n > 0, the configs the deep searches of the lt_knn
+    nearest tune shapes found (`baselines/cublaslt_knn.py`; 0 = off; no table for this GPU = none) and the lt_rank configs a
+    learned ranker over all valid cuBLASLt configs predicts fastest (`baselines/cublaslt_rank.py`; 0 = off). lt_knn=None
+    means automatic: KNN_DEFAULT neighbours only when the ranker is off or has no model for this GPU, else none (the
+    ranker alone beat the proposals; the union adds little for +0.1 s). Returns {"k", "reason", "choice", "candidates", "rank_s",
     "cached"}. choice = {"key", "family", "mode", "rank", "compile_s", "time_s"} (key None if no candidate was valid); a shape
     whose tensors do not fit in memory returns {"skipped": ...} with choice None.
 
@@ -214,18 +249,27 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
         from kernels import bundle
         bundle.install()
     wc = _winner_cache(cache)
+    if lt_n and lt_rank:
+        from baselines.cublaslt_rank import ranker as _lt_ranker
+        if _lt_ranker() is None:
+            lt_rank = 0
+    if lt_knn is None:
+        lt_knn = 0 if (lt_rank or not lt_n) else KNN_DEFAULT
+    if not lt_n:
+        lt_knn = lt_rank = 0
     k = policy.k_for(calls, frequent)
     dname = _DTYPE_NAMES.get(dtype, str(dtype))
     if wc is not None:
         try:
             from tune.winner_cache import backend_for
-            hit = wc.get(M, N, K, dname, k=k, lt_n=lt_n)
+            hit = wc.get(M, N, K, dname, k=k, lt_n=lt_n, lt_knn=lt_knn, lt_rank=lt_rank)
             if hit is not None and backend_for(hit["choice"], M, N, K, dtype, hit["lt_n"]) is not None:
                 return {"k": hit["k"], "reason": "cached", "rank_s": 0.0, "choice": hit["choice"], "candidates": [],
                         "cached": True}
         except Exception as e:                      # a broken cache must not break selection: search instead
             warnings.warn(f"winner cache lookup failed ({type(e).__name__}: {e}); searching")
-    r = search_shape(ranker, M, N, K, k, dtype, order, lt_n)
+    r = search_shape(ranker, M, N, K, k, dtype, order, lt_n,
+                     **({"lt_knn": lt_knn} if lt_knn else {}), **({"lt_rank": lt_rank} if lt_rank else {}))
     out = {"k": k, "reason": "frequent" if k == policy.k_frequent and k != policy.k else "default", "rank_s": r["rank_s"],
            "cached": False}
     if r.get("skipped"):
@@ -233,7 +277,7 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
     choice = choose(r["candidates"], k)
     if wc is not None:
         try:
-            wc.put(M, N, K, dname, k=k, lt_n=lt_n, choice=choice, candidates=r["candidates"], order=order,
+            wc.put(M, N, K, dname, k=k, lt_n=lt_n, lt_knn=lt_knn, lt_rank=lt_rank, choice=choice, candidates=r["candidates"], order=order,
                    ranker=f"lgbm_rank/{getattr(ranker, 'features', None) or 'v1'}")
         except Exception as e:
             warnings.warn(f"winner cache write failed ({type(e).__name__}: {e})")
@@ -252,7 +296,7 @@ def _winner_cache(cache):
 
 def run(shapes: Iterable[dict], ranker_stem: Path, out_dir: Path, *, k: int = 5, dtype: str = "fp16",
         order: str = "plain", out_name: str = "online_lgbm_rank.jsonl", session_id: str | None = None, lt_n: int = 0,
-        policy: KPolicy | None = None,
+        lt_knn: int = 0, lt_rank: int = 0, policy: KPolicy | None = None,
         log: Callable[[str], None] = print) -> Path:
     from analysis.learned import Ranker
     from tune.runner import DTYPES
@@ -265,7 +309,7 @@ def run(shapes: Iterable[dict], ranker_stem: Path, out_dir: Path, *, k: int = 5,
     if path.exists():
         rule = None if order == "plain" else ranker.rule(order)
         done = {(r["M"], r["N"], r["K"], r.get("k")) for r in map(json.loads, path.read_text().splitlines())
-                if r.get("order", "plain") == order and r.get("rule") == rule and r.get("lt_n", 0) == lt_n}
+                if r.get("order", "plain") == order and r.get("rule") == rule and r.get("lt_n", 0) == lt_n and r.get("lt_knn", 0) == lt_knn and r.get("lt_rank", 0) == lt_rank}
     # Per-shape k: the policy's, from the shape's own `calls` / `frequent` fields; without a policy, the global k.
     shapes = [dict(s, _k=shape_k(s, k, policy)) for s in shapes]
     shapes = [s for s in shapes if (s["M"], s["N"], s["K"], s["_k"]) not in done]
@@ -274,8 +318,9 @@ def run(shapes: Iterable[dict], ranker_stem: Path, out_dir: Path, *, k: int = 5,
         for i, s in enumerate(shapes):
             M, N, K, ks = s["M"], s["N"], s["K"], s["_k"]
             t = time.perf_counter()
-            r = search_shape(ranker, M, N, K, ks, DTYPES[dtype], order, lt_n)
-            row = {"M": M, "N": N, "K": K, "dtype": dtype, "k": ks, "order": order, "lt_n": lt_n,
+            r = search_shape(ranker, M, N, K, ks, DTYPES[dtype], order, lt_n,
+                             **({"lt_knn": lt_knn} if lt_knn else {}), **({"lt_rank": lt_rank} if lt_rank else {}))
+            row = {"M": M, "N": N, "K": K, "dtype": dtype, "k": ks, "order": order, "lt_n": lt_n, "lt_knn": lt_knn, "lt_rank": lt_rank,
                    **({"calls": s.get("calls"), "frequent": s.get("frequent"),
                        "k_reason": "frequent" if ks == policy.k_frequent and ks != policy.k else "default"} if policy else {}),
                    "rule": None if order == "plain" else ranker.rule(order),

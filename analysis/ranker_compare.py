@@ -20,7 +20,7 @@ import numpy as np
 SMALL_US = 50.0
 EPS = {"small": 1.05, "large": 1.02}
 CONFIGS = (("top-3 Triton only", 3, 0), ("top-3 + LT16", 3, 16), ("top-5 + LT16", 5, 16), ("top-1 + LT16", 1, 16))
-FAMILY = {"triton_nn_v1": "tri", "cublaslt": "lth", "cublaslt_deep": "ltd", "torch_matmul": "torch"}
+FAMILY = {"triton_nn_v1": "tri", "cublaslt": "lth", "cublaslt_deep": "ltd", "cublaslt_knn": "ltk", "cublaslt_rank": "ltr", "torch_matmul": "torch"}
 
 
 def load_stage2(data: Path, files: list[str], mode: str) -> dict:
