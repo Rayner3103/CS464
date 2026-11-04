@@ -126,10 +126,10 @@ def test_select_kernel_uses_the_policy_k(monkeypatch):
     import tune.online as online
     seen = []
     monkeypatch.setattr(online, "search_shape", _fake_search(seen))
-    a = online.select_kernel(None, 64, 64, 64)
-    b = online.select_kernel(None, 64, 64, 64, calls=2_000_000)
-    c = online.select_kernel(None, 64, 64, 64, calls=2_000_000, policy=online.KPolicy(3, 8, 5_000_000))
-    d = online.select_kernel(None, 64, 64, 64, frequent=True, lt_n=0)
+    a = online.select_kernel(None, 64, 64, 64, cache=None, use_bundle=False)
+    b = online.select_kernel(None, 64, 64, 64, calls=2_000_000, cache=None, use_bundle=False)
+    c = online.select_kernel(None, 64, 64, 64, calls=2_000_000, policy=online.KPolicy(3, 8, 5_000_000), cache=None, use_bundle=False)
+    d = online.select_kernel(None, 64, 64, 64, frequent=True, lt_n=0, cache=None, use_bundle=False)
     assert [x[3] for x in seen] == [3, 5, 3, 5] and seen[3][4] == 0 and seen[0][4] == 16
     assert (a["k"], a["reason"]) == (3, "default") and (b["k"], b["reason"]) == (5, "frequent") and c["reason"] == "default"
     assert b["choice"]["key"] == "c4" and b["choice"]["compile_s"] == pytest.approx(0.5) and len(b["candidates"]) == 5

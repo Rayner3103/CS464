@@ -188,19 +188,66 @@ def search_shape(ranker, M: int, N: int, K: int, k: int, dtype=torch.float16, or
     return {"rank_s": rank_s, "candidates": cands, **({"lt_setup_s": lt_setup_s} if lt_n > 0 else {})}
 
 
+_DTYPE_NAMES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
+
+
 def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, frequent: bool | None = None,
-                  policy: KPolicy = KPolicy(), lt_n: int = 16, order: str = "diverse", dtype=torch.float16) -> dict:
+                  policy: KPolicy = KPolicy(), lt_n: int = 16, order: str = "diverse", dtype=torch.float16,
+                  cache=True, use_bundle: bool = True) -> dict:
     """First-use kernel selection for one shape with the call-count-aware k policy. `calls` (expected launches) or
     `frequent` (explicit) come from the caller; the ranker cannot know them. Searches the policy's k Triton candidates
-    plus cuBLASLt's heuristic top lt_n (0 = Triton only) and returns {"k", "reason", "choice", "candidates", "rank_s"}.
-    choice = {"key", "family", "mode", "rank", "compile_s", "time_s"} (key None if no candidate was valid); a shape whose
-    tensors do not fit in memory returns {"skipped": ...} with choice None."""
+    plus cuBLASLt's heuristic top lt_n (0 = Triton only) and returns {"k", "reason", "choice", "candidates", "rank_s",
+    "cached"}. choice = {"key", "family", "mode", "rank", "compile_s", "time_s"} (key None if no candidate was valid); a shape
+    whose tensors do not fit in memory returns {"skipped": ...} with choice None.
+
+    Two things make a repeat or a fresh clone cheap (both default on, both opt-out because experiments measure the search
+    itself and `demo.py` passes `cache=None, use_bundle=False`):
+      * `use_bundle`: install the prebuilt Triton kernel bundle (`kernels/bundle.py`), so a candidate the rankers can
+        propose is loaded instead of compiled. Any kernel not in it, or a bundle built for another Triton / GPU
+        architecture, compiles as before (a mismatch is warned about once);
+      * `cache`: the per-shape winner cache (`tune/winner_cache.py`). True = the default file for this GPU (None / False /
+        `TUNE_WINNER_CACHE=off` = off; or pass a `WinnerCache`). A stored winner from a search at least as wide as this
+        one is returned with no ranking, compiling or timing: {"reason": "cached", "cached": True, "candidates": []}. A
+        miss searches and stores the winner. Cache problems are warned about and never fail the selection."""
+    import warnings
+    if use_bundle:
+        from kernels import bundle
+        bundle.install()
+    wc = _winner_cache(cache)
     k = policy.k_for(calls, frequent)
+    dname = _DTYPE_NAMES.get(dtype, str(dtype))
+    if wc is not None:
+        try:
+            from tune.winner_cache import backend_for
+            hit = wc.get(M, N, K, dname, k=k, lt_n=lt_n)
+            if hit is not None and backend_for(hit["choice"], M, N, K, dtype, hit["lt_n"]) is not None:
+                return {"k": hit["k"], "reason": "cached", "rank_s": 0.0, "choice": hit["choice"], "candidates": [],
+                        "cached": True}
+        except Exception as e:                      # a broken cache must not break selection: search instead
+            warnings.warn(f"winner cache lookup failed ({type(e).__name__}: {e}); searching")
     r = search_shape(ranker, M, N, K, k, dtype, order, lt_n)
-    out = {"k": k, "reason": "frequent" if k == policy.k_frequent and k != policy.k else "default", "rank_s": r["rank_s"]}
+    out = {"k": k, "reason": "frequent" if k == policy.k_frequent and k != policy.k else "default", "rank_s": r["rank_s"],
+           "cached": False}
     if r.get("skipped"):
         return {**out, "skipped": r["skipped"], "choice": None, "candidates": []}
-    return {**out, "choice": choose(r["candidates"], k), "candidates": r["candidates"]}
+    choice = choose(r["candidates"], k)
+    if wc is not None:
+        try:
+            wc.put(M, N, K, dname, k=k, lt_n=lt_n, choice=choice, candidates=r["candidates"], order=order,
+                   ranker=f"lgbm_rank/{getattr(ranker, 'features', None) or 'v1'}")
+        except Exception as e:
+            warnings.warn(f"winner cache write failed ({type(e).__name__}: {e})")
+    return {**out, "choice": choice, "candidates": r["candidates"]}
+
+
+def _winner_cache(cache):
+    """`cache` argument of `select_kernel` -> a WinnerCache or None."""
+    if cache is None or cache is False:
+        return None
+    if cache is True:
+        from tune.winner_cache import WinnerCache
+        return WinnerCache.default()
+    return cache
 
 
 def run(shapes: Iterable[dict], ranker_stem: Path, out_dir: Path, *, k: int = 5, dtype: str = "fp16",

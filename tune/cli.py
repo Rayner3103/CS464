@@ -10,6 +10,7 @@
   drift      thermal drift run -> data/<hw_id>/drift-*.csv
   analyze    build plots + markdown summaries into reports/
   portfolio  config-space reduction from the sweep screen (B6 over the full space, G3, G5) -> reports/sweep_portfolio.md
+  bundle     build / status / verify / pack / unpack the prebuilt Triton kernel bundle (kernels/bundle/, see kernels/bundle.py)
 """
 from __future__ import annotations
 
@@ -203,6 +204,31 @@ def cmd_online(args):
     print(f"online -> {path}")
 
 
+def cmd_bundle(args):
+    """`tune bundle build|status|verify`: the prebuilt kernel bundle (kernels/bundle.py). build and verify need the GPU idle."""
+    from kernels import bundle as B
+    if args.bundle_cmd == "status":
+        print(json.dumps(B.status(), indent=1))
+        return 0
+    if args.bundle_cmd == "pack":
+        B.pack(args.bundle_dir, args.archive)
+        return 0
+    if args.bundle_cmd == "unpack":
+        B.unpack(args.archive or B.archive_for(args.bundle_dir), args.bundle_dir)
+        return 0
+    from kernels import bundle_build as BB
+    bundle_dir = args.bundle_dir or B.bundle_root()
+    pools = [Path(p) for p in (args.pool or [args.data / "lgbm_rank", args.data / "lgbm_rank_v2"])]
+    if args.bundle_cmd == "build":
+        BB.build(pools, bundle_dir, args.build_cache or args.data / "bundle_build_cache", dtypes=tuple(args.dtypes.split(",")),
+                 workers=args.workers, limit=args.limit)
+        return 0
+    shapes = _shapes("S1,S2,S3,S4,S5,S6,S7") + _shapes("edge")
+    res = BB.verify_bundle(bundle_dir, shapes, BB.pool_configs(pools), per_shape=args.per_shape, smoke=args.smoke)
+    print(json.dumps(res, indent=1))
+    return 0 if res["ok"] else 1
+
+
 def cmd_analyze(args):
     from analysis.report import build_reports
     build_reports(args.data, args.report, args.results)
@@ -339,10 +365,34 @@ def main(argv=None):
     p.add_argument("--extra-screens", nargs="*", default=["sweep_screen_tail"], help="extra tune screen dirs under --data")
     p.add_argument("--stem", default="lgbm_rank_v2")
 
+    p = sub.add_parser("bundle", help="prebuilt Triton kernel bundle: build (compile every kernel the rankers can pick), status, "
+                                      "verify (zero-compile coverage gate); build and verify need an idle GPU")
+    p.set_defaults(fn=cmd_bundle)
+    p.add_argument("--data", type=Path, default=None)
+    bsub = p.add_subparsers(dest="bundle_cmd", required=True)
+    for name in ("build", "status", "verify", "pack", "unpack"):
+        q = bsub.add_parser(name)
+        if name == "status":
+            continue
+        if name in ("pack", "unpack"):
+            q.add_argument("--bundle-dir", type=Path, default=None, help="default: kernels/bundle (or $TUNE_KERNEL_BUNDLE_DIR)")
+            q.add_argument("--archive", type=Path, default=None, help="default: <bundle-dir>.tar.xz (kernels/bundle.tar.xz)")
+            continue
+        q.add_argument("--bundle-dir", type=Path, default=None, help="default: kernels/bundle (or $TUNE_KERNEL_BUNDLE_DIR)")
+        q.add_argument("--pool", nargs="*", default=None, help="ranker stems whose pools to cover; default data/<hw>/lgbm_rank{,_v2}")
+        if name == "build":
+            q.add_argument("--dtypes", default="fp16", help="comma-separated: fp16 (default), bf16")
+            q.add_argument("--workers", type=int, default=0, help="0 = auto (capped by free host RAM and VRAM)")
+            q.add_argument("--limit", type=int, default=0, help="build only the first N configs (smoke test; recorded in the manifest)")
+            q.add_argument("--build-cache", type=Path, default=None, help="scratch Triton cache (resumable); default data/<hw>/bundle_build_cache")
+        else:
+            q.add_argument("--per-shape", type=int, default=40, help="random runnable pool configs warmed per shape (0 = all)")
+            q.add_argument("--smoke", type=int, default=6, help="kernels launched for real and checked against torch.matmul")
+
     args = ap.parse_args(argv)
     if args.clock_lock is not None:
         os.environ["TUNE_CLOCK_LOCK"] = args.clock_lock
-    if args.cmd in ("analyze", "portfolio", "selectors", "learned", "topk", "ranker-v2"):
+    if args.cmd in ("analyze", "portfolio", "selectors", "learned", "topk", "ranker-v2", "bundle"):
         args.data = args.data or default_data_dir()
     else:
         args.out = args.out or default_data_dir()

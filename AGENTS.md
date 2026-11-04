@@ -22,7 +22,7 @@ M, N, K in [1, 16384]. No fused epilogues, batched/grouped GEMM, or quantized dt
 
 ```
 tune/        harness package and CLI (python -m tune ...)
-  cli.py         subcommands: env check roofline benchmark baseline sweep noise drift analyze portfolio selectors
+  cli.py         subcommands: env check roofline benchmark baseline sweep noise drift analyze portfolio selectors bundle
   env.py         hw fingerprint, NVML telemetry, clock-lock probe, git provenance, CPU pinning, env.json
   timing.py      CUDA-event timer: warmup, adaptive repeats, cold/hot L2, backlogged launches, CUDA-graph amortized
   correctness.py fp32 reference, tolerance check, NaN-prefilled output, placed (address-shifted) inputs
@@ -31,10 +31,13 @@ tune/        harness package and CLI (python -m tune ...)
   sweep.py       stage-1 screen of the full pruned Triton space (subprocess per shape, parallel compile)
   noise.py       noise-floor study and thermal-drift run
   profile.py     records the device kernel names that vendor backends launch
-  online.py      top-k + short online search with the saved Ranker (compile, validate, short-time, pick)
+  online.py      top-k + short online search with the saved Ranker (compile, validate, short-time, pick); `select_kernel` adds the winner cache and the kernel bundle
+  winner_cache.py per-shape winner cache: append-only JSONL, one searched shape per line, keyed by GPU + Triton + cuBLASLt + driver; `backend_for` turns a choice into a runnable backend
 kernels/
   triton_matmul.py  parameterized Triton GEMM (MatmulConfig, EVEN_K specialization, deterministic split-K)
   config_space.py   SPACE (19,200 configs), static + shape pruning rules, HANDPICKED configs
+  bundle.py         prebuilt-kernel bundle, runtime side: Triton cache manager that serves compiled kernels from `kernels/bundle/` and falls back to compiling; `install()`, `status()`; the limitations are in its docstring
+  bundle_build.py   bundle build side: enumerate every (config, argument specialization) the rankers' pools can launch, compile in workers, keep only cubin + json; `verify_bundle` is the zero-compile coverage gate
 baselines/
   roofline.py         B0: measured peak TFLOP/s and DRAM GB/s
   torch_mm.py         B1: torch.matmul (default cuBLAS)
@@ -54,7 +57,8 @@ analysis/
   plots.py           figures + reports/results_overview.md for the current state (baselines, noise, selectors, kernel-selection stats); CPU-only, reads existing results (`python -m analysis.plots`)
   zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`); `load_screen` keeps `slow` screen rows
   cross_gpu.py       cross-GPU comparison on the held-out shapes the runs share: regret vs each GPU's own screen, speed vs B3+, family ceiling, PTX mma check, paired bootstrap; CPU-only (`python -m analysis.cross_gpu --side LABEL DIR ...`, docstring has the command). Never compare a subset run to the 86-shape `REFERENCE_3080` constants in `zero_shot.py`
-tests/       pytest unit tests (137 tests; most need a CUDA GPU)
+demo.py      ~10 s workload on held-out shapes through B1/B2/B3/B5/B6 and the selector (top-3 Triton, joint with cuBLASLt): durations + one-time search cost (`python -m demo`, GPU idle)
+tests/       pytest unit tests (175 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)
@@ -92,6 +96,7 @@ Measuring commands pin the process to one CPU core and write under `data/<hw_id>
 | `learned [--results ... --graph-results ...]` | Grouped-CV grid search (cached, ~2 h first run) and held-out scoring of the 10 learned selectors; reads `selector_picks.json` for b6/knn5/knnf | `data/<hw>/learned_picks.json`, `learned_search.json`, `reports/learned_selectors.md` |
 | `topk [--results ... --graph-results ... --online ...]` | Refit lgbm_rank on all tune shapes, save `data/<hw>/lgbm_rank.txt/.json`, write top-5 picks per held-out shape, score best-of-k and the online search | `data/<hw>/learned_topk_picks.json`, `reports/learned_topk.md` |
 | `ranker-v2 [--extra-screens sweep_screen_tail]` | CPU only. Fit rank v2 (v1's rank form + analytic roofline features + near-top row weights + the tail suite as extra tune shapes) on all tune shapes; hyperparameters are v1's CV-chosen ones; diversification rule refit on v2's own out-of-fold scores. Reads no held-out shape. Use with `online --ranker data/<hw>/lgbm_rank_v2` | `lgbm_rank_v2.txt/.json`, `lgbm_rank_v2_cv_scores.npz` |
+| `bundle build\|status\|verify` | The prebuilt Triton kernel bundle (`kernels/bundle.py`). `build` compiles every kernel the rankers' pools can launch (v1 ∪ v2 pools + hand-picked, fp16, every specialization) into a scratch cache (`data/<hw>/bundle_build_cache`, resumable) and keeps only cubin + json in `kernels/bundle/` (gitignored); GPU idle, ~1 GiB host RAM + ~360 MiB VRAM per worker. `verify` warms every runnable (pool config, suite shape) pair with the bundle installed and an empty user cache and requires 0 compiles, then runs a few kernels against torch.matmul; exit 1 on any miss. `status` prints whether the bundle matches this Triton / GPU. `pack` writes the committed archive `kernels/bundle.tar.xz` (19 MiB; `unpack` is what `install()` does on a fresh clone, ~11 s, atomic). `--pool`, `--dtypes`, `--workers`, `--limit` | `kernels/bundle/<cache key>/{_matmul_kernel,_splitk_reduce_kernel}.{cubin,json}`, `manifest.json`; `kernels/bundle.tar.xz` |
 | `online --shapes-file ... --k 5 [--order diverse\|inner] [--lt-n 16] [--k-frequent 5 --frequent-calls 1000000] --fresh-cache` | First-use search: rank (plain or diversified top-k), compile + validate + short-time the top k (empty Triton cache), keep the fastest; choices for every k' <= k stored. `--lt-n N` also short-times cuBLASLt's heuristic top N in the same pool (joint selection, no compile; `choice_lt` stores k' x lt_n' in {0, 1, 4, N}). `--k-frequent` makes k per shape (call-count policy `tune.online.KPolicy`, default k 3 / frequent 5): shapes in the file with `calls` >= `--frequent-calls` or `frequent: true` get `--k-frequent` candidates, the rest `--k`; one shape from Python: `tune.online.select_kernel(ranker, M, N, K, calls=...)` | `online_lgbm_rank[_diverse].jsonl` (`online_joint_*` with `--lt-n`) |
 
 Not part of `python -m tune`: `python -m analysis.plots [--theme light|dark] [--only baselines,noise,selectors,selection]` redraws every overview figure into `reports/figures/overview/` and rewrites
@@ -149,6 +154,11 @@ Runbook (standalone version with the prerequisites, scoring and pitfalls: [`docs
 - Pruning is named and auditable. **Static** rules (per GPU): smem limit, accumulator regs > 128, < 8 accumulator elements per thread, tile too
   small for the warp count. They keep 10,840 of 19,200. **Shape** rules: oversized tiles, starved split-K, split-K workspace too large, no-op GROUP_M.
 
+### Prebuilt kernels and the winner cache (shipping the selector)
+- **Bundle** (`kernels/bundle.py`, `kernels/bundle_build.py`, `docs/kernel_bundle.md`): the online search spends ~2/3 of its first-use cost compiling its top-k Triton configs (~0.13 s each). The bundle holds the compiled binary of every kernel the saved rankers can pick, so a fresh clone loads them instead.
+  Triton's own cache cannot just be copied: its group files store absolute paths. `BundleCacheManager` (a `FileCacheManager` selected through `TRITON_CACHE_MANAGER`) looks in this machine's cache, then the read-only bundle, then lets Triton compile (into the user cache, never the repo). `select_kernel(use_bundle=True)` installs it; `tune online --fresh-cache`, `analysis.zero_shot` and the benchmark commands do not, so every measured compile cost stays a true first use.
+- **Winner cache** (`tune/winner_cache.py`): `select_kernel(cache=True)` returns the stored winner of an earlier search at least as wide (k and lt_n) with no ranking, compiling or timing, and stores the winner of every search it runs. Default file `data/<hw>/winner_cache.jsonl` (`TUNE_WINNER_CACHE=<path>` moves it, `=off` disables it). `demo.py` and the experiments pass `cache=None`.
+
 ### Baselines (plan §4.1)
 B0 roofline · B1 torch.matmul · B2 cuBLASLt heuristic top-1 · B3 best of the heuristic top-N · **B3+** best of B3 and a
 20 s/shape enumerate-and-screen over algo × tile × stages × split-K × reduction × swizzle × custom · B5 Triton tutorial ·
@@ -199,8 +209,8 @@ Other findings to keep in mind:
   (median 0.91 vs B2, 1.00 vs B3+; B3+ stays an offline bar). `KPolicy` / `select_kernel` (`tune/online.py`) choose k = 3, or 5 for shapes the caller marks frequent (`calls` >= 1M). Rank v2 (`python -m tune ranker-v2`, analytic features + near-top weights + the `tail` suite as tune data) halves the Triton-only held-out tail
   (regret vs the Triton oracle at top-3: 0.4% / 9.5% / 2.3% -> 0.2% / 4.6% / 1.2% median / p95 / mean) but moves the joint search only within noise, for +0.08 s. Details and caveats: `reports/week1.md` 2026-11-01, `reports/ranker_compare.md`. Score rankers side by side with `python -m analysis.ranker_compare`.
 - **Second GPU (RTX 2060, Turing, 2026-11-02).** Triton's `tl.dot` compiles to FMAs on sm_75 (no `mma.sync` in any cached kernel): the best Triton config is 0.44x of B3+ (3080: 1.0x), so the family fails G2 and G4 there. Retrained on 56 shapes (~10 h of sweep) the ranker selects as well as on the 3080 (online top-3 0.7% / 7.5% / 2.5%, 0 of 27 picks > 50% off); the 3080 rankers used zero-shot do not transfer for Triton-only selection (13 of 27 top-3 picks > 50% off in `native`, the 2060 oracle uses BLOCK_K = 16 everywhere), but the joint search with cuBLASLt top-16 lands at its pool's ceiling (0.98 of B3+, cuBLASLt chosen on 24 of 27). Confounded by the missing tensor-core path; a second tensor-core GPU is open. `reports/week1.md` 2026-11-02, `reports/cross_gpu.md`.
-- **Triton-only selector bar (v1): lgbm diverse online top-3** (`tune online --order diverse`, sessions `topkd` / `topkd-graph` / `online-…-topkd`). lgbm_rank (`analysis/learned.py`) is a LightGBM regressor
 - **Third GPU (RTX 3090, Ampere sm_86, 2026-11-03, unlocked clock, driver 590.48.01).** The 3080 rankers used zero-shot on the same 27 held-out shapes transfer: 0 of 27 top-3 picks > 50% off in all four variants (2060: 13), online top-3 regret 5.4 / 3.7 / 0.9 / 1.8% median (v1 as_is / v1 native / v2 as_is / v2 native) vs 1.5% (3080 v1); v2 is within noise of the 3080 (+0.5 to +1.4 points mean), v1 as_is is worse (+3.5 [+1.1, +6.4]). Joint search with cuBLASLt top-16: 0.99-1.00 of B3+ median, same as the 3080. No retrained 3090 ranker and no noise study (unlocked), so margins are borrowed. `reports/week1.md` 2026-11-03, `reports/cross_gpu.md`.
+- **Triton-only selector bar (v1): lgbm diverse online top-3** (`tune online --order diverse`, sessions `topkd` / `topkd-graph` / `online-…-topkd`). lgbm_rank (`analysis/learned.py`) is a LightGBM regressor
   of log regret per (shape, candidate) over each tune shape's top-5 pool, using shape features + config params + `candidate_features`. It ranks the shape. `diverse_order` keeps the top pick, then takes the best config
   of each new (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K) group within 0.05 predicted log regret. That rule was fit on out-of-fold tune scores and is saved in `lgbm_rank.json`. The 3 picks are compiled, validated and short-timed (graph when < 50 µs), and the fastest is kept.
   Cold all: 1.0% / 9.9% / 2.7% (median / p95 / mean). ≥ 50 µs: 0.9% / 11.1% / 2.5%. Graph < 50 µs: 0.2% / 9.9% / 2.1%. Cost: ~0.4 s first use per shape (JIT compile).
@@ -280,7 +290,22 @@ python -m tune selectors       # re-score with both stage-2 files
 
 1. **Learned selector v0: done** (lgbm_rank, see §6 and `reports/week1.md` 2026-10-19 late). Next: lambdarank / regression blends, a larger candidate pool.
 2. **Top-k + short online search: done** (`tune online --order diverse`, top-3; inner warps / stages pass tried, a tie). Next: better ranking for N = 1 / tiny-K shapes and near-optimal tiles ranked low.
-3. **Joint {Triton ∪ cuBLASLt} selection: done without a router** (`--lt-n 16`, see §6). Left: a cost-only family router (skip Triton compiles when cuBLASLt is clearly ahead), the joint selector in the zero-shot runbook, faster v2 ranking (+40 ms), and a cache to move a shape from k = 3 to k = 5.
+3. **Joint {Triton ∪ cuBLASLt} selection: done without a router** (`--lt-n 16`, see §6). Left: a cost-only family router (skip Triton compiles when cuBLASLt is clearly ahead), the joint selector in the zero-shot runbook, and faster v2 ranking (+40 ms). The cache that moves a shape from k = 3 to k = 5 is the winner cache (§5).
 4. Noise study for graph-amortized mode (second session plus a reboot) before relying on tiny-GEMM wins.
 5. Kernel-level fixes if differentiation matters: an aligned-copy or padded path for unaligned strides, and a fused or atomic split-K reduction.
 6. Not built yet: B4 (CUTLASS), per-candidate subprocess isolation with hang timeouts (plan 7.2), adaptive sampling.
+
+## 10. Limitations of the shipped selector (prebuilt kernels and winner cache)
+
+**Prebuilt kernel bundle** (`kernels/bundle.py`; every miss falls back to compiling, so these cost time, never correctness):
+- **One Triton build and one GPU architecture.** The bundle is valid for the Triton version (3.7.1) and the compute capability it was built on (sm_86: RTX 3080, also the 3090). Another Triton version, another architecture (the 2060 is sm_75), a different `ptxas`, or any edit to `kernels/triton_matmul.py` changes Triton's cache keys: every lookup misses and every kernel compiles on first use, exactly as without a bundle. `install()` warns once with the reason; `python -m tune bundle status` shows it. Rebuild with `python -m tune bundle build` (~10 min on 10 workers).
+- **Only what the rankers can propose.** The union of the v1 and v2 pools (+ the 5 hand-picked configs), fp16 only (bf16 needs `--dtypes fp16,bf16` and compiles on first use otherwise), for tensors with 16-byte-aligned base pointers and the contiguous row-major strides `TritonMatmul` passes. A config outside the pool (`triton:<any key>`), a retrained ranker with a new pool, or a non-aligned view compiles on first use; rebuild after retraining a ranker.
+- **The C launcher is not bundled.** Triton also builds a small launcher per argument signature with gcc on first launch, cached in the user cache; it depends on the Python ABI and host compiler. The first launches in a fresh user cache pay it.
+- **A bundle hit skips compilation, not validation**: the correctness gate still runs on every candidate. The bundle is read only; a miss writes to the user cache (`TRITON_CACHE_DIR`).
+- **Size and shipping.** 21,187 kernels, 799 MiB as files (986 MiB on disk): not committable as files, so `kernels/bundle/` is gitignored and the repo carries the 19 MiB archive `kernels/bundle.tar.xz`, unpacked by the first `install()`. An archive for another Triton / architecture is not unpacked. Every committed rebuild adds ~19 MiB to git history (use Git LFS if it will change often).
+
+**Winner cache** (`tune/winner_cache.py`):
+- Entries are per machine and per environment (GPU id, Triton, cuBLASLt version, driver); a different environment ignores them (they stay in the file). Nothing is shared across GPUs.
+- Nothing expires: a winner is reused until the environment changes, a wider search is requested for that shape, or the file is deleted. A stored winner is the fastest of one short online timing (10 cold samples, one placement, no tie margin), so near-ties are as arbitrary as in `choose`.
+- A cuBLASLt winner is a heuristic key; if the library no longer returns it the entry is a miss and the shape is searched again.
+- A cache hit returns no `candidates` and `rank_s = 0`; callers that read the candidate list (experiments, `demo.py`) must pass `cache=None`.
