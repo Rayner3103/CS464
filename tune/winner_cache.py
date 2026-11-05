@@ -12,7 +12,7 @@ a winner whichever ranker proposed it. It is recorded for provenance.
 
 An entry is reused when it came from a search at least as wide as the one asked for (stored k >= k and stored lt_n >=
 lt_n): a shape first seen with k = 3 is searched again, once, when a caller later marks it frequent (k = 5), and the
-wider result replaces it. `select_kernel(..., cache=None)` turns the cache off (experiments, `demo.py`: they measure the
+wider result replaces it. `select_kernel(..., cache=None)` turns the cache off (experiments: they measure the
 search itself).
 
 A cuBLASLt winner is stored as its heuristic key (`h<rank>_a<algo>_t<tile>_...`); `select_kernel` rebuilds the candidate list

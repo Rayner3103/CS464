@@ -9,3 +9,6 @@ pipeline/.lock
 
 # Prebuilt Triton kernel bundle (kernels/bundle.py): ~1.5 GB of cubins, never commit it directly; ship the packed archive instead
 kernels/bundle/
+
+# nohup output of backgrounded runs
+nohup.out

@@ -63,7 +63,6 @@ analysis/
   zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`); `load_screen` keeps `slow` screen rows
   lt_ceiling.py / lt_clusters.py / lt_knn_scan.py / lt_knn_ab.py / lt_rank.py / lt_rank_ab.py / router.py / confirm_ab.py / joint_rank.py  the cuBLASLt k-NN, learned-ranker, router and joint-score study (router: fit + held-out score; confirm_ab: paired scoring of the router / confirmation online runs; joint_rank: the negative result) (CPU only): where the joint search's regret comes from, winner structure, tune-only leave-one-out choice of k, held-out A/B from one stage-2 session
   cross_gpu.py       cross-GPU comparison on the held-out shapes the runs share: regret vs each GPU's own screen, speed vs B3+, family ceiling, PTX mma check, paired bootstrap; CPU-only (`python -m analysis.cross_gpu --side LABEL DIR ...`, docstring has the command). Never compare a subset run to the 86-shape `REFERENCE_3080` constants in `zero_shot.py`
-demo.py      ~10 s workload on held-out shapes through B1/B2/B3/B5/B6 and the selector (top-3 Triton, joint with cuBLASLt): durations + one-time search cost (`python -m demo`, GPU idle)
 tests/       pytest unit tests (193 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
@@ -165,7 +164,7 @@ Runbook (standalone version with the prerequisites, scoring and pitfalls: [`docs
 ### Prebuilt kernels and the winner cache (shipping the selector)
 - **Bundle** (`kernels/bundle.py`, `kernels/bundle_build.py`, `docs/kernel_bundle.md`): the online search spends ~2/3 of its first-use cost compiling its top-k Triton configs (~0.13 s each). The bundle holds the compiled binary of every kernel the saved rankers can pick, so a fresh clone loads them instead.
   Triton's own cache cannot just be copied: its group files store absolute paths. `BundleCacheManager` (a `FileCacheManager` selected through `TRITON_CACHE_MANAGER`) looks in this machine's cache, then the read-only bundle, then lets Triton compile (into the user cache, never the repo). `select_kernel(use_bundle=True)` installs it; `tune online --fresh-cache`, `analysis.zero_shot` and the benchmark commands do not, so every measured compile cost stays a true first use.
-- **Winner cache** (`tune/winner_cache.py`): `select_kernel(cache=True)` returns the stored winner of an earlier search at least as wide (k and lt_n) with no ranking, compiling or timing, and stores the winner of every search it runs. Default file `data/<hw>/winner_cache.jsonl` (`TUNE_WINNER_CACHE=<path>` moves it, `=off` disables it). `demo.py` and the experiments pass `cache=None`.
+- **Winner cache** (`tune/winner_cache.py`): `select_kernel(cache=True)` returns the stored winner of an earlier search at least as wide (k and lt_n) with no ranking, compiling or timing, and stores the winner of every search it runs. Default file `data/<hw>/winner_cache.jsonl` (`TUNE_WINNER_CACHE=<path>` moves it, `=off` disables it). The experiments pass `cache=None`.
 
 ### Baselines (plan §4.1)
 B0 roofline · B1 torch.matmul · B2 cuBLASLt heuristic top-1 · B3 best of the heuristic top-N · **B3+** best of B3 and a
@@ -331,4 +330,4 @@ python -m tune selectors       # re-score with both stage-2 files
 - Entries are per machine and per environment (GPU id, Triton, cuBLASLt version, driver); a different environment ignores them (they stay in the file). Nothing is shared across GPUs.
 - Nothing expires: a winner is reused until the environment changes, a wider search is requested for that shape, or the file is deleted. A stored winner is the fastest of one short online timing (10 cold samples, one placement, no tie margin), so near-ties are as arbitrary as in `choose`.
 - A cuBLASLt winner is a heuristic key; if the library no longer returns it the entry is a miss and the shape is searched again.
-- A cache hit returns no `candidates` and `rank_s = 0`; callers that read the candidate list (experiments, `demo.py`) must pass `cache=None`.
+- A cache hit returns no `candidates` and `rank_s = 0`; callers that read the candidate list (experiments) must pass `cache=None`.

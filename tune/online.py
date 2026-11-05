@@ -289,7 +289,7 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
     whose tensors do not fit in memory returns {"skipped": ...} with choice None.
 
     Two things make a repeat or a fresh clone cheap (both default on, both opt-out because experiments measure the search
-    itself and `demo.py` passes `cache=None, use_bundle=False`):
+    itself and pass `cache=None, use_bundle=False`):
       * `use_bundle`: install the prebuilt Triton kernel bundle (`kernels/bundle.py`), so a candidate the rankers can
         propose is loaded instead of compiled. Any kernel not in it, or a bundle built for another Triton / GPU
         architecture, compiles as before (a mismatch is warned about once);

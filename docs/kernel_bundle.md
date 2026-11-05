@@ -7,7 +7,7 @@ Two things make the shipped selector cheap on a machine that has never seen a sh
 2. **The winner cache** (`tune/winner_cache.py`): the kernel the search picked for a shape, so a shape is searched once per machine.
 
 Both are on by default in `tune.online.select_kernel(ranker, M, N, K, ...)` and off everywhere that measures the search itself
-(`tune online`, `analysis.zero_shot`, the benchmark commands, `demo.py`).
+(`tune online`, `analysis.zero_shot`, the benchmark commands).
 
 ## LIMITATIONS (read first)
 
