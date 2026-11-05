@@ -117,7 +117,11 @@ def cmd_sweep(args):
     from tune.sweep import HELDOUT_SPLITS, coarse_subset, run_sweep
     splits = HELDOUT_SPLITS if args.split == "heldout" else ("tune",)
     screen_dir = args.screen_dir or ("sweep_screen_heldout" if args.split == "heldout" else "sweep_screen")
-    shapes = coarse_subset(_shapes(args.suite), args.per_suite, args.max_gflop, splits)
+    if args.shapes_file:                                   # an explicit shape list (e.g. suites/fresh/fresh465.json): screen all of it
+        shapes = _shapes(args.suite, args.shapes_file)
+        screen_dir = args.screen_dir or "sweep_screen_custom"
+    else:
+        shapes = coarse_subset(_shapes(args.suite), args.per_suite, args.max_gflop, splits)
     sweep_dir = args.out / screen_dir
     sweep_dir.mkdir(parents=True, exist_ok=True)
     subset = sweep_dir / "subset.json"
@@ -282,6 +286,8 @@ def main(argv=None):
                    help="heldout = heldout_region + heldout_random shapes (G5 out-of-sample check)")
     p.add_argument("--screen-dir", default=None,
                    help="directory under --out; default sweep_screen (tune) or sweep_screen_heldout (heldout)")
+    p.add_argument("--shapes-file", default=None, help="JSON with a 'shapes' list: screen exactly these shapes (overrides --suite / --split / "
+                                                       "--per-suite; default --screen-dir sweep_screen_custom)")
     p = add("noise", cmd_noise)
     p.add_argument("--shapes", default="suites/v1/noise.json")
     p.add_argument("--backends", default="torch,triton:bm128_bn128_bk32_w4_s4_g8_sk1")
