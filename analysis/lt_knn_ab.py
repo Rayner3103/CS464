@@ -40,7 +40,7 @@ ORC_X = np.minimum(ORC, KNN)
 print(f"n={len(shapes)} ({small.sum()} graph-amortized); rows with knn timed on {np.isfinite(KNN).sum()} shapes")
 
 def st(x):
-    return f"median {100*np.median(x):5.1f}%  p90 {100*np.percentile(x,90):5.1f}%  p95 {100*np.percentile(x,95):5.1f}%  mean {100*np.mean(x):5.1f}%"
+    return f"median {100*np.median(x):5.1f}%  p90 {100*np.percentile(x,90):5.1f}%  p95 {100*np.percentile(x,95):5.1f}%  p99 {100*np.percentile(x,99):5.1f}%  mean {100*np.mean(x):5.1f}%"
 
 print("\n== proposer ceiling (best of the kNN proposals, full protocol) ==")
 print(" vs B3 (heuristic top-16): faster by >margin on", int((KNN < B3 / eps).sum()), "shapes; slower by >margin on", int((KNN > B3 * eps).sum()))

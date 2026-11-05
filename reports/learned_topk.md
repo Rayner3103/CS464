@@ -1,21 +1,21 @@
 # Learned ranker: top-k + short online search on held-out shapes (auto-generated)
 
-lgbm_rank (`{"objective": "regression", "num_leaves": 255, "n_estimators": 1500}`) refit on all 477 tune shapes and saved as `data/<hw>/lgbm_rank.txt/.json` (pool of 868 configs). Per held-out shape it ranks its runnable pool; best-of-k = the fastest of the first k. Two orders: **plain** (score order) and **diverse** (`diverse_order`, rule `{"group": "tile_split_bk", "delta": 0.05, "plain": 1}`: keep the top `plain` picks, then the best config of each new group within `delta` predicted log regret of the top pick, then score order). Regret = t / oracle - 1, median / p95 (mean).
+lgbm_rank (`{"objective": "regression", "num_leaves": 255, "n_estimators": 1500}`) refit on all 477 tune shapes and saved as `data/<hw>/lgbm_rank.txt/.json` (pool of 868 configs). Per held-out shape it ranks its runnable pool; best-of-k = the fastest of the first k. Two orders: **plain** (score order) and **diverse** (`diverse_order`, rule `{"group": "tile_split_bk", "delta": 0.05, "plain": 1}`: keep the top `plain` picks, then the best config of each new group within `delta` predicted log regret of the top pick, then score order). Regret = t / oracle - 1, median / p95 / p99 (mean).
 
 ## Diversification rule (tune shapes only: best-of-3 screen regret on out-of-fold scores, 20 grouped folds)
 
 | rule | best-of-1 | best-of-3 | best-of-5 |
 |---|---|---|---|
-| {"group": "tile_split_bk", "delta": 0.05, "plain": 1} | 2.3% / 16.6% (4.8%) | 1.2% / 10.1% (2.8%) | 0.9% / 8.4% (2.1%) |
-| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "warps", "inner_delta": 0.02, "inner_pos": "after"} | 2.3% / 16.6% (4.8%) | 1.2% / 10.1% (2.8%) | 0.9% / 8.4% (2.1%) |
-| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "warps", "inner_delta": 0.1, "inner_pos": "after"} | 2.3% / 16.6% (4.8%) | 1.2% / 10.1% (2.8%) | 0.8% / 8.3% (2.1%) |
-| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "stages_warps", "inner_delta": 0.02, "inner_pos": "after"} | 2.3% / 16.6% (4.8%) | 1.2% / 10.1% (2.8%) | 0.8% / 8.4% (2.1%) |
-| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "stages_warps", "inner_delta": 0.05, "inner_pos": "after"} | 2.3% / 16.6% (4.8%) | 1.2% / 10.1% (2.8%) | 0.8% / 8.4% (2.1%) |
-| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "stages_warps", "inner_delta": 0.1, "inner_pos": "after"} | 2.3% / 16.6% (4.8%) | 1.2% / 10.1% (2.8%) | 0.8% / 8.4% (2.1%) |
-| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "stages_warps", "inner_delta": 0.2, "inner_pos": "after"} | 2.3% / 16.6% (4.8%) | 1.2% / 10.1% (2.8%) | 0.8% / 8.4% (2.1%) |
-| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "stages_warps", "inner_delta": Infinity, "inner_pos": "after"} | 2.3% / 16.6% (4.8%) | 1.2% / 10.1% (2.8%) | 0.8% / 8.4% (2.1%) |
-| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "warps", "inner_delta": 0.02, "inner_pos": "before"} | 2.3% / 16.6% (4.8%) | 1.2% / 10.1% (2.8%) | 0.9% / 8.3% (2.1%) |
-| plain | 2.3% / 16.6% (4.8%) | 1.5% / 12.0% (3.3%) | 1.0% / 10.5% (2.6%) |
+| {"group": "tile_split_bk", "delta": 0.05, "plain": 1} | 2.3% / 16.6% / 32.5% (4.8%) | 1.2% / 10.1% / 21.3% (2.8%) | 0.9% / 8.4% / 21.2% (2.1%) |
+| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "warps", "inner_delta": 0.02, "inner_pos": "after"} | 2.3% / 16.6% / 32.5% (4.8%) | 1.2% / 10.1% / 21.3% (2.8%) | 0.9% / 8.4% / 21.2% (2.1%) |
+| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "warps", "inner_delta": 0.1, "inner_pos": "after"} | 2.3% / 16.6% / 32.5% (4.8%) | 1.2% / 10.1% / 21.3% (2.8%) | 0.8% / 8.3% / 21.2% (2.1%) |
+| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "stages_warps", "inner_delta": 0.02, "inner_pos": "after"} | 2.3% / 16.6% / 32.5% (4.8%) | 1.2% / 10.1% / 21.3% (2.8%) | 0.8% / 8.4% / 21.2% (2.1%) |
+| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "stages_warps", "inner_delta": 0.05, "inner_pos": "after"} | 2.3% / 16.6% / 32.5% (4.8%) | 1.2% / 10.1% / 21.2% (2.8%) | 0.8% / 8.4% / 21.2% (2.1%) |
+| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "stages_warps", "inner_delta": 0.1, "inner_pos": "after"} | 2.3% / 16.6% / 32.5% (4.8%) | 1.2% / 10.1% / 21.2% (2.8%) | 0.8% / 8.4% / 21.2% (2.1%) |
+| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "stages_warps", "inner_delta": 0.2, "inner_pos": "after"} | 2.3% / 16.6% / 32.5% (4.8%) | 1.2% / 10.1% / 21.2% (2.8%) | 0.8% / 8.4% / 21.2% (2.1%) |
+| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "stages_warps", "inner_delta": Infinity, "inner_pos": "after"} | 2.3% / 16.6% / 32.5% (4.8%) | 1.2% / 10.1% / 21.2% (2.8%) | 0.8% / 8.4% / 21.2% (2.1%) |
+| {"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "warps", "inner_delta": 0.02, "inner_pos": "before"} | 2.3% / 16.6% / 32.5% (4.8%) | 1.2% / 10.1% / 21.3% (2.8%) | 0.9% / 8.3% / 21.2% (2.1%) |
+| plain | 2.3% / 16.6% / 32.5% (4.8%) | 1.5% / 12.0% / 26.1% (3.3%) | 1.0% / 10.5% / 22.9% (2.6%) |
 
 **inner** (diagnostic) = the best rule whose inner pass takes a top-3 slot, `{"group": "tile_split_bk", "delta": 0.05, "plain": 1, "inner": 1, "inner_group": "warps", "inner_delta": 0.02, "inner_pos": "before"}`; not chosen on tune CV.
 
@@ -25,21 +25,21 @@ Distinct (BLOCK_M, BLOCK_N, SPLIT_K) among the held-out top 3: plain 1.55, diver
 
 | order | k | all | >= 50 us | < 50 us |
 |---|---|---|---|---|
-| plain | 1 | 3.6% / 18.1% (5.5%) | 2.2% / 20.6% (5.6%) | 3.9% / 14.2% (5.5%) |
-| plain | 2 | 2.4% / 13.1% (4.2%) | 2.0% / 19.2% (4.9%) | 3.0% / 10.0% (3.8%) |
-| plain | 3 | 1.8% / 12.4% (3.6%) | 1.8% / 16.5% (4.0%) | 1.8% / 9.5% (3.4%) |
-| plain | 4 | 1.4% / 12.3% (3.1%) | 1.6% / 16.5% (3.6%) | 1.0% / 9.5% (2.7%) |
-| plain | 5 | 0.8% / 12.3% (2.8%) | 1.5% / 16.5% (3.5%) | 0.4% / 9.5% (2.5%) |
-| diverse | 1 | 3.6% / 18.1% (5.5%) | 2.2% / 20.6% (5.6%) | 3.9% / 14.2% (5.5%) |
-| diverse | 2 | 2.8% / 12.2% (4.0%) | 1.8% / 13.9% (4.0%) | 3.7% / 10.1% (4.0%) |
-| diverse | 3 | 2.0% / 10.6% (3.4%) | 1.5% / 10.4% (2.8%) | 2.9% / 9.4% (3.7%) |
-| diverse | 4 | 1.5% / 9.0% (2.8%) | 0.8% / 10.1% (2.4%) | 2.0% / 8.2% (3.0%) |
-| diverse | 5 | 0.9% / 9.0% (2.6%) | 0.8% / 10.1% (2.2%) | 1.5% / 8.2% (2.9%) |
-| inner | 1 | 3.6% / 18.1% (5.5%) | 2.2% / 20.6% (5.6%) | 3.9% / 14.2% (5.5%) |
-| inner | 2 | 2.7% / 12.2% (3.9%) | 1.8% / 13.9% (4.0%) | 3.6% / 10.1% (3.9%) |
-| inner | 3 | 2.0% / 10.6% (3.3%) | 1.5% / 10.4% (2.8%) | 2.8% / 9.7% (3.5%) |
-| inner | 4 | 1.5% / 10.4% (2.8%) | 0.8% / 10.1% (2.4%) | 2.0% / 9.3% (3.0%) |
-| inner | 5 | 0.8% / 9.0% (2.5%) | 0.8% / 10.1% (2.2%) | 1.4% / 8.0% (2.7%) |
+| plain | 1 | 3.6% / 18.1% / 24.0% (5.5%) | 2.2% / 20.6% / 22.5% (5.6%) | 3.9% / 14.2% / 23.1% (5.5%) |
+| plain | 2 | 2.4% / 13.1% / 19.9% (4.2%) | 2.0% / 19.2% / 22.1% (4.9%) | 3.0% / 10.0% / 14.3% (3.8%) |
+| plain | 3 | 1.8% / 12.4% / 19.9% (3.6%) | 1.8% / 16.5% / 22.1% (4.0%) | 1.8% / 9.5% / 14.3% (3.4%) |
+| plain | 4 | 1.4% / 12.3% / 19.9% (3.1%) | 1.6% / 16.5% / 22.1% (3.6%) | 1.0% / 9.5% / 13.2% (2.7%) |
+| plain | 5 | 0.8% / 12.3% / 19.9% (2.8%) | 1.5% / 16.5% / 22.1% (3.5%) | 0.4% / 9.5% / 13.1% (2.5%) |
+| diverse | 1 | 3.6% / 18.1% / 24.0% (5.5%) | 2.2% / 20.6% / 22.5% (5.6%) | 3.9% / 14.2% / 23.1% (5.5%) |
+| diverse | 2 | 2.8% / 12.2% / 16.4% (4.0%) | 1.8% / 13.9% / 19.4% (4.0%) | 3.7% / 10.1% / 14.3% (4.0%) |
+| diverse | 3 | 2.0% / 10.6% / 15.9% (3.4%) | 1.5% / 10.4% / 16.9% (2.8%) | 2.9% / 9.4% / 14.3% (3.7%) |
+| diverse | 4 | 1.5% / 9.0% / 14.4% (2.8%) | 0.8% / 10.1% / 16.9% (2.4%) | 2.0% / 8.2% / 13.2% (3.0%) |
+| diverse | 5 | 0.9% / 9.0% / 14.4% (2.6%) | 0.8% / 10.1% / 16.9% (2.2%) | 1.5% / 8.2% / 13.2% (2.9%) |
+| inner | 1 | 3.6% / 18.1% / 24.0% (5.5%) | 2.2% / 20.6% / 22.5% (5.6%) | 3.9% / 14.2% / 23.1% (5.5%) |
+| inner | 2 | 2.7% / 12.2% / 16.4% (3.9%) | 1.8% / 13.9% / 19.4% (4.0%) | 3.6% / 10.1% / 13.8% (3.9%) |
+| inner | 3 | 2.0% / 10.6% / 15.9% (3.3%) | 1.5% / 10.4% / 16.9% (2.8%) | 2.8% / 9.7% / 13.8% (3.5%) |
+| inner | 4 | 1.5% / 10.4% / 13.9% (2.8%) | 0.8% / 10.1% / 16.9% (2.4%) | 2.0% / 9.3% / 12.8% (3.0%) |
+| inner | 5 | 0.8% / 9.0% / 13.9% (2.5%) | 0.8% / 10.1% / 16.9% (2.2%) | 1.4% / 8.0% / 12.8% (2.7%) |
 
 Online search (plain): 86 shapes from `online_lgbm_rank.jsonl`.
 
@@ -53,38 +53,38 @@ Online search (inner): 86 shapes from `online_lgbm_rank_inner.jsonl`.
 
 | selector | all (n=86) | >= 50 us (n=30) | < 50 us (n=56) | vs B3+ median [p10, p90] |
 |---|---|---|---|---|
-| knn5 | 2.6% / 24.1% (9.5%) | 3.8% / 65.5% (18.8%) | 2.4% / 16.9% (4.5%) | 0.970 [0.71, 1.12] |
-| knnf | 2.5% / 22.3% (6.5%) | 2.2% / 36.5% (8.7%) | 2.7% / 18.4% (5.3%) | 0.967 [0.70, 1.12] |
-| plain best-of-1, full-protocol timing | 2.4% / 17.8% (4.1%) | 2.6% / 19.0% (5.2%) | 2.3% / 11.8% (3.5%) | 0.968 [0.77, 1.12] |
-| plain best-of-2, full-protocol timing | 1.2% / 11.9% (3.2%) | 2.0% / 18.3% (4.5%) | 0.7% / 9.3% (2.5%) | 0.971 [0.77, 1.12] |
-| plain best-of-3, full-protocol timing | 0.6% / 11.6% (2.8%) | 0.9% / 16.6% (3.7%) | 0.3% / 8.3% (2.2%) | 0.981 [0.77, 1.12] |
-| plain best-of-4, full-protocol timing | 0.3% / 11.0% (2.4%) | 0.7% / 16.6% (3.3%) | 0.0% / 7.2% (2.0%) | 0.988 [0.77, 1.12] |
-| plain best-of-5, full-protocol timing | 0.3% / 11.0% (2.3%) | 0.7% / 16.6% (3.1%) | 0.0% / 7.2% (1.8%) | 0.993 [0.77, 1.12] |
-| diverse best-of-1, full-protocol timing | 2.4% / 17.8% (4.1%) | 2.6% / 19.0% (5.2%) | 2.3% / 11.8% (3.5%) | 0.968 [0.77, 1.12] |
-| diverse best-of-2, full-protocol timing | 1.2% / 10.4% (2.8%) | 1.5% / 12.5% (3.6%) | 1.0% / 8.3% (2.4%) | 0.979 [0.78, 1.12] |
-| diverse best-of-3, full-protocol timing | 0.7% / 9.1% (2.3%) | 1.0% / 10.0% (2.4%) | 0.6% / 8.3% (2.2%) | 0.988 [0.78, 1.12] |
-| diverse best-of-4, full-protocol timing | 0.4% / 8.5% (2.0%) | 0.5% / 8.1% (2.0%) | 0.4% / 8.3% (2.0%) | 0.991 [0.78, 1.12] |
-| diverse best-of-5, full-protocol timing | 0.2% / 8.5% (1.9%) | 0.3% / 8.1% (1.8%) | 0.2% / 8.3% (1.9%) | 0.991 [0.78, 1.13] |
-| inner best-of-1, full-protocol timing | 2.4% / 17.8% (4.1%) | 2.6% / 19.0% (5.2%) | 2.3% / 11.8% (3.5%) | 0.968 [0.77, 1.12] |
-| inner best-of-2, full-protocol timing | 1.2% / 9.5% (2.8%) | 1.5% / 12.5% (3.6%) | 1.0% / 8.3% (2.3%) | 0.979 [0.78, 1.12] |
-| inner best-of-3, full-protocol timing | 0.7% / 9.1% (2.2%) | 1.0% / 10.0% (2.4%) | 0.4% / 8.3% (2.0%) | 0.988 [0.78, 1.12] |
-| inner best-of-4, full-protocol timing | 0.4% / 8.5% (1.9%) | 0.5% / 8.1% (2.0%) | 0.4% / 8.3% (1.9%) | 0.991 [0.78, 1.12] |
-| inner best-of-5, full-protocol timing | 0.2% / 8.5% (1.8%) | 0.3% / 8.1% (1.8%) | 0.0% / 8.3% (1.7%) | 0.991 [0.78, 1.12] |
-| plain online top-1 (short timing picks) | 2.4% / 17.8% (4.1%) | 2.6% / 19.0% (5.2%) | 2.3% / 11.8% (3.5%) | 0.968 [0.77, 1.12] |
-| plain online top-2 (short timing picks) | 1.5% / 12.7% (3.5%) | 2.0% / 18.3% (4.6%) | 1.2% / 9.3% (2.9%) | 0.971 [0.77, 1.12] |
-| plain online top-3 (short timing picks) | 0.9% / 12.2% (3.1%) | 0.9% / 16.7% (3.8%) | 1.0% / 8.4% (2.7%) | 0.973 [0.77, 1.12] |
-| plain online top-4 (short timing picks) | 0.8% / 11.3% (2.9%) | 0.8% / 16.7% (3.4%) | 1.0% / 8.3% (2.6%) | 0.985 [0.77, 1.12] |
-| plain online top-5 (short timing picks) | 1.0% / 11.3% (2.9%) | 1.0% / 16.7% (3.3%) | 1.6% / 8.3% (2.7%) | 0.986 [0.77, 1.12] |
-| diverse online top-1 (short timing picks) | 2.4% / 17.8% (4.1%) | 2.6% / 19.0% (5.2%) | 2.3% / 11.8% (3.5%) | 0.968 [0.77, 1.12] |
-| diverse online top-2 (short timing picks) | 1.4% / 10.4% (3.0%) | 1.5% / 12.5% (3.6%) | 1.2% / 8.4% (2.7%) | 0.971 [0.77, 1.12] |
-| diverse online top-3 (short timing picks) | 1.1% / 9.1% (2.6%) | 1.0% / 10.0% (2.4%) | 1.2% / 8.4% (2.7%) | 0.980 [0.77, 1.12] |
-| diverse online top-4 (short timing picks) | 0.8% / 8.5% (2.4%) | 0.6% / 8.1% (2.0%) | 1.1% / 8.4% (2.6%) | 0.982 [0.77, 1.12] |
-| diverse online top-5 (short timing picks) | 0.7% / 8.5% (2.4%) | 0.3% / 8.1% (1.9%) | 0.9% / 8.4% (2.6%) | 0.986 [0.77, 1.12] |
-| inner online top-1 (short timing picks) | 2.4% / 17.8% (4.1%) | 2.6% / 19.0% (5.2%) | 2.3% / 11.8% (3.5%) | 0.968 [0.77, 1.12] |
-| inner online top-2 (short timing picks) | 1.4% / 10.4% (3.0%) | 1.5% / 12.5% (3.7%) | 1.2% / 8.4% (2.7%) | 0.979 [0.77, 1.12] |
-| inner online top-3 (short timing picks) | 1.1% / 9.1% (2.5%) | 1.0% / 10.0% (2.4%) | 1.2% / 8.4% (2.6%) | 0.980 [0.77, 1.12] |
-| inner online top-4 (short timing picks) | 1.0% / 8.5% (2.4%) | 0.8% / 8.1% (2.0%) | 1.3% / 8.4% (2.7%) | 0.986 [0.77, 1.12] |
-| inner online top-5 (short timing picks) | 0.8% / 8.5% (2.3%) | 0.3% / 8.1% (1.9%) | 1.2% / 8.4% (2.6%) | 0.986 [0.77, 1.12] |
+| knn5 | 2.6% / 24.1% / 122.2% (9.5%) | 3.8% / 65.5% / 222.1% (18.8%) | 2.4% / 16.9% / 22.1% (4.5%) | 0.970 [0.71, 1.12] |
+| knnf | 2.5% / 22.3% / 40.9% (6.5%) | 2.2% / 36.5% / 44.5% (8.7%) | 2.7% / 18.4% / 24.9% (5.3%) | 0.967 [0.70, 1.12] |
+| plain best-of-1, full-protocol timing | 2.4% / 17.8% / 23.8% (4.1%) | 2.6% / 19.0% / 21.8% (5.2%) | 2.3% / 11.8% / 25.9% (3.5%) | 0.968 [0.77, 1.12] |
+| plain best-of-2, full-protocol timing | 1.2% / 11.9% / 21.9% (3.2%) | 2.0% / 18.3% / 21.8% (4.5%) | 0.7% / 9.3% / 16.3% (2.5%) | 0.971 [0.77, 1.12] |
+| plain best-of-3, full-protocol timing | 0.6% / 11.6% / 21.9% (2.8%) | 0.9% / 16.6% / 21.8% (3.7%) | 0.3% / 8.3% / 16.3% (2.2%) | 0.981 [0.77, 1.12] |
+| plain best-of-4, full-protocol timing | 0.3% / 11.0% / 21.9% (2.4%) | 0.7% / 16.6% / 21.8% (3.3%) | 0.0% / 7.2% / 16.3% (2.0%) | 0.988 [0.77, 1.12] |
+| plain best-of-5, full-protocol timing | 0.3% / 11.0% / 21.9% (2.3%) | 0.7% / 16.6% / 21.8% (3.1%) | 0.0% / 7.2% / 16.3% (1.8%) | 0.993 [0.77, 1.12] |
+| diverse best-of-1, full-protocol timing | 2.4% / 17.8% / 23.8% (4.1%) | 2.6% / 19.0% / 21.8% (5.2%) | 2.3% / 11.8% / 25.9% (3.5%) | 0.968 [0.77, 1.12] |
+| diverse best-of-2, full-protocol timing | 1.2% / 10.4% / 18.6% (2.8%) | 1.5% / 12.5% / 18.2% (3.6%) | 1.0% / 8.3% / 14.9% (2.4%) | 0.979 [0.78, 1.12] |
+| diverse best-of-3, full-protocol timing | 0.7% / 9.1% / 18.6% (2.3%) | 1.0% / 10.0% / 17.1% (2.4%) | 0.6% / 8.3% / 14.9% (2.2%) | 0.988 [0.78, 1.12] |
+| diverse best-of-4, full-protocol timing | 0.4% / 8.5% / 18.6% (2.0%) | 0.5% / 8.1% / 16.7% (2.0%) | 0.4% / 8.3% / 14.9% (2.0%) | 0.991 [0.78, 1.12] |
+| diverse best-of-5, full-protocol timing | 0.2% / 8.5% / 18.6% (1.9%) | 0.3% / 8.1% / 16.7% (1.8%) | 0.2% / 8.3% / 14.9% (1.9%) | 0.991 [0.78, 1.13] |
+| inner best-of-1, full-protocol timing | 2.4% / 17.8% / 23.8% (4.1%) | 2.6% / 19.0% / 21.8% (5.2%) | 2.3% / 11.8% / 25.9% (3.5%) | 0.968 [0.77, 1.12] |
+| inner best-of-2, full-protocol timing | 1.2% / 9.5% / 18.6% (2.8%) | 1.5% / 12.5% / 18.2% (3.6%) | 1.0% / 8.3% / 13.4% (2.3%) | 0.979 [0.78, 1.12] |
+| inner best-of-3, full-protocol timing | 0.7% / 9.1% / 18.6% (2.2%) | 1.0% / 10.0% / 17.1% (2.4%) | 0.4% / 8.3% / 13.4% (2.0%) | 0.988 [0.78, 1.12] |
+| inner best-of-4, full-protocol timing | 0.4% / 8.5% / 18.6% (1.9%) | 0.5% / 8.1% / 16.7% (2.0%) | 0.4% / 8.3% / 13.4% (1.9%) | 0.991 [0.78, 1.12] |
+| inner best-of-5, full-protocol timing | 0.2% / 8.5% / 18.6% (1.8%) | 0.3% / 8.1% / 16.7% (1.8%) | 0.0% / 8.3% / 13.4% (1.7%) | 0.991 [0.78, 1.12] |
+| plain online top-1 (short timing picks) | 2.4% / 17.8% / 23.8% (4.1%) | 2.6% / 19.0% / 21.8% (5.2%) | 2.3% / 11.8% / 25.9% (3.5%) | 0.968 [0.77, 1.12] |
+| plain online top-2 (short timing picks) | 1.5% / 12.7% / 22.4% (3.5%) | 2.0% / 18.3% / 21.8% (4.6%) | 1.2% / 9.3% / 17.2% (2.9%) | 0.971 [0.77, 1.12] |
+| plain online top-3 (short timing picks) | 0.9% / 12.2% / 22.4% (3.1%) | 0.9% / 16.7% / 21.8% (3.8%) | 1.0% / 8.4% / 17.2% (2.7%) | 0.973 [0.77, 1.12] |
+| plain online top-4 (short timing picks) | 0.8% / 11.3% / 22.4% (2.9%) | 0.8% / 16.7% / 21.8% (3.4%) | 1.0% / 8.3% / 16.9% (2.6%) | 0.985 [0.77, 1.12] |
+| plain online top-5 (short timing picks) | 1.0% / 11.3% / 22.4% (2.9%) | 1.0% / 16.7% / 21.8% (3.3%) | 1.6% / 8.3% / 16.9% (2.7%) | 0.986 [0.77, 1.12] |
+| diverse online top-1 (short timing picks) | 2.4% / 17.8% / 23.8% (4.1%) | 2.6% / 19.0% / 21.8% (5.2%) | 2.3% / 11.8% / 25.9% (3.5%) | 0.968 [0.77, 1.12] |
+| diverse online top-2 (short timing picks) | 1.4% / 10.4% / 20.2% (3.0%) | 1.5% / 12.5% / 18.2% (3.6%) | 1.2% / 8.4% / 16.9% (2.7%) | 0.971 [0.77, 1.12] |
+| diverse online top-3 (short timing picks) | 1.1% / 9.1% / 20.2% (2.6%) | 1.0% / 10.0% / 17.1% (2.4%) | 1.2% / 8.4% / 16.9% (2.7%) | 0.980 [0.77, 1.12] |
+| diverse online top-4 (short timing picks) | 0.8% / 8.5% / 20.2% (2.4%) | 0.6% / 8.1% / 16.7% (2.0%) | 1.1% / 8.4% / 16.9% (2.6%) | 0.982 [0.77, 1.12] |
+| diverse online top-5 (short timing picks) | 0.7% / 8.5% / 20.2% (2.4%) | 0.3% / 8.1% / 16.7% (1.9%) | 0.9% / 8.4% / 16.9% (2.6%) | 0.986 [0.77, 1.12] |
+| inner online top-1 (short timing picks) | 2.4% / 17.8% / 23.8% (4.1%) | 2.6% / 19.0% / 21.8% (5.2%) | 2.3% / 11.8% / 25.9% (3.5%) | 0.968 [0.77, 1.12] |
+| inner online top-2 (short timing picks) | 1.4% / 10.4% / 20.2% (3.0%) | 1.5% / 12.5% / 18.2% (3.7%) | 1.2% / 8.4% / 16.6% (2.7%) | 0.979 [0.77, 1.12] |
+| inner online top-3 (short timing picks) | 1.1% / 9.1% / 20.2% (2.5%) | 1.0% / 10.0% / 17.2% (2.4%) | 1.2% / 8.4% / 16.9% (2.6%) | 0.980 [0.77, 1.12] |
+| inner online top-4 (short timing picks) | 1.0% / 8.5% / 20.2% (2.4%) | 0.8% / 8.1% / 16.8% (2.0%) | 1.3% / 8.4% / 16.9% (2.7%) | 0.986 [0.77, 1.12] |
+| inner online top-5 (short timing picks) | 0.8% / 8.5% / 20.2% (2.3%) | 0.3% / 8.1% / 16.8% (1.9%) | 1.2% / 8.4% / 16.9% (2.6%) | 0.986 [0.77, 1.12] |
 
 Worst shapes of plain top-3 (online) and the diverse top-3 there:
 
@@ -105,38 +105,38 @@ Worst shapes of plain top-3 (online) and the diverse top-3 there:
 
 | selector | all (< 50 us shapes) (n=56) | vs B3+ median [p10, p90] |
 |---|---|---|
-| knn5 | 4.0% / 23.8% (7.0%) | 0.971 [0.65, 1.17] |
-| knnf | 4.9% / 25.8% (7.7%) | 0.950 [0.69, 1.15] |
-| plain best-of-1, full-protocol timing | 2.5% / 13.5% (4.4%) | 0.994 [0.72, 1.17] |
-| plain best-of-2, full-protocol timing | 0.4% / 11.9% (2.9%) | 1.007 [0.73, 1.17] |
-| plain best-of-3, full-protocol timing | 0.3% / 11.9% (2.6%) | 1.007 [0.73, 1.18] |
-| plain best-of-4, full-protocol timing | 0.1% / 11.8% (2.4%) | 1.007 [0.73, 1.18] |
-| plain best-of-5, full-protocol timing | 0.0% / 11.8% (2.2%) | 1.010 [0.73, 1.18] |
-| diverse best-of-1, full-protocol timing | 2.5% / 13.5% (4.4%) | 0.994 [0.72, 1.17] |
-| diverse best-of-2, full-protocol timing | 0.2% / 10.9% (2.3%) | 1.011 [0.73, 1.18] |
-| diverse best-of-3, full-protocol timing | 0.2% / 9.7% (2.0%) | 1.011 [0.73, 1.18] |
-| diverse best-of-4, full-protocol timing | 0.1% / 8.2% (1.8%) | 1.011 [0.73, 1.18] |
-| diverse best-of-5, full-protocol timing | 0.0% / 8.2% (1.7%) | 1.011 [0.73, 1.18] |
-| inner best-of-1, full-protocol timing | 2.5% / 13.5% (4.4%) | 0.994 [0.72, 1.17] |
-| inner best-of-2, full-protocol timing | 0.2% / 11.6% (2.3%) | 1.007 [0.73, 1.18] |
-| inner best-of-3, full-protocol timing | 0.2% / 8.2% (1.7%) | 1.011 [0.73, 1.18] |
-| inner best-of-4, full-protocol timing | 0.1% / 8.2% (1.6%) | 1.011 [0.73, 1.18] |
-| inner best-of-5, full-protocol timing | 0.0% / 7.8% (1.4%) | 1.011 [0.73, 1.18] |
-| plain online top-1 (short timing picks) | 2.5% / 13.5% (4.4%) | 0.994 [0.72, 1.17] |
-| plain online top-2 (short timing picks) | 0.4% / 12.3% (2.9%) | 1.007 [0.73, 1.17] |
-| plain online top-3 (short timing picks) | 0.4% / 12.3% (2.7%) | 1.007 [0.73, 1.17] |
-| plain online top-4 (short timing picks) | 0.3% / 12.6% (2.5%) | 1.007 [0.73, 1.17] |
-| plain online top-5 (short timing picks) | 0.1% / 12.6% (2.3%) | 1.010 [0.73, 1.18] |
-| diverse online top-1 (short timing picks) | 2.5% / 13.5% (4.4%) | 0.994 [0.72, 1.17] |
-| diverse online top-2 (short timing picks) | 0.3% / 11.1% (2.3%) | 1.011 [0.73, 1.18] |
-| diverse online top-3 (short timing picks) | 0.2% / 9.7% (2.1%) | 1.011 [0.73, 1.18] |
-| diverse online top-4 (short timing picks) | 0.2% / 8.2% (1.9%) | 1.011 [0.73, 1.18] |
-| diverse online top-5 (short timing picks) | 0.2% / 8.2% (1.9%) | 1.011 [0.73, 1.18] |
-| inner online top-1 (short timing picks) | 2.5% / 13.5% (4.4%) | 0.994 [0.72, 1.17] |
-| inner online top-2 (short timing picks) | 0.3% / 11.6% (2.3%) | 1.007 [0.73, 1.18] |
-| inner online top-3 (short timing picks) | 0.2% / 8.2% (1.7%) | 1.011 [0.73, 1.18] |
-| inner online top-4 (short timing picks) | 0.1% / 8.2% (1.6%) | 1.011 [0.73, 1.18] |
-| inner online top-5 (short timing picks) | 0.1% / 7.8% (1.5%) | 1.011 [0.73, 1.18] |
+| knn5 | 4.0% / 23.8% / 36.6% (7.0%) | 0.971 [0.65, 1.17] |
+| knnf | 4.9% / 25.8% / 37.9% (7.7%) | 0.950 [0.69, 1.15] |
+| plain best-of-1, full-protocol timing | 2.5% / 13.5% / 21.4% (4.4%) | 0.994 [0.72, 1.17] |
+| plain best-of-2, full-protocol timing | 0.4% / 11.9% / 14.7% (2.9%) | 1.007 [0.73, 1.17] |
+| plain best-of-3, full-protocol timing | 0.3% / 11.9% / 14.7% (2.6%) | 1.007 [0.73, 1.18] |
+| plain best-of-4, full-protocol timing | 0.1% / 11.8% / 14.7% (2.4%) | 1.007 [0.73, 1.18] |
+| plain best-of-5, full-protocol timing | 0.0% / 11.8% / 14.7% (2.2%) | 1.010 [0.73, 1.18] |
+| diverse best-of-1, full-protocol timing | 2.5% / 13.5% / 21.4% (4.4%) | 0.994 [0.72, 1.17] |
+| diverse best-of-2, full-protocol timing | 0.2% / 10.9% / 14.9% (2.3%) | 1.011 [0.73, 1.18] |
+| diverse best-of-3, full-protocol timing | 0.2% / 9.7% / 14.9% (2.0%) | 1.011 [0.73, 1.18] |
+| diverse best-of-4, full-protocol timing | 0.1% / 8.2% / 14.9% (1.8%) | 1.011 [0.73, 1.18] |
+| diverse best-of-5, full-protocol timing | 0.0% / 8.2% / 14.9% (1.7%) | 1.011 [0.73, 1.18] |
+| inner best-of-1, full-protocol timing | 2.5% / 13.5% / 21.4% (4.4%) | 0.994 [0.72, 1.17] |
+| inner best-of-2, full-protocol timing | 0.2% / 11.6% / 13.6% (2.3%) | 1.007 [0.73, 1.18] |
+| inner best-of-3, full-protocol timing | 0.2% / 8.2% / 13.0% (1.7%) | 1.011 [0.73, 1.18] |
+| inner best-of-4, full-protocol timing | 0.1% / 8.2% / 13.0% (1.6%) | 1.011 [0.73, 1.18] |
+| inner best-of-5, full-protocol timing | 0.0% / 7.8% / 12.2% (1.4%) | 1.011 [0.73, 1.18] |
+| plain online top-1 (short timing picks) | 2.5% / 13.5% / 21.4% (4.4%) | 0.994 [0.72, 1.17] |
+| plain online top-2 (short timing picks) | 0.4% / 12.3% / 14.8% (2.9%) | 1.007 [0.73, 1.17] |
+| plain online top-3 (short timing picks) | 0.4% / 12.3% / 14.8% (2.7%) | 1.007 [0.73, 1.17] |
+| plain online top-4 (short timing picks) | 0.3% / 12.6% / 14.8% (2.5%) | 1.007 [0.73, 1.17] |
+| plain online top-5 (short timing picks) | 0.1% / 12.6% / 14.8% (2.3%) | 1.010 [0.73, 1.18] |
+| diverse online top-1 (short timing picks) | 2.5% / 13.5% / 21.4% (4.4%) | 0.994 [0.72, 1.17] |
+| diverse online top-2 (short timing picks) | 0.3% / 11.1% / 15.0% (2.3%) | 1.011 [0.73, 1.18] |
+| diverse online top-3 (short timing picks) | 0.2% / 9.7% / 15.0% (2.1%) | 1.011 [0.73, 1.18] |
+| diverse online top-4 (short timing picks) | 0.2% / 8.2% / 15.0% (1.9%) | 1.011 [0.73, 1.18] |
+| diverse online top-5 (short timing picks) | 0.2% / 8.2% / 15.0% (1.9%) | 1.011 [0.73, 1.18] |
+| inner online top-1 (short timing picks) | 2.5% / 13.5% / 21.4% (4.4%) | 0.994 [0.72, 1.17] |
+| inner online top-2 (short timing picks) | 0.3% / 11.6% / 13.7% (2.3%) | 1.007 [0.73, 1.18] |
+| inner online top-3 (short timing picks) | 0.2% / 8.2% / 13.1% (1.7%) | 1.011 [0.73, 1.18] |
+| inner online top-4 (short timing picks) | 0.1% / 8.2% / 13.1% (1.6%) | 1.011 [0.73, 1.18] |
+| inner online top-5 (short timing picks) | 0.1% / 7.8% / 12.4% (1.5%) | 1.011 [0.73, 1.18] |
 
 Worst shapes of plain top-3 (online) and the diverse top-3 there:
 

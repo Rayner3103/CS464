@@ -158,7 +158,7 @@ def main(argv=None):
             pool.append(next(x for x in c if x.get("family") == "cublaslt"))
         return pool
 
-    print(f"\nheld-out simulation, n = {len(shapes)}; regret vs the joint oracle (median / p95 / mean), shapes > 5% / > 10% off, slower than B3+, "
+    print(f"\nheld-out simulation, n = {len(shapes)}; regret vs the joint oracle (median / p95 / p99 / mean), shapes > 5% / > 10% off, slower than B3+, "
           "mean pool size, cost (no bundle), shapes with no Triton candidate in the pool")
     rowsout = [("fixed: Triton top-3 + heuristic 16 + ranker 5", fixed)]
     for m in (4, 6, 8, 10, 12, 16, 24):
@@ -168,7 +168,7 @@ def main(argv=None):
     for lab, fn in rowsout:
         t, cost, nt, size = evaluate(fn)
         g = t / ORC - 1
-        print(f"  {lab:46s} {100 * np.median(g):4.1f}% / {100 * np.percentile(g, 95):5.1f}% / {100 * g.mean():4.1f}% | {(g > .05).sum():2d} / {(g > .10).sum():2d} | "
+        print(f"  {lab:46s} {100 * np.median(g):4.1f}% / {100 * np.percentile(g, 95):5.1f}% / {100 * np.percentile(g, 99):5.1f}% / {100 * g.mean():4.1f}% | {(g > .05).sum():2d} / {(g > .10).sum():2d} | "
               f"{(t > B3P * eps).sum():2d} | {size.mean():4.1f} | {cost.mean():.3f}s | {(nt == 0).sum():2d}")
 
 

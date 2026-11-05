@@ -77,7 +77,7 @@ def timeof(shape, key, ref, cold):
 
 
 def st(x):
-    return f"{100 * np.median(x):4.1f}% / {100 * np.percentile(x, 95):5.1f}% / {100 * np.mean(x):4.1f}%"
+    return f"{100 * np.median(x):4.1f}% / {100 * np.percentile(x, 95):5.1f}% / {100 * np.percentile(x, 99):5.1f}% / {100 * np.mean(x):4.1f}%"
 
 
 def main(argv=None):
@@ -120,7 +120,7 @@ def main(argv=None):
             fam.append(ch.get("family", "triton"))
         res[label] = (np.array(t), np.array(cost), np.array(fam))
 
-    print("\n== regret vs the joint oracle (median / p95 / mean); v2 top-3 Triton + heuristic LT16 + the named proposals ==")
+    print("\n== regret vs the joint oracle (median / p95 / p99 / mean); v2 top-3 Triton + heuristic LT16 + the named proposals ==")
     print(f"{'pool':26s} {'all':>22s} {'>= 50 us':>22s} {'< 50 us':>22s} | >5% >10% | vs B3+ faster/slower | cost  picks kNN/rank")
     for label, _, _ in POOLS:
         t, cost, fam = res[label]
@@ -133,15 +133,16 @@ def main(argv=None):
         g0 = res[label][0] / ORC0 - 1
         print(f"{label:26s} {st(g0):>22s} | >5% {(g0 > 0.05).sum():3d} >10% {(g0 > 0.10).sum():3d} | shapes with negative regret {(g0 < -1e-9).sum():2d}, worst {100 * g0.min():5.1f}%")
 
-    print("\n== paired bootstrap of the regret difference a - b (points; 4000 resamples of the shapes, 95% interval): mean and p95 ==")
+    print("\n== paired bootstrap of the regret difference a - b (points; 4000 resamples of the shapes, 95% interval): mean, p95 and p99 ==")
     rb = np.random.default_rng(1)
     def regret_diff(a_lab, b_lab):
         ga, gb = res[a_lab][0] / ORC - 1, res[b_lab][0] / ORC - 1
         ix = rb.integers(0, len(ga), (4000, len(ga)))
         dm = 100 * (ga[ix].mean(1) - gb[ix].mean(1))
         dp = 100 * (np.percentile(ga[ix], 95, axis=1) - np.percentile(gb[ix], 95, axis=1))
+        d99 = 100 * (np.percentile(ga[ix], 99, axis=1) - np.percentile(gb[ix], 99, axis=1))
         f = lambda x: f"{x.mean():+6.2f} [{np.percentile(x, 2.5):+6.2f}, {np.percentile(x, 97.5):+6.2f}]"
-        print(f"  {a_lab:26s} - {b_lab:22s} mean {f(dm)}   p95 {f(dp)}")
+        print(f"  {a_lab:26s} - {b_lab:22s} mean {f(dm)}   p95 {f(dp)}   p99 {f(d99)}")
     regret_diff("+ kNN8 proposals", "heuristic LT16 only")
     regret_diff("+ ranker top-5", "heuristic LT16 only")
     regret_diff("+ ranker top-5", "+ kNN8 proposals")

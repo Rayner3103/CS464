@@ -78,9 +78,9 @@ def chosen_times(online: Path, ref: dict, cold: dict) -> dict:
 
 def stats(x: np.ndarray) -> dict:
     if not len(x):  # an empty group (e.g. no shape under 50 us on this GPU)
-        return {k: float("nan") for k in ("median", "p10", "p90", "p95", "mean")}
+        return {k: float("nan") for k in ("median", "p10", "p90", "p95", "p99", "mean")}
     return {"median": float(np.median(x)), "p10": float(np.percentile(x, 10)), "p90": float(np.percentile(x, 90)),
-            "p95": float(np.percentile(x, 95)), "mean": float(np.mean(x))}
+            "p95": float(np.percentile(x, 95)), "p99": float(np.percentile(x, 99)), "mean": float(np.mean(x))}
 
 
 def score(online: Path, ref: dict, cold: dict) -> dict:
@@ -137,16 +137,16 @@ def build(data: Path, report: Path, online: dict[str, str], results: str, graph_
     for g in ("all", "< 50 us", ">= 50 us"):
         lines += [f"## {g} (n = {sc[names[0]]['scores'][cfgs[0]][g]['n']})", "",
                   "| ranker | selector | first-use cost | vs B2 median / p10 | faster / slower | vs B3 median / p10 | faster / slower | "
-                  "vs B3+ median / p10 | faster / slower | regret vs joint oracle median / p95 (mean) | picks cuBLASLt |",
+                  "vs B3+ median / p10 | faster / slower | regret vs joint oracle median / p95 / p99 (mean) | picks cuBLASLt |",
                   "|---|---|---|---|---|---|---|---|---|---|---|"]
         for n in names:
             for c in cfgs:
                 e = sc[n]["scores"][c][g]
                 rg = e["regret_joint"]
                 lines.append(f"| {n} | {c} | {e['cost_s']:.2f} s | " + " | ".join(fmt(e, r) for r in ("b2", "b3", "b3p"))
-                             + f" | {100 * rg['median']:.1f}% / {100 * rg['p95']:.1f}% ({100 * rg['mean']:.1f}%) | {e['pct_lt']:.0f}% |")
+                             + f" | {100 * rg['median']:.1f}% / {100 * rg['p95']:.1f}% / {100 * rg['p99']:.1f}% ({100 * rg['mean']:.1f}%) | {e['pct_lt']:.0f}% |")
         lines.append("")
-    lines += ["## Triton only: regret vs the Triton oracle of the session (median / p95 (mean))", "",
+    lines += ["## Triton only: regret vs the Triton oracle of the session (median / p95 / p99 (mean))", "",
               "| selector | " + " | ".join(f"{n} {g}" for n in names for g in ("all", "< 50 us", ">= 50 us")) + " |",
               "|---|" + "---|" * (3 * len(names))]
     for c in [c for c in ("top-3 Triton only",) if c in cfgs]:
@@ -154,7 +154,7 @@ def build(data: Path, report: Path, online: dict[str, str], results: str, graph_
         for n in names:
             for g in ("all", "< 50 us", ">= 50 us"):
                 rg = sc[n]["scores"][c][g]["regret_triton"]
-                cells.append(f"{100 * rg['median']:.1f}% / {100 * rg['p95']:.1f}% ({100 * rg['mean']:.1f}%)")
+                cells.append(f"{100 * rg['median']:.1f}% / {100 * rg['p95']:.1f}% / {100 * rg['p99']:.1f}% ({100 * rg['mean']:.1f}%)")
         lines.append(f"| {c} | " + " | ".join(cells) + " |")
     pr = {}
     if len(names) == 2:

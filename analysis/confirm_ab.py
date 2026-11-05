@@ -6,7 +6,7 @@ two halves are timed, whether the Triton half may be skipped (`--router`) and wh
 (`results_lock1755_rank16*.jsonl`), so differences between runs are differences of choice, not of measurement. The reference is the earlier
 Triton-first run's own k = 3 choice from the same pool (ranker top-5, no k-NN proposals).
 
-Per run: regret vs the joint oracle (median / p95 / mean), shapes > 5% / > 10% off, shapes slower than B3+ by the tie margin, first-use cost
+Per run: regret vs the joint oracle (median / p95 / p99 / mean), shapes > 5% / > 10% off, shapes slower than B3+ by the tie margin, first-use cost
 (no bundle: true compile), shapes the router skipped; then paired comparisons (geometric-mean time ratio with a 95% bootstrap interval and the
 shapes worse / better by the tie margin) against the reference and between the named pairs.
 
@@ -70,10 +70,10 @@ def main(argv=None):
         SKIP[lab] = sum(bool((rows[s].get("router") or {}).get("skipped")) for s in shapes)
     labs = list(T)
     print(f"n = {len(shapes)} held-out shapes ({small.sum()} graph-amortized); picks looked up in {a.results} / {a.graph_results}")
-    print(f"{'run':48s} {'regret med / p95 / mean':>24s} | >5% >10% | slow vs B3+ | cost (no bundle) | skipped")
+    print(f"{'run':48s} {'regret med / p95 / p99 / mean':>32s} | >5% >10% | slow vs B3+ | cost (no bundle) | skipped")
     for lab in labs:
         g = T[lab] / ORC - 1
-        print(f"{lab:48s} {100 * np.median(g):6.1f}% / {100 * np.percentile(g, 95):5.1f}% / {100 * g.mean():4.1f}% | {(g > .05).sum():3d} {(g > .10).sum():3d} | "
+        print(f"{lab:48s} {100 * np.median(g):6.1f}% / {100 * np.percentile(g, 95):5.1f}% / {100 * np.percentile(g, 99):5.1f}% / {100 * g.mean():4.1f}% | {(g > .05).sum():3d} {(g > .10).sum():3d} | "
               f"{(T[lab] > B3P * eps).sum():5d}      | {COST[lab]:.3f} s ({100 * (COST[lab] / COST[labs[0]] - 1):+4.0f}%)   | {SKIP[lab]:3d}")
 
     rng = np.random.default_rng(0)

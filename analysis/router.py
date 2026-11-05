@@ -111,13 +111,13 @@ def score(d: Path, online_f: str, results: str, graph: str, stem: Path | None):
         return np.array(t), np.array(cost), np.array(skipped), np.array(p_all)
 
     base_t, base_c, _, _ = run(thr_scale=0.0)       # never skip = the current default pool (Triton top-3 + LT16 + ranker top-5)
-    print("\npool: v2 top-3 Triton + heuristic LT16 + learned-ranker top-5; regret vs the joint oracle (median / p95 / mean), shapes > 5% / > 10% off,")
+    print("\npool: v2 top-3 Triton + heuristic LT16 + learned-ranker top-5; regret vs the joint oracle (median / p95 / p99 / mean), shapes > 5% / > 10% off,")
     print("shapes slower than B3+ by the margin, first-use cost from the no-bundle online run (true compile), shapes skipped")
     for lab, thr in (("never skip (default)", 0.0), ("router @ rule threshold", None), ("router @ 2x threshold", 2 * router.threshold),
                      ("router @ 0.05", 0.05)):
         t, cost, sk, p = run(thr)
         g = t / ORC - 1
-        print(f"  {lab:26s} {100 * np.median(g):4.1f}% / {100 * np.percentile(g, 95):5.1f}% / {100 * np.mean(g):4.1f}% | {(g > 0.05).sum():2d} / {(g > 0.10).sum():2d} | "
+        print(f"  {lab:26s} {100 * np.median(g):4.1f}% / {100 * np.percentile(g, 95):5.1f}% / {100 * np.percentile(g, 99):5.1f}% / {100 * np.mean(g):4.1f}% | {(g > 0.05).sum():2d} / {(g > 0.10).sum():2d} | "
               f"{(t > B3P * eps).sum():2d} | {cost.mean():.3f}s (-{100 * (1 - cost.mean() / base_c.mean()):2.0f}%) | skipped {sk.sum():2d}"
               + (f" | worse than default by > margin on {(t > base_t * eps).sum()}, better on {(t < base_t / eps).sum()}" if thr != 0.0 else ""))
     t, cost, sk, p = run(None)

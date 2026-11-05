@@ -746,7 +746,12 @@ def fit_diverse_rule(ctx: dict, S: np.ndarray, k: int = 3, grid: dict = DIVERSE_
 
 
 def build(data: Path, report: Path, results: str = "results_lock1755_learned.jsonl",
-          graph_results: str = "results_lock1755_learned_graph.jsonl", log=print) -> tuple[Path, dict]:
+          graph_results: str = "results_lock1755_learned_graph.jsonl", log=print,
+          reuse_picks: bool = False) -> tuple[Path, dict]:
+    """Fit the selectors, write their held-out picks and score them. `reuse_picks` scores the picks already saved in
+    `learned_picks.json` (the ones the stage-2 sessions measured) instead of the refit ones: a refit is not bit-for-bit
+    reproducible for every model (logreg_rank flipped 2 of 86 picks with the same pinned libraries), and the stage-2 rows
+    exist only for the saved picks. Use it to regenerate a report from existing measurements."""
     ctx = context(data)
     S = search_cached(ctx, data, log)
     keys, shapes, hshapes, R, Rh = ctx["keys"], ctx["shapes"], ctx["hshapes"], ctx["R"], ctx["Rh"]
@@ -763,10 +768,15 @@ def build(data: Path, report: Path, results: str = "results_lock1755_learned.jso
     cvp = {"b6": np.full(len(shapes), ctx["b6"]),
            "knn5": knn_cv_picks(ctx["F"], R, ctx["ok"], {"fill": 0, "align": 0}, 5, folds),
            "knnf": knn_cv_picks(ctx["F"], R, ctx["ok"], knnf_fit["weights"], knnf_fit["k"], folds)}
+    saved = None
+    if reuse_picks:
+        saved = json.loads((Path(data) / "learned_picks.json").read_text())["by_selector"]
     fits, ceil = {}, {}
     for n in names:
         best = S[n]["grid"][0]
         pick, cand, est = fit_final(ctx, n, best["hp"])
+        if saved is not None:
+            pick = np.array([col[saved[n][f"{s['M']}x{s['N']}x{s['K']}"]] for s in hshapes])
         held[n], cvp[n] = pick, np.array(best["picks"])
         imp = importances(est, sh_names if n.endswith("_cls") else row_names)
         fits[n] = {"hp": best["hp"], "n_candidates": int(len(cand)), "importance": imp,
@@ -798,7 +808,7 @@ def build(data: Path, report: Path, results: str = "results_lock1755_learned.jso
                "exact_oracle_pick_rate": agree, "candidate_ceiling": ceilings, "fits": fits,
                "distinct_picks": {n: int(len(set(held[n].tolist()))) for n in order}}
     pct = lambda x: f"{100 * x:.1f}%"
-    ms = lambda d: f"{pct(d['p50'])} / {pct(d['p95'])}" if d.get("n") else "-"
+    ms = lambda d: f"{pct(d['p50'])} / {pct(d['p95'])} / {pct(d['p99'])}" if d.get("n") else "-"
     md = ["# Learned selectors v0 on held-out shapes (auto-generated)\n",
           f"Five model families x two forms, fit on the tune-split screen ({len(shapes)} shapes x {len(keys)} configs) and "
           f"scored on {len(hshapes)} held-out shapes. **cls** = shape -> config classification over the first P greedy "
@@ -811,7 +821,7 @@ def build(data: Path, report: Path, results: str = "results_lock1755_learned.jso
           "regret. b6 / knn5 / knnf are the existing baselines (`selector_baselines.md`), CV-scored under the same folds "
           "with their weights fixed. Regret = t / oracle - 1.\n",
           "## Screen: regret vs the held-out per-shape best (full pruned space)\n",
-          "| selector | tune CV mean | tune CV median / p95 | " + " | ".join(f"held-out {g} median / p95" for g in groups)
+          "| selector | tune CV mean | tune CV median / p95 / p99 | " + " | ".join(f"held-out {g} median / p95 / p99" for g in groups)
           + " | held-out mean | max | picks the oracle | distinct picks |",
           "|---|---|---|" + "---|" * len(groups) + "---|---|---|---|"]
     for n in order:
@@ -821,7 +831,7 @@ def build(data: Path, report: Path, results: str = "results_lock1755_learned.jso
     md.append("\n## Chosen hyperparameters and candidate ceilings\n")
     md.append("Ceiling = regret of the best member of the selector's own candidate set (cls label set, rank pool) on each "
               "held-out shape: the floor any pick from that set can reach.\n")
-    md.append("| selector | hyperparameters | candidates | grid points | ceiling held-out median / p95 / mean | "
+    md.append("| selector | hyperparameters | candidates | grid points | ceiling held-out median / p95 / p99 / mean | "
               "CV mean, best / worst grid point |")
     md.append("|---|---|---|---|---|---|")
     for n in names:
@@ -872,7 +882,7 @@ def build(data: Path, report: Path, results: str = "results_lock1755_learned.jso
         md.append(f"{desc}. Per shape: the screen's top-8 tiles, every pick above, B1, B3 and B3+ in one session. "
                   f"{res['n_shapes']} shapes, {res['n_rows']} rows, {res['n_invalid_rows']} invalid, "
                   f"{res['power_capped_rows']} power-capped. Oracle = fastest Triton row.\n")
-        md.append("Regret vs the per-shape Triton oracle, median / p95 (mean of all):\n")
+        md.append("Regret vs the per-shape Triton oracle, median / p95 / p99 (mean of all):\n")
         md.append("| selector | " + " | ".join(f"{g} (n={int(m.sum())})" for g, m in g2.items()) + " | mean (all) |")
         md.append("|---|" + "---|" * (len(g2) + 1))
         for n in order:
@@ -943,7 +953,7 @@ def build_topk(data: Path, report: Path, results: str = "results_lock1755_topk.j
 
     small = ctx["hT"].min(axis=1) < SMALL_US
     pct = lambda x: f"{100 * x:.1f}%"
-    ms = lambda d: f"{pct(d['p50'])} / {pct(d['p95'])} ({pct(d['mean'])})" if d.get("n") else "-"
+    ms = lambda d: f"{pct(d['p50'])} / {pct(d['p95'])} / {pct(d['p99'])} ({pct(d['mean'])})" if d.get("n") else "-"
     from tune.sweep import parse_key
     tiles = {v: [len({(c.BLOCK_M, c.BLOCK_N, c.SPLIT_K) for c in map(parse_key, ks[:DIVERSE_K])}) for ks in ranked[v]]
              for v in VARIANTS}
@@ -959,7 +969,7 @@ def build_topk(data: Path, report: Path, results: str = "results_lock1755_topk.j
           f"pool; best-of-k = the fastest of the first k. Two orders: **plain** (score order) and **diverse** "
           f"(`diverse_order`, rule `{json.dumps(rk.meta['diverse_rule'])}`: keep the top `plain` picks, then the best "
           "config of each new group within `delta` predicted log regret of the top pick, then score order). "
-          "Regret = t / oracle - 1, median / p95 (mean).\n",
+          "Regret = t / oracle - 1, median / p95 / p99 (mean).\n",
           f"## Diversification rule (tune shapes only: best-of-{DIVERSE_K} screen regret on out-of-fold scores, "
           f"{N_FOLDS} grouped folds)\n",
           f"| rule | best-of-1 | best-of-{DIVERSE_K} | best-of-{TOPK} |", "|---|---|---|---|"]
