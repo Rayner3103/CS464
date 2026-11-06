@@ -96,6 +96,44 @@ It writes the stage-2 inputs and prints the two `tune benchmark` commands (cold,
 command (it passes `--report`: without it `ranker_compare` overwrites the committed `reports/ranker_compare.md`, the 3080's). Add `cublaslt_deep:20` to `--backends` for B3+ (20 s per shape). Without a stage-2 session only cuBLASLt picks, and Triton picks that happen to be
 timed there, have a full-protocol time.
 
+## 6b. The learned cuBLASLt ranker (and the router) on the RTX 3090 / RTX 2060
+
+The shipped joint selector also proposes cuBLASLt configs with a learned ranker (`baselines/cublaslt_rank.py`, 3080 / sm_86) and can skip the
+Triton half with a router (`tune/router.py`). Both refuse another GPU by default. Two explicit routes, one flag each:
+
+| GPU | Route | How |
+|---|---|---|
+| RTX 3090 (sm_86, 82 SMs) | **zero-shot**: the 3080 model, no refit | `pipeline/zero_shot.sh --quick --lt-mode zero_shot --lt-models <dir with lt_rank.*>` (SLURM: `LT_MODE=zero_shot sbatch remoteGPU/zero_shot.sh`). Tile / algorithm ids are the same architecture's, so this is a real transfer test. Rows come in two variants like the Triton rankers: `as_is` keeps the model's 68 SMs in the CTA / wave features, `native` uses this device's 82 |
+| RTX 3090 | **retrain**: its own model, for the comparison | `--lt-mode retrain` (below) |
+| RTX 2060 (sm_75, 30 SMs) | **retrain** (zero-shot is not meaningful: cuBLASLt ids are per architecture) | `pipeline/zero_shot.sh --quick --lt-mode retrain` (SLURM: `LT_MODE=retrain sbatch remoteGPU/zero_shot.sh`) |
+
+`--lt-mode retrain` adds two stages in front of the oracle sweep: `lt_screen` (every valid cuBLASLt config of the *tune* shapes on this GPU, in a
+subprocess per shape: `--smoke` 12 shapes, `--quick` 160 spread over the size-sorted 652, `--full` all 652, about 70 min on the 3080; resumable) and
+`lt_fit` (CPU, `analysis/lt_rank`: grouped-CV table, then `data/<hw>/lt_rank.{txt,json}` with this GPU's SM count and cuBLASLt version in the json).
+`run` and stage 2 then use that model (`TUNE_LT_RANK`). By hand:
+
+```bash
+python -m baselines.cublaslt_screen [--limit 160 --spread]          # TUNE_CLOCK_LOCK=X in the environment
+python -m analysis.lt_rank --save $D/lt_rank --screen-dir $D/lt_screen
+python -m analysis.zero_shot --clock-lock X run ... --lt-n 16 --lt-rank 5                       # own model
+python -m analysis.zero_shot --clock-lock X run ... --lt-n 16 --lt-rank 5 --lt-rank-model <dir>/lt_rank   # zero-shot 3080 model
+```
+
+With `--lt-rank M` the rows' `choice` is the joint choice over Triton top-k, cuBLASLt top-N **and** the ranker's M picks; `choice_lt` stays the
+heuristic-only pool, so the screen table (Triton-only, `<k>_lt0`) is unchanged. The joint choice is scored in stage 2, which then also times
+`cublaslt_rank:M` (a zero-shot model needs one pass per variant, the pipeline does both; `benchmark` resumes per candidate key, so the second pass only
+times new picks). `analysis.ranker_compare` resolves a pick from the ranker / k-NN families (`PICK_FAMILIES`): without those timings in stage 2 it fails.
+Read the "+ LT16" rows of that report as "+ LT16 + ranker top-M" for these runs.
+
+**Router.** Retraining it needs the GPU's whole tune stage 2 (`analysis/router.py fit`: the Triton tune sweep, about 17 h on the 3080), so it has no
+pipeline stage: on another GPU it is a transfer test. Run `tune online --router --confirm 3 --lt-n 16 --lt-rank 5` with
+`TUNE_ROUTER_FOREIGN=1` (and `TUNE_ROUTER_SMS=native` for the `native` variant) and score the run with `analysis/confirm_ab.py`; `zero_shot run` does not
+run it because a skipped shape has no Triton candidates for the Triton-only screen to score. Expect the 2060 router to skip nearly everything (Triton is 0.44x of
+B3+ there); whether that is right is the measurement.
+
+Environment of both models (all read per process): `TUNE_LT_RANK` / `TUNE_ROUTER` = model stem, `TUNE_LT_RANK_FOREIGN` / `TUNE_ROUTER_FOREIGN=1` lifts the
+`hw_id` guard (a warning is printed instead), `TUNE_LT_RANK_SMS` / `TUNE_ROUTER_SMS` = `native` or an integer (unset = the model's own).
+
 ## 7. Write it up
 
 Add a dated `## Update YYYY-MM-DD: ...` at the top of `reports/week1.md`: session ids, row counts, invalid and skipped counts, the commits the rows record

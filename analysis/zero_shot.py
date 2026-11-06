@@ -22,6 +22,16 @@ More than one model, the joint selector and the k policy (added 2026-11-01):
   * `--lt-n 16` also times cuBLASLt's heuristic top 16 in the same short-timing pool (joint selection). The screen oracle is
     Triton-only, so the screen table scores the Triton-only choice (`choice_lt` "<k>_lt0"); the joint choice is scored in a
     small stage-2 session on this GPU against B2 / B3 (see the `picks` subcommand and analysis.ranker_compare).
+  * `--lt-rank M` (with `--lt-n`) adds the M configs of the learned cuBLASLt ranker (baselines/cublaslt_rank.py) to the pool, the way
+    `select_kernel` ships it. `--lt-rank-model STEM` is its model: without it, the model this GPU has (`data/<hw>/lt_rank`, retrained
+    here), with it a model fit elsewhere (the 3080's, zero-shot: the foreign-model guard is lifted for this process only, and the
+    variant decides the SM count of its fill features, `as_is` = the model's, `native` = this device's, the same split as the
+    Triton ranker). cuBLASLt tile / algorithm ids are per architecture, so on the 3090 (sm_86) this is a real transfer test and on
+    the 2060 (sm_75) a probable failure; retrain there (pipeline/zero_shot.sh --lt-mode retrain). The screen oracle is
+    Triton-only, so the screen table still scores `choice_lt` "<k>_lt0"; the joint choice with the ranker's picks is `choice`, scored
+    in the stage-2 session (backend `cublaslt_rank:M`, which `pipeline/zero_shot.sh` adds). The router is not run here: its output is
+    not scorable against a Triton-only screen (a skipped shape has no Triton candidates); use `tune online --router --confirm 3`
+    with TUNE_ROUTER_FOREIGN=1 and score it with analysis/confirm_ab.py.
   * `--k 3 --k-frequent 5 --frequent-calls 1000000` applies tune.online.KPolicy: a shape in the shapes file with `calls` >= the
     threshold (or `frequent: true`) gets k = 5, every other shape k = 3. Held-out shapes carry no call counts, so for the
     evaluation just run `--k 5` and read `online-3` (default tier) and `online-5` (frequent tier) from the same rows.
@@ -121,11 +131,21 @@ def variant_ranker(stem: Path, variant: str, native_gpu: dict | None):
     return Ranker(r.booster, r.pool_keys, r.hp, native_gpu, r.meta)
 
 
+def lt_rank_env(variant: str, model: Path | None) -> dict:
+    """Environment that points baselines.cublaslt_rank at the right model for one Triton variant: `model` = None -> this GPU's own
+    (data/<hw>/lt_rank), else that stem as a zero-shot foreign model with the variant's SM count (as_is: the model's, native: ours)."""
+    if model is None:
+        return {"TUNE_LT_RANK": None, "TUNE_LT_RANK_FOREIGN": None, "TUNE_LT_RANK_SMS": None}
+    return {"TUNE_LT_RANK": str(model), "TUNE_LT_RANK_FOREIGN": "1", "TUNE_LT_RANK_SMS": "native" if variant == "native" else None}
+
+
 def run(shapes: list[dict], ranker_stem: Path, out_dir: Path, *, variants=VARIANTS, k: int = 3,
-        session_id: str | None = None, log=print, name: str = "", lt_n: int = 0, policy=None) -> list[Path]:
+        session_id: str | None = None, log=print, name: str = "", lt_n: int = 0, policy=None, lt_rank: int = 0,
+        lt_rank_model: Path | None = None) -> list[Path]:
     """Rank + short online search for each variant of one saved model. name: output file tag (see out_name); lt_n > 0:
     also time cuBLASLt's heuristic top lt_n (joint selection); policy: a tune.online.KPolicy making k per shape from
-    the shape's `calls` / `frequent` fields (k is then the default tier)."""
+    the shape's `calls` / `frequent` fields (k is then the default tier); lt_rank > 0 (needs lt_n > 0): also the M configs of the
+    learned cuBLASLt ranker (`lt_rank_model`: see `lt_rank_env`; None = this GPU's own model)."""
     from tune.env import provenance, write_env
     from tune.online import all_choices, search_shape, shape_k
     from tune.records import RecordWriter
@@ -134,7 +154,16 @@ def run(shapes: list[dict], ranker_stem: Path, out_dir: Path, *, variants=VARIAN
     session_id = session_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     env = write_env(out_dir, session_id=session_id, kind="zero_shot")
     paths, source_gpu = [], source_gpu_name(ranker_stem)
+    if lt_rank and not lt_n:
+        raise ValueError("lt_rank needs lt_n > 0 (the ranker's picks join the cuBLASLt half of the pool)")
+    if lt_rank:
+        from baselines.cublaslt_rank import ranker as lt_ranker
     for variant in variants:
+        for key, val in (lt_rank_env(variant, lt_rank_model).items() if lt_rank else ()):
+            os.environ.pop(key, None) if val is None else os.environ.__setitem__(key, val)
+        if lt_rank and lt_ranker() is None:
+            raise RuntimeError("--lt-rank: no cuBLASLt ranker usable on this GPU (retrain: python -m baselines.cublaslt_screen, then "
+                               "python -m analysis.lt_rank --save data/<hw>/lt_rank; or pass --lt-rank-model STEM for a zero-shot run)")
         ranker = variant_ranker(ranker_stem, variant, env["gpu"])
         rule = ranker.rule("diverse")
         path = out_dir / out_name(variant, name)
@@ -142,7 +171,8 @@ def run(shapes: list[dict], ranker_stem: Path, out_dir: Path, *, variants=VARIAN
         done = set()
         if path.exists():
             done = {(r["M"], r["N"], r["K"], r.get("k")) for r in map(json.loads, path.read_text().splitlines())
-                    if r.get("rule") == rule and r.get("lt_n", 0) == lt_n}
+                    if r.get("rule") == rule and r.get("lt_n", 0) == lt_n and r.get("lt_rank", 0) == lt_rank
+                    and r.get("lt_rank_model") == (str(lt_rank_model) if lt_rank_model else None)}
         todo = [dict(s, _k=shape_k(s, k, policy)) for s in shapes]
         todo = [s for s in todo if (s["M"], s["N"], s["K"], s["_k"]) not in done]
         t0 = time.perf_counter()
@@ -150,8 +180,10 @@ def run(shapes: list[dict], ranker_stem: Path, out_dir: Path, *, variants=VARIAN
             for i, s in enumerate(todo):
                 M, N, K, ks = s["M"], s["N"], s["K"], s["_k"]
                 t = time.perf_counter()
-                r = search_shape(ranker, M, N, K, ks, torch.float16, "diverse", lt_n)
-                row = {"M": M, "N": N, "K": K, "dtype": "fp16", "k": ks, "order": "diverse", "rule": rule, "lt_n": lt_n,
+                r = search_shape(ranker, M, N, K, ks, torch.float16, "diverse", lt_n, **({"lt_rank": lt_rank} if lt_rank else {}))
+                row = {"M": M, "N": N, "K": K, "dtype": "fp16", "k": ks, "order": "diverse", "rule": rule, "lt_n": lt_n, "lt_rank": lt_rank,
+                       "lt_rank_model": str(lt_rank_model) if lt_rank_model else None,
+                       **({"lt_rank_sms": lt_ranker().sms, "lt_rank_hw_id": lt_ranker().meta.get("hw_id")} if lt_rank else {}),
                        "model": name or "lgbm_rank", "variant": variant, "split": s.get("split"), "suite": s.get("suite"),
                        **({"calls": s.get("calls"), "frequent": s.get("frequent")} if policy else {}),
                        "session_id": session_id, "hw_id": env["hw_id"], "driver": env["driver"], **provenance(env),
@@ -349,6 +381,10 @@ def _main(argv=None):
     p.add_argument("--k-frequent", type=int, default=0, help="k for shapes marked `frequent` / with calls >= --frequent-calls; 0 = off")
     p.add_argument("--frequent-calls", type=int, default=1_000_000)
     p.add_argument("--lt-n", type=int, default=0, help="also time cuBLASLt's heuristic top N (joint selection); 0 = Triton only")
+    p.add_argument("--lt-rank", type=int, default=0,
+                   help="with --lt-n: also time the M configs of the learned cuBLASLt ranker (baselines/cublaslt_rank.py); 0 = off")
+    p.add_argument("--lt-rank-model", type=Path, default=None,
+                   help="zero-shot cuBLASLt ranker stem (<dir>/lt_rank, fit on another GPU); default: this GPU's own data/<hw>/lt_rank")
     p.add_argument("--variants", default=",".join(VARIANTS))
     p.add_argument("--out", type=Path, default=None, help="default data/<hw_id>")
     p.add_argument("--fresh-cache", action="store_true", help="compile into an empty TRITON_CACHE_DIR under --out")
@@ -381,7 +417,9 @@ def _main(argv=None):
         picks, lt, n = write_stage2_picks(data, args.screen)
         lock = f"--clock-lock {args.clock_lock} " if args.clock_lock else "--clock-lock X "
         files = [f"{(m + '_' if m else '') + v}={out_name(v, m)}" for m in find_models(data) for v in VARIANTS if (data / out_name(v, m)).exists()]
-        be = "torch,triton:sweep:8,triton:picks,cublaslt:16"
+        m_rank = max((json.loads(l).get("lt_rank", 0) for p in data.glob("zero_shot*_*.jsonl") if not p.name.startswith("zero_shot_stage2")
+                      for l in p.read_text().splitlines()), default=0)
+        be = "torch,triton:sweep:8,triton:picks,cublaslt:16" + (f",cublaslt_rank:{m_rank}" if m_rank else "")
         print(f"{n} shapes -> {picks}\n{lt}\n\nRun on the idle GPU (never alongside another GPU job), then score:\n"
               f"  export TUNE_SWEEP_DIR={data / args.screen} TUNE_PICKS={picks}\n"
               f"  python -m tune {lock}benchmark --shapes-file {data / args.screen / 'subset.json'} --backends {be} --cache-modes cold --out-name results_zero_shot.jsonl\n"
@@ -405,7 +443,8 @@ def _main(argv=None):
     paths = []
     for name, stem in parse_rankers(args.ranker):
         paths += run(shapes, stem, out_dir, variants=tuple(args.variants.split(",")), k=args.k, session_id=args.session,
-                     name=name, lt_n=args.lt_n, policy=policy)
+                     name=name, lt_n=args.lt_n, policy=policy, lt_rank=args.lt_rank,
+                     lt_rank_model=args.lt_rank_model)
     print("zero-shot rows -> " + ", ".join(map(str, paths)))
     return 0
 

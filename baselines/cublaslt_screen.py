@@ -9,7 +9,10 @@ custom, us, seed] (tile / stages None for tile-less algorithms) in `data/<hw>/lt
 skipped). Times are the search's own screen timing (hot L2, 1 warmup + 3 launches, 1.0 us grid): noisy per config, a label
 for ranking, not a measurement. GPU idle, one job at a time, `--clock-lock` as for every other run (recorded in meta.json).
 
-    python -m baselines.cublaslt_screen [--budget-s 40] [--limit N] [--clock-lock 1755]
+    python -m baselines.cublaslt_screen [--budget-s 40] [--limit N [--spread]] [--out DIR]   (TUNE_CLOCK_LOCK=1755 in the environment)
+
+`--limit N` alone takes the N SMALLEST unfinished shapes (a smoke test); with `--spread` it takes N shapes evenly spaced over the
+whole size-sorted tune set instead, so a reduced screen (pipeline/zero_shot.sh --quick) still sees small and large GEMMs.
 """
 from __future__ import annotations
 
@@ -62,18 +65,27 @@ def screen_one(M: int, N: int, K: int, dest: Path, budget_s: float, dtype: str =
     return "ok"
 
 
+def limit_shapes(todo: list, limit: int, spread: bool) -> list:
+    """The first `limit` shapes of the size-sorted list, or (spread) `limit` shapes evenly spaced over all of it, ends included."""
+    if not limit or limit >= len(todo):
+        return todo
+    if spread and limit > 1:
+        return [todo[round(i * (len(todo) - 1) / (limit - 1))] for i in range(limit)]
+    return todo[:limit]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--budget-s", type=float, default=40.0)
     ap.add_argument("--limit", type=int, default=0, help="screen only the first N unfinished shapes (smoke test)")
+    ap.add_argument("--spread", action="store_true", help="with --limit: N shapes evenly spaced over the size-sorted tune set, not the N smallest")
     ap.add_argument("--out", type=Path, default=None)
     a = ap.parse_args(argv)
     d = a.out or out_dir()
     d.mkdir(parents=True, exist_ok=True)
     shapes = sorted(tune_shapes(), key=lambda s: s[0] * s[1] * s[2])
     todo = [s for s in shapes if not path_for(d, *s).exists()]
-    if a.limit:
-        todo = todo[:a.limit]
+    todo = limit_shapes(todo, a.limit, a.spread)
     import os
     (d / "meta.json").write_text(json.dumps({
         "started": time.strftime("%Y-%m-%d %H:%M:%S"), "budget_s": a.budget_s, "clock_lock_mhz": os.environ.get("TUNE_CLOCK_LOCK"),

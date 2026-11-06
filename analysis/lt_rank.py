@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from baselines.cublaslt_rank import CATS, FEATURES, SMS, TILE_MN, Y_CLIP, features  # noqa: E402  (shared with the runtime ranker)
+from baselines.cublaslt_rank import CATS, FEATURES, SMS, TILE_MN, Y_CLIP, device_sms, features  # noqa: E402  (shared with the runtime ranker)
 from baselines.cublaslt_search import CFG_KEYS  # noqa: E402
 
 
@@ -63,9 +63,9 @@ def groups_of(shapes: list) -> np.ndarray:
     return np.array([find(i) for i in range(len(shapes))])
 
 
-def shape_feat(s: tuple) -> np.ndarray:
+def shape_feat(s: tuple, sms: int = SMS) -> np.ndarray:
     M, N, K = s
-    return np.array([math.log2(M), math.log2(N), math.log2(K), math.log2(math.ceil(M / 128) * math.ceil(N / 128) / SMS + 1e-9),
+    return np.array([math.log2(M), math.log2(N), math.log2(K), math.log2(math.ceil(M / 128) * math.ceil(N / 128) / sms + 1e-9),
                      float(M % 8 == 0 and N % 8 == 0 and K % 8 == 0)])
 
 
@@ -112,7 +112,11 @@ def main(argv=None):
     ap.add_argument("--screen-dir", type=Path, default=None)
     ap.add_argument("--rounds", type=int, default=300)
     ap.add_argument("--save", type=Path, default=None, help="fit on all tune shapes and save the model here (text) + .json")
+    ap.add_argument("--sms", type=int, default=None,
+                    help="SM count of the GPU the screen was measured on (default: this device's; the CTA / wave features use it and "
+                         "it is saved in the model's json). Needed only to fit on a machine other than the screened GPU")
     a = ap.parse_args(argv)
+    sms = a.sms or device_sms()
     import lightgbm as lgb
     from sklearn.model_selection import GroupKFold
 
@@ -124,7 +128,7 @@ def main(argv=None):
     print(f"{n} tune shapes screened ({complete} completely), {sum(len(screens[s]['us']) for s in shapes)} (shape, config) rows; "
           f"{need.sum()} shapes where the screen beats the best heuristic seed by > 5%")
 
-    X = [features(s, screens[s]["cfgs"]) for s in shapes]
+    X = [features(s, screens[s]["cfgs"], sms) for s in shapes]
     Y = [np.minimum(np.log(screens[s]["us"] / screens[s]["best"]), Y_CLIP) for s in shapes]
     grp = groups_of(shapes)
     print(f"{len(set(grp))} shape groups (shares two of M, N, K)")
@@ -147,7 +151,7 @@ def main(argv=None):
         print(f"  fold {f + 1}/{a.folds}: {len(tr)} train / {len(te)} test shapes ({time.perf_counter() - t0:.0f}s)", flush=True)
 
     # --- k-NN proposer on the screen's own winners (grouped exclusion), exact times
-    F = np.array([shape_feat(s) for s in shapes]); F = F / (F.std(0) + 1e-9)
+    F = np.array([shape_feat(s, sms) for s in shapes]); F = F / (F.std(0) + 1e-9)
     D = np.sqrt(((F[:, None, :] - F[None, :, :]) ** 2).sum(-1))
     order = [[j for j in np.argsort(D[i]) if j != i and grp[j] != grp[i]] for i in range(n)]
     tops = [[tuple(int(v) for v in screens[s]["cfgs"][j]) for j in np.argsort(screens[s]["us"])[:8]] for s in shapes]
@@ -198,7 +202,7 @@ def main(argv=None):
         from tune.env import default_data_dir
         Path(str(a.save) + ".json").write_text(json.dumps({"hw_id": default_data_dir().name, "cublaslt_version": library_info()["version"],
                                                           "features": FEATURES, "cats": CATS, "params": params, "rounds": a.rounds,
-                                                          "n_tune_shapes": n, "tile_mn": TILE_MN, "y_clip": Y_CLIP,
+                                                          "n_tune_shapes": n, "sms": sms, "tile_mn": TILE_MN, "y_clip": Y_CLIP,
                                                           "importance_gain": imp}, indent=1))
         print("saved", a.save, "| top features by gain:", list(imp)[:8])
     return out

@@ -63,7 +63,7 @@ analysis/
   zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`); `load_screen` keeps `slow` screen rows
   lt_ceiling.py / lt_clusters.py / lt_knn_scan.py / lt_knn_ab.py / lt_rank.py / lt_rank_ab.py / router.py / confirm_ab.py / joint_rank.py  the cuBLASLt k-NN, learned-ranker, router and joint-score study (router: fit + held-out score; confirm_ab: paired scoring of the router / confirmation online runs; joint_rank: the negative result) (CPU only): where the joint search's regret comes from, winner structure, tune-only leave-one-out choice of k, held-out A/B from one stage-2 session
   cross_gpu.py       cross-GPU comparison on the held-out shapes the runs share: regret vs each GPU's own screen, speed vs B3+, family ceiling, PTX mma check, paired bootstrap; CPU-only (`python -m analysis.cross_gpu --side LABEL DIR ...`, docstring has the command). Never compare a subset run to the 86-shape `REFERENCE_3080` constants in `zero_shot.py`
-tests/       pytest unit tests (193 tests; most need a CUDA GPU)
+tests/       pytest unit tests (200 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)
@@ -297,6 +297,9 @@ TUNE_SWEEP_DIR=$D/sweep_screen_heldout python -m tune --clock-lock 1755 benchmar
 python -m tune selectors       # re-score with both stage-2 files
 ```
 
+Full training of the shipped selector on another GPU (rank v1 + v2, cuBLASLt ranker, router; optional bundle; held-out validation; models packaged into the run directory):
+`pipeline/train_best.sh [--smoke] [--clock-lock X] [--with-bundle] [--skip-validation]` (stage list: `--list-stages`; resumable with `--resume <run dir>`; ~35 h on a 3080, extrapolated). Output: `pipeline/runs/train_best-<mode>-<ts>/{data/<hw>,reports,models,SUMMARY.md}`; `models/INSTALL.md` says where the files go. Its CPU stages (`lt_fit`, `router_fit`, `package`, `summary`) were rehearsed on the 3080's data and reproduce the committed fits (router AUC 0.823, threshold 0.02); the GPU stages were not run end to end.
+
 ## 9. Open next steps
 
 1. **Learned selector v0: done** (lgbm_rank, see §6 and `reports/week1.md` 2026-10-19 late). Next: lambdarank / regression blends, a larger candidate pool.
@@ -320,11 +323,11 @@ python -m tune selectors       # re-score with both stage-2 files
 - Proposals are validated (`cublasLtMatmulAlgoCheck` + the correctness gate) and short-timed, never trusted. A winner-cache entry from a search without proposals (`lt_knn` 0) is a miss when proposals are requested.
 
 **cuBLASLt learned ranker** (`baselines/cublaslt_rank.py`):
-- One GPU's model (3080 / sm_86; CTA features assume 68 SMs; tile / algorithm ids are per architecture and cuBLASLt version). `ranker()` loads `data/<hw>/lt_rank` or the committed snapshot and refuses a model whose `hw_id` differs (warns once; `select_kernel` then falls back to the k-NN proposals, which fall back to the heuristic top-16). Needs `lightgbm` at run time and enumerates every valid config of the shape (≈0.1-0.2 s). A new GPU: `python -m baselines.cublaslt_screen` (~70 min on the 3080), `python -m analysis.lt_rank --save data/<hw>/lt_rank`, copy to the snapshot.
+- One GPU's model (3080 / sm_86; CTA features assume 68 SMs; tile / algorithm ids are per architecture and cuBLASLt version). `ranker()` loads `data/<hw>/lt_rank` or the committed snapshot and refuses a model whose `hw_id` differs (warns once; `select_kernel` then falls back to the k-NN proposals, which fall back to the heuristic top-16). Needs `lightgbm` at run time and enumerates every valid config of the shape (≈0.1-0.2 s). A new GPU: `python -m baselines.cublaslt_screen` (~70 min on the 3080), `python -m analysis.lt_rank --save data/<hw>/lt_rank`, copy to the snapshot. The SM count of the fill features comes from the model's json (`sms`, saved from the device at fit time; models without it are 68). Another GPU, by hand: `pipeline/zero_shot.sh --lt-mode zero_shot|retrain` (3090: either, 2060: retrain; `docs/zero_shot_runbook.md` section 6b), or per process `TUNE_LT_RANK=<stem> TUNE_LT_RANK_FOREIGN=1 [TUNE_LT_RANK_SMS=native]` to use another GPU's model zero-shot.
 - Picks are validated and short-timed like any candidate; a winner-cache entry from a narrower search (`lt_rank` 0) is a miss when the ranker is requested.
 
 **Family router** (`tune/router.py`):
-- One GPU's model (3080), refused on another `hw_id` (warns once; the search then runs both halves). Only useful when the Triton kernels compile for real; it skips ~16% of shapes at the rule threshold 0.02 on the held-out set. The cuBLASLt half is timed before Triton, which changes the timing order: always run it with `confirm` (select_kernel does). A skipped shape's winner is cuBLASLt and is what the winner cache stores.
+- One GPU's model (3080), refused on another `hw_id` (warns once; the search then runs both halves). Only useful when the Triton kernels compile for real; it skips ~16% of shapes at the rule threshold 0.02 on the held-out set. The cuBLASLt half is timed before Triton, which changes the timing order: always run it with `confirm` (select_kernel does). A skipped shape's winner is cuBLASLt and is what the winner cache stores. Zero-shot on another GPU only with `TUNE_ROUTER_FOREIGN=1` (+ `TUNE_ROUTER_SMS=native`); retraining needs that GPU's whole tune stage 2, so it is a transfer test (runbook section 6b).
 
 **Winner cache** (`tune/winner_cache.py`):
 - Entries are per machine and per environment (GPU id, Triton, cuBLASLt version, driver); a different environment ignores them (they stay in the file). Nothing is shared across GPUs.

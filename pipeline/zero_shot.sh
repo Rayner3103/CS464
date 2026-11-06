@@ -12,8 +12,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
-STAGES=(preflight install tests env sweep run score picks stage2_cold stage2_graph compare summary)
-GPU_STAGES=(env sweep run stage2_cold stage2_graph)
+STAGES=(preflight install tests env lt_screen lt_fit sweep run score picks stage2_cold stage2_graph compare summary)
+GPU_STAGES=(env lt_screen sweep run stage2_cold stage2_graph)
 
 MODE=quick
 LOCK=1755
@@ -32,6 +32,9 @@ MODELS=""
 ORACLE=""
 K=5
 LT_N=16
+LT_MODE=off
+LT_RANK=5
+LT_MODELS=
 
 usage() {
   cat <<EOF
@@ -49,6 +52,15 @@ Options:
                           the sweep stage is then skipped. The screen's shape subset decides what is scored
   --k N                   Triton candidates per shape in the online search, stored for every k' <= N (default $K)
   --lt-n N                also short-time cuBLASLt's heuristic top N in the same pool, joint selection (default $LT_N; 0 = off)
+  --lt-mode off|zero_shot|retrain
+                          the learned cuBLASLt ranker (baselines/cublaslt_rank.py) in the joint search; default off (heuristic top-N only).
+                            zero_shot  the 3080's lt_rank, no refit, as_is / native SM count like the Triton rankers (--lt-models DIR). Means
+                                       something only on the same architecture (RTX 3090, sm_86); on a Turing card expect it to fail
+                            retrain    screen every cuBLASLt config of the tune shapes on THIS GPU (stage lt_screen: ~70 min on the 3080,
+                                       smoke 12 / quick 160 shapes, full 652), fit data/<hw>/lt_rank on it (stage lt_fit, CPU) and use that.
+                                       The right choice for the RTX 2060 (sm_75); the 3090 can do either, and both is the comparison
+  --lt-rank M             cuBLASLt ranker picks per search (default $LT_RANK; needs --lt-n > 0 and --lt-mode)
+  --lt-models DIR         where the 3080's lt_rank.{txt,json} are for --lt-mode zero_shot (default: --models DIR)
   --clock-lock MHZ|none   SM clock you locked beforehand with 'sudo nvidia-smi -lgc MHZ,MHZ' (default $LOCK). The script never
                           calls sudo. 'none' = run unlocked (needs --allow-unlocked); then compare regret and ratios within
                           this GPU only, not times with the 3080's 1755 MHz runs
@@ -81,6 +93,9 @@ while [[ $# -gt 0 ]]; do
     --oracle) ORACLE="${2:?}"; shift ;;
     --k) K="${2:?}"; shift ;;
     --lt-n) LT_N="${2:?}"; shift ;;
+    --lt-mode) LT_MODE="${2:?}"; shift ;;
+    --lt-rank) LT_RANK="${2:?}"; shift ;;
+    --lt-models) LT_MODELS="${2:?}"; shift ;;
     --clock-lock) LOCK="${2:?}"; shift ;;
     --allow-unlocked) ALLOW_UNLOCKED=1 ;;
     --run-dir) RUN_DIR="${2:?}"; shift ;;
@@ -102,6 +117,10 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$K" =~ ^[0-9]+$ && "$K" -ge 3 ]] || die "--k must be an integer >= 3 (the scores are at k = 3 and k = $K)"
 [[ "$LT_N" =~ ^[0-9]+$ ]] || die "--lt-n must be an integer"
+[[ "$LT_MODE" =~ ^(off|zero_shot|retrain)$ ]] || die "--lt-mode must be off, zero_shot or retrain"
+[[ "$LT_RANK" =~ ^[0-9]+$ ]] || die "--lt-rank must be an integer"
+[[ "$LT_MODE" == off || ( "$LT_N" -gt 0 && "$LT_RANK" -gt 0 ) ]] || die "--lt-mode $LT_MODE needs --lt-n > 0 and --lt-rank > 0"
+[[ "$LT_MODE" == off ]] && LT_RANK=0
 
 # ------------------------------------------------------------------ run directory and mode
 if [[ -n "$RUN_DIR" && -z "$MODE" ]]; then
@@ -115,12 +134,13 @@ REPORTS="$RUN_DIR/reports"
 echo "$MODE" > "$RUN_DIR/mode"
 [[ "$LOCK" == "none" && "$ALLOW_UNLOCKED" == 0 ]] && die "--clock-lock none needs --allow-unlocked"
 
+# LT_SHAPES = tune shapes of the cuBLASLt screen for --lt-mode retrain (0 = all 652; spread over the size-sorted set).
 # PER_SUITE = held-out shapes per suite in the oracle subset (1000 = all 86; 12 = the 27-shape subset). DEEP_S = seconds per
 # shape of the cuBLASLt enumerate-and-screen baseline (B3+) in stage 2.
 case "$MODE" in
-  smoke) PER_SUITE=3;    DEEP_S=2  ;;
-  quick) PER_SUITE=12;   DEEP_S=20 ;;
-  full)  PER_SUITE=1000; DEEP_S=20 ;;
+  smoke) PER_SUITE=3;    DEEP_S=2;  LT_SHAPES=12 ;;
+  quick) PER_SUITE=12;   DEEP_S=20; LT_SHAPES=160 ;;
+  full)  PER_SUITE=1000; DEEP_S=20; LT_SHAPES=0 ;;
   *) die "unknown mode '$MODE'" ;;
 esac
 
@@ -160,6 +180,23 @@ resolve_models() {
   for f in lgbm_rank.txt lgbm_rank.json lgbm_rank_v2.txt lgbm_rank_v2.json; do
     [[ -f "$MODELS/$f" ]] || die "$MODELS/$f is missing (the four 3080 model files are needed; data/ is gitignored, copy them by hand)"
   done
+}
+
+resolve_lt_models() {
+  [[ "$LT_MODE" == zero_shot ]] || return 0
+  [[ -n "$LT_MODELS" ]] || LT_MODELS="$MODELS"
+  LT_MODELS="$(cd "$LT_MODELS" 2>/dev/null && pwd)" || die "--lt-models directory does not exist"
+  local f
+  for f in lt_rank.txt lt_rank.json; do
+    [[ -f "$LT_MODELS/$f" ]] || die "$LT_MODELS/$f is missing (--lt-mode zero_shot needs the 3080's cuBLASLt ranker; it is in data/<hw>/ or reports/snapshot/lock1755/)"
+  done
+}
+
+# The cuBLASLt ranker's model for the run / stage-2 processes: retrain = the one fitted in this run, zero_shot = passed explicitly.
+lt_env() {
+  unset TUNE_LT_RANK TUNE_LT_RANK_FOREIGN TUNE_LT_RANK_SMS
+  [[ "$LT_MODE" == retrain ]] && export TUNE_LT_RANK="$DATA/lt_rank"
+  return 0
 }
 
 # ------------------------------------------------------------------ checks
@@ -204,6 +241,8 @@ EOF
   resolve_models
   echo "3080 models: $MODELS"
   md5sum "$MODELS/lgbm_rank.txt" "$MODELS/lgbm_rank_v2.txt"
+  if [[ "$LT_MODE" == zero_shot ]]; then resolve_lt_models; echo "3080 cuBLASLt ranker: $LT_MODELS"; md5sum "$LT_MODELS/lt_rank.txt"; fi
+  [[ "$LT_MODE" != retrain ]] || echo "cuBLASLt ranker: will be retrained on this GPU ($LT_SHAPES tune shapes screened; 0 = all)"
   if [[ -n "$ORACLE" ]]; then
     [[ -f "$ORACLE/subset.json" ]] || die "--oracle $ORACLE has no subset.json (point it at a sweep_screen_heldout/ directory)"
   fi
@@ -283,6 +322,27 @@ if not ok:
 EOF
 }
 
+# --lt-mode retrain: screen every valid cuBLASLt config of the TUNE shapes on this GPU (never a held-out shape), subprocess per shape,
+# resumable. Training data of this GPU's cuBLASLt ranker.
+stage_lt_screen() {
+  [[ "$LT_MODE" == retrain ]] || { echo "skipped (--lt-mode $LT_MODE)"; return; }
+  [[ "$LOCK" == "none" ]] || export TUNE_CLOCK_LOCK="$LOCK"
+  local lim=()
+  [[ "$LT_SHAPES" -gt 0 ]] && lim=(--limit "$LT_SHAPES" --spread)
+  "$PY" -u -m baselines.cublaslt_screen --out "$DATA/lt_screen" "${lim[@]}"
+}
+
+# CPU only: grouped-CV report and the saved model data/<hw>/lt_rank.{txt,json} (hw_id, SM count and cuBLASLt version in the json).
+stage_lt_fit() {
+  [[ "$LT_MODE" == retrain ]] || { echo "skipped (--lt-mode $LT_MODE)"; return; }
+  "$PY" -u -m analysis.lt_rank --screen-dir "$DATA/lt_screen" --save "$DATA/lt_rank"
+  "$PY" - "$DATA/lt_rank.json" <<'EOF'
+import json, sys
+m = json.load(open(sys.argv[1]))
+print(f"cuBLASLt ranker fit on {m['n_tune_shapes']} tune shapes of {m['hw_id']} ({m['sms']} SMs), cuBLASLt {m['cublaslt_version']}")
+EOF
+}
+
 # The oracle: this GPU's own screen of the held-out shapes (every pruned Triton config compiled, validated, timed).
 # Never fit anything on these shapes. Resumes per shape.
 stage_sweep() {
@@ -310,7 +370,13 @@ EOF
 # cuBLASLt heuristic top-LT_N. Output: zero_shot_{v1,v2}_{as_is,native}.jsonl. Resumes per (shape, k).
 stage_run() {
   resolve_models
-  zs run --out "$DATA" --ranker v1="$MODELS/lgbm_rank" v2="$MODELS/lgbm_rank_v2" --k "$K" --lt-n "$LT_N" --fresh-cache
+  local lt=()
+  lt_env
+  case "$LT_MODE" in
+    retrain)   lt=(--lt-rank "$LT_RANK") ;;
+    zero_shot) resolve_lt_models; lt=(--lt-rank "$LT_RANK" --lt-rank-model "$LT_MODELS/lt_rank") ;;
+  esac
+  zs run --out "$DATA" --ranker v1="$MODELS/lgbm_rank" v2="$MODELS/lgbm_rank_v2" --k "$K" --lt-n "$LT_N" --fresh-cache "${lt[@]}"
 }
 
 # CPU only. One fixed report name per data directory, so k = 3 and k = 5 go to separate folders.
@@ -324,12 +390,30 @@ stage_score() {
 stage_picks() { zs picks --data "$DATA"; }
 
 # Stage 2: every pick re-timed with the full protocol in one session with B1, the screen's best tiles, B2/B3 and B3+.
-stage2_env() { export TUNE_SWEEP_DIR="$DATA/sweep_screen_heldout" TUNE_PICKS="$DATA/zero_shot_stage2_picks.json"; }
+stage2_env() { export TUNE_SWEEP_DIR="$DATA/sweep_screen_heldout" TUNE_PICKS="$DATA/zero_shot_stage2_picks.json"; lt_env; }
 STAGE2_BACKENDS="torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:$DEEP_S"
+[[ "$LT_RANK" -gt 0 ]] && STAGE2_BACKENDS="torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_rank:$LT_RANK,cublaslt_deep:$DEEP_S"
+
+# One benchmark pass per cuBLASLt-ranker variant. `cublaslt_rank:M` expands to whatever the ranker in this process proposes, so a
+# zero-shot model needs one pass as_is and one native (the SM count differs, so may the picks); `benchmark` resumes per (shape,
+# candidate key), so the second pass only times the picks the first did not propose. retrain / off: a single pass.
+# usage: stage2_pass <benchmark args...>
+stage2_pass() {
+  local variants=(default) v
+  [[ "$LT_MODE" == zero_shot ]] && { resolve_lt_models; variants=(as_is native); }
+  for v in "${variants[@]}"; do
+    if [[ "$v" != default ]]; then
+      export TUNE_LT_RANK="$LT_MODELS/lt_rank" TUNE_LT_RANK_FOREIGN=1
+      if [[ "$v" == native ]]; then export TUNE_LT_RANK_SMS=native; else unset TUNE_LT_RANK_SMS; fi
+      echo "--- cuBLASLt ranker variant: $v"
+    fi
+    tune benchmark "$@"
+  done
+}
 
 stage_stage2_cold() {
   stage2_env
-  tune benchmark --shapes-file "$DATA/sweep_screen_heldout/subset.json" --backends "$STAGE2_BACKENDS" \
+  stage2_pass --shapes-file "$DATA/sweep_screen_heldout/subset.json" --backends "$STAGE2_BACKENDS" \
     --cache-modes cold --out-name results_zero_shot.jsonl --out "$DATA"
 }
 
@@ -338,7 +422,7 @@ stage_stage2_graph() {
   local n
   n="$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1]))['n'])" "$DATA/zero_shot_lt50us.json")"
   if [[ "$n" -gt 0 ]]; then
-    tune benchmark --shapes-file "$DATA/zero_shot_lt50us.json" --backends "$STAGE2_BACKENDS" \
+    stage2_pass --shapes-file "$DATA/zero_shot_lt50us.json" --backends "$STAGE2_BACKENDS" \
       --cache-modes hot --graph-batch 50 --out-name results_zero_shot_graph.jsonl --out "$DATA"
   else
     echo "no held-out shape under 50 us on this GPU: no graph pass"
@@ -404,7 +488,7 @@ is_gpu_stage() { local s; for s in "${GPU_STAGES[@]}"; do [[ "$s" == "$1" ]] && 
 if [[ -n "$FROM" ]]; then printf '%s\n' "${STAGES[@]}" | grep -qx "$FROM" || die "unknown stage '$FROM' (see --list-stages)"; fi
 if [[ "$CHECK_ONLY" == 1 ]]; then check_prereqs; exit 0; fi
 
-say "Zero-shot mode: $MODE (per-suite $PER_SUITE, k $K, cuBLASLt top-$LT_N) | run dir: $RUN_DIR | clock lock: $LOCK"
+say "Zero-shot mode: $MODE (per-suite $PER_SUITE, k $K, cuBLASLt top-$LT_N, cuBLASLt ranker: $LT_MODE${LT_RANK:+ top-$LT_RANK}) | run dir: $RUN_DIR | clock lock: $LOCK"
 T_START=$SECONDS
 for s in "${STAGES[@]}"; do
   selected "$s" || continue

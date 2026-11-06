@@ -47,7 +47,16 @@
 # Submit from the repo:   sbatch remoteGPU/zero_shot.sh
 # Settings, as environment variables (sbatch exports them):
 #   PER_SUITE=12     held-out shapes per suite for the oracle: 12 = the 27-shape subset (the 2060 took 17.7 h for it), 1000 = all 86
-#   STAGES=sweep,run,score,stage2   which stages to run (all by default; e.g. STAGES=run,score,stage2 when the screen already exists)
+#   STAGES=sweep,run,score,stage2   which stages to run (all by default; e.g. STAGES=run,score,stage2 when the screen already exists).
+#                    ltscreen,ltfit (cuBLASLt ranker retraining, LT_MODE=retrain only) are added by LT_MODE, in front of sweep
+#   LT_MODE=off      the learned cuBLASLt ranker in the joint search (baselines/cublaslt_rank.py): off | zero_shot | retrain.
+#                      zero_shot  the 3080's lt_rank.{txt,json} (LT_MODELS=DIR, default $MODELS), no refit, as_is and native SM count.
+#                                 Only meaningful on the same architecture: the RTX 3090 (sm_86), not the 2060 (sm_75)
+#                      retrain    screen the cuBLASLt configs of the tune shapes on this GPU (ltscreen, LT_SHAPES=160 spread over the
+#                                 652; 0 = all, ~70 min on a 3080), fit data/<hw>/lt_rank (ltfit, CPU) and use it: the choice for the 2060
+#   LT_RANK=5        cuBLASLt ranker picks per search (with LT_MODE != off)
+#   LT_SHAPES=160    tune shapes of the cuBLASLt screen for LT_MODE=retrain (0 = all 652)
+#   e.g.  LT_MODE=retrain sbatch remoteGPU/zero_shot.sh            (2060)       LT_MODE=zero_shot sbatch remoteGPU/zero_shot.sh   (3090)
 #   CLOCK_LOCK=none  declared SM clock lock in MHz. A job cannot run `nvidia-smi -lgc` (no sudo), so the default is "none" = unlocked:
 #                    results are NOT comparable to the 3080's 1755 MHz numbers in absolute time, only in regret / ratios within this GPU
 #   WORKERS=4        parallel compile workers of the sweep (default: the CPUs of the job)
@@ -103,7 +112,7 @@ TUNE=(python -m tune --clock-lock "$LOCK")
 ZS=(python -m analysis.zero_shot --clock-lock "$LOCK")
 PER_SUITE="${PER_SUITE:-12}"
 WORKERS="${WORKERS:-${SLURM_CPUS_PER_TASK:-4}}"
-STAGES="${STAGES:-sweep,run,score,stage2}"
+STAGES="${STAGES:-ltscreen,ltfit,sweep,run,score,stage2}"
 stage() { [[ ",$STAGES," == *",$1,"* ]]; }
 
 D="$(python -c 'from tune.env import default_data_dir; print(default_data_dir())' | tail -1)"
@@ -122,6 +131,36 @@ import json, sys
 for stem in ("lgbm_rank", "lgbm_rank_v2"):
     print(stem, "was fit on:", json.load(open(f"{sys.argv[1]}/{stem}.json"))["gpu"]["name"])
 EOF
+
+LT_MODE="${LT_MODE:-off}"
+LT_RANK="${LT_RANK:-5}"
+LT_SHAPES="${LT_SHAPES:-160}"
+case "$LT_MODE" in off|zero_shot|retrain) ;; *) die "LT_MODE must be off, zero_shot or retrain" ;; esac
+[ "$LT_MODE" = "off" ] && LT_RANK=0
+LT_ARGS=()
+if [ "$LT_MODE" = "zero_shot" ]; then
+    LT_MODELS="${LT_MODELS:-$MODELS}"
+    for f in lt_rank.txt lt_rank.json; do
+        [ -f "$LT_MODELS/$f" ] || die "$LT_MODELS/$f is missing: LT_MODE=zero_shot needs the 3080's cuBLASLt ranker (data/<hw>/ or reports/snapshot/lock1755/)"
+    done
+    md5sum "$LT_MODELS"/lt_rank.txt
+    LT_ARGS=(--lt-rank "$LT_RANK" --lt-rank-model "$LT_MODELS/lt_rank")
+elif [ "$LT_MODE" = "retrain" ]; then
+    LT_ARGS=(--lt-rank "$LT_RANK")
+    export TUNE_LT_RANK="$D/lt_rank"
+fi
+echo "cuBLASLt ranker: $LT_MODE (top-$LT_RANK)"
+
+if [ "$LT_MODE" = "retrain" ] && stage ltscreen; then
+    echo "=== ltscreen: every cuBLASLt config of the tune shapes, on this GPU ($(date '+%F %T'))"
+    [ "$LOCK" = "none" ] || export TUNE_CLOCK_LOCK="$LOCK"
+    LIM=(); [ "$LT_SHAPES" -gt 0 ] && LIM=(--limit "$LT_SHAPES" --spread)
+    python -u -m baselines.cublaslt_screen --out "$D/lt_screen" "${LIM[@]}"
+fi
+if [ "$LT_MODE" = "retrain" ] && stage ltfit; then
+    echo "=== ltfit: cuBLASLt ranker on this GPU's screen ($(date '+%F %T'))"
+    python -u -m analysis.lt_rank --screen-dir "$D/lt_screen" --save "$D/lt_rank"
+fi
 
 if stage sweep; then
     echo "=== sweep: held-out oracle ($(date '+%F %T'))"
@@ -144,7 +183,7 @@ EOF
 
 if stage run; then
     echo "=== run: ranker -> compile -> short online search ($(date '+%F %T'))"
-    "${ZS[@]}" run --ranker v1="$MODELS/lgbm_rank" v2="$MODELS/lgbm_rank_v2" --k 5 --lt-n 16 --fresh-cache
+    "${ZS[@]}" run --ranker v1="$MODELS/lgbm_rank" v2="$MODELS/lgbm_rank_v2" --k 5 --lt-n 16 --fresh-cache "${LT_ARGS[@]}"
 fi
 
 # Each `score` call writes one fixed file name per data directory, so k = 3 and k = 5 go to separate report folders
@@ -160,11 +199,25 @@ if stage stage2; then
     "${ZS[@]}" picks
     export TUNE_SWEEP_DIR="$D/sweep_screen_heldout" TUNE_PICKS="$D/zero_shot_stage2_picks.json"
     BACKENDS="torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20"
-    "${TUNE[@]}" benchmark --shapes-file "$D/sweep_screen_heldout/subset.json" --backends "$BACKENDS" --cache-modes cold \
+    [ "$LT_RANK" -gt 0 ] && BACKENDS="torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_rank:$LT_RANK,cublaslt_deep:20"
+    # `cublaslt_rank:M` expands to what this process's ranker proposes: a zero-shot model needs a pass per SM-count variant (as_is, native);
+    # `benchmark` resumes per (shape, candidate key), so a second pass only times the picks the first did not propose.
+    VARIANTS=(default); [ "$LT_MODE" = "zero_shot" ] && VARIANTS=(as_is native)
+    bench() {
+        for v in "${VARIANTS[@]}"; do
+            if [ "$v" != default ]; then
+                export TUNE_LT_RANK="$LT_MODELS/lt_rank" TUNE_LT_RANK_FOREIGN=1
+                if [ "$v" = native ]; then export TUNE_LT_RANK_SMS=native; else unset TUNE_LT_RANK_SMS; fi
+                echo "--- cuBLASLt ranker variant: $v"
+            fi
+            "${TUNE[@]}" benchmark "$@"
+        done
+    }
+    bench --shapes-file "$D/sweep_screen_heldout/subset.json" --backends "$BACKENDS" --cache-modes cold \
         --out-name results_zero_shot.jsonl
     N_SMALL="$(python -c "import json; print(json.load(open('$D/zero_shot_lt50us.json'))['n'])")"
     if [ "$N_SMALL" -gt 0 ]; then
-        "${TUNE[@]}" benchmark --shapes-file "$D/zero_shot_lt50us.json" --backends "$BACKENDS" --cache-modes hot --graph-batch 50 \
+        bench --shapes-file "$D/zero_shot_lt50us.json" --backends "$BACKENDS" --cache-modes hot --graph-batch 50 \
             --out-name results_zero_shot_graph.jsonl
     else
         echo "no held-out shape under 50 us on this GPU: no graph pass"

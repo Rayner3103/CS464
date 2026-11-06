@@ -20,6 +20,9 @@ import numpy as np
 SMALL_US = 50.0
 EPS = {"small": 1.05, "large": 1.02}
 CONFIGS = (("top-3 Triton only", 3, 0), ("top-3 + LT16", 3, 16), ("top-5 + LT16", 5, 16), ("top-1 + LT16", 1, 16))
+# Families a joint choice can come from: a search run with the learned cuBLASLt ranker / k-NN proposals (`lt_rank`, `lt_knn`) may pick one,
+# so stage 2 must have timed them too (`--backends ...,cublaslt_rank:M`); without them in the lookup such a pick is a StopIteration.
+PICK_FAMILIES = ("tri", "lth", "ltd", "ltk", "ltr")
 FAMILY = {"triton_nn_v1": "tri", "cublaslt": "lth", "cublaslt_deep": "ltd", "cublaslt_knn": "ltk", "cublaslt_rank": "ltr", "torch_matmul": "torch"}
 
 
@@ -66,9 +69,9 @@ def chosen_times(online: Path, ref: dict, cold: dict) -> dict:
         for name, k, lt in configs:
             ch = r["choice"][str(k)] if lt == 16 else r["choice_lt"][f"{k}_lt{lt}"]
             src = ref[s]["src"]
-            t = next((src[f][ch["key"]] for f in ("tri", "lth", "ltd") if ch["key"] in src[f]), None)
+            t = next((src[f][ch["key"]] for f in PICK_FAMILIES if ch["key"] in src[f]), None)
             if t is None:  # not timed in this mode (e.g. a pick only timed cold): fall back to the cold session
-                t = next(cold[s][f][ch["key"]] for f in ("tri", "lth", "ltd") if ch["key"] in cold[s][f])
+                t = next(cold[s][f][ch["key"]] for f in PICK_FAMILIES if ch["key"] in cold[s][f])
             out[name]["t"].append(t)
             out[name]["cost"].append(ch["compile_s"] + ch["time_s"] + r["rank_s"])
             out[name]["family"].append(ch.get("family", "triton"))
