@@ -58,6 +58,16 @@ def test_summarize_counts_picks_over_50_percent():
     assert s["over_50"] == 3 and s["n"] == 5 and s["unscored"] == 1
 
 
+def test_summarize_and_fmt_report_p99_between_p95_and_worst():
+    vals = [i / 100 for i in range(100)]                       # 0.00 .. 0.99
+    s = zs.summarize(vals)
+    assert s["p95"] == pytest.approx(0.9405) and s["p99"] == pytest.approx(0.9801) and s["p95"] < s["p99"] <= s["worst"]
+    assert zs.fmt(s) == "49.5% / 94.0% / 98.0% (49.5%)"
+    old = {k: v for k, v in s.items() if k != "p99"}           # a summary written before p99 was stored still formats
+    assert zs.fmt(old) == "49.5% / 94.0% (49.5%)"
+    assert zs.fmt({"n": 0}) == "n/a"
+
+
 def test_build_report_has_the_over_50_column_and_counts_slow_picks(tmp_path):
     data = tmp_path / "hw_x"
     data.mkdir()

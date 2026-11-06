@@ -4,6 +4,41 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-11-06: p99 in the remaining docs, reports and generators — noise floor, fresh shapes, cross-GPU, overview; the tail the tie margin does not cover
+
+**What.** The 2026-11-04 (audit) entry added p99 to the selector and joint-search scorers. This pass carries it to everything else that quoted a p95 without it. **Nothing was re-measured**: every number is a re-score or re-aggregation of stored rows (CPU only; no GPU job ran; GPU idle throughout). Where a generated file changed, its other cells are unchanged: with the p99 keys / columns stripped, `cross_gpu_summary.json`, the 3090 `zero_shot_*_summary.json` and `ranker_compare_summary.json`, the five `week1_summary_lock1755*.json` noise blocks and `results_overview.md` equal the committed versions cell for cell (checked by script). The one exception was the compiled-kernel count of `cross_gpu.md` (the local 3080 Triton cache has grown from 1,886 to 5,310 files since that report), which was put back to the committed value so that the diff is p99 only.
+
+**Code.** `analysis/zero_shot.py` (`summarize` stores `p99`, `fmt` prints `median / p95 / p99 (mean)` and still prints summaries written before p99 existed; the two 3080 reference rows are now `(median, p95, p99, mean)` and were re-derived from the stored online files with `cross_gpu.screen_table` / `score_rows`: top-1 v1 3.6 / 18.1 / 24.0 / 5.5% and v2 2.8 / 13.0 / 26.2 / 4.6% reproduce the old triples exactly); `analysis/cross_gpu.py` (header text); `analysis/plots.py` (p99 columns in the overview's noise, selector and portfolio tables); `analysis/report.py` (`range_p99` / `paired_p99` next to the p95s of the noise summary); `pipeline/run.sh`, `pipeline/zero_shot.sh` (table labels). Docs: `AGENTS.md` §6 and §7, `docs/methodology.md`, `docs/zero_shot_runbook.md`, `results/*.md` (the plain-language summary; its figures still draw median / mean / p95).
+
+**Noise floor** (`docs/methodology.md`; p99 over 44 / 43 kernels per session, i.e. essentially the worst kernel):
+
+| | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| range of medians across the three sessions, ≥ 50 µs, cold | 0.24% | 1.75% | **2.3%** | 2.5% |
+| same, hot | 0.09% | 1.78% | **2.6%** | 3.0% |
+| across rounds, one allocation, all shapes (cold) | 0.67% | 5.4% | 12.5% | 20.0% |
+| across rounds, 3 allocations pooled (cold) | 0.29% | 2.6% | 6.3% | 9.6% |
+| paired kernel ratio across rounds, 1 / 3 allocations (cold) | 2.1 / 0.33% | 6.2 / 3.5% | 20.0 / 10.3% | |
+
+Per session across rounds (≥ 50 µs, cold / hot), p95 → p99: `…642a` 1.3 / 1.2 → 2.0 / 1.7%; `…lock1755` 1.8 / 1.8 → 3.1 / 2.8%; `…6985` (2 min after a reboot) 1.4 / 1.9 → **4.3 / 4.2%** (worst cold kernel 4.8%). Under 50 µs, cold per launch: p95 6.2-6.4% in the locked sessions, p99 7.3 / 13.2%. **The tie margin ε = 2% is a p95 statement.** The worst kernel in 44 moves 2.3-2.6% between sessions and 3-4% between rounds of one session, so a 2-4% win on one shape is not distinguishable from noise even when it passes ε; G1 is unchanged (it is defined on p95). The kernel-ratio p95 of 1.94% quoted since 10-14 comes from a script that is not in the repo; the obvious definition on `noise_stats.csv` gives 2.05% cold / 2.11% hot, so no p99 is given for it.
+
+**Fresh shapes (2026-11-05 entry, now with p99).** Regret vs the joint oracle, median / p95 / p99 / mean: heuristic-only 1.0 / 17.4 / 33.6 / 3.3% → k-NN8 1.0 / 6.7 / 27.6 / 2.5% → ranker top-5 **0.6 / 5.6 / 12.8 / 1.6%** (held-out for the same pools: p99 22.8 → 8.3 → 8.4%). Against the extended oracle: 0.7 / 5.6 / 12.9 / 1.8%. The ranker's p99 gain over the heuristic pool is −18.9 points [−36.3, 0.0] paired (the interval touches 0, as the p95's does; only the mean excludes 0). Router + confirm 3 leaves the p99 at 12.9% (A and C), B 13.9%. `python -m analysis.lt_rank_ab` and `confirm_ab` with the commands of that entry print all of it.
+
+**Cross-GPU** (`reports/cross_gpu.md`, 27 shared shapes, p99 = the worst shape or the one before it): online top-3 p99 3080 v1 9.2%, 3080 v2 10.2%, 2060 retrained 13.3%; 3090 zero-shot v1 as_is / native 26.5 / 14.8%, v2 as_is / native 14.4 / 12.6%; 2060 zero-shot 570-3260%. So the 3090's zero-shot v2 stays within noise of the 3080 on the mean (2026-11-03 entry) but sits at 1.2-1.4x the 3080 v2's p99, and the zero-shot v1 `as_is` tail (26.5% against 9.2%) is the clearest sign that v1's tail does not transfer; at n = 27 one shape decides it. 3080 reference rows of the zero-shot reports (86 shapes, v1 / v2): top-1 24.0 / 26.2%, best-of-3 diverse 15.9 / 13.0%, v2 best-of-5 13.0%.
+
+**Overview and Triton-only tables** (`reports/results_overview.md`, `learned_topk.md`, `selector_baselines.md`, `sweep_portfolio*.md`, all with p99 already or now): held-out cold stage 2, p95 → p99 (as regret fractions): B6 4.86 → 9.48; diverse online top-3 0.091 → 0.202; k-NN + fill 0.229 → 0.413; static portfolio of 100 configs held-out 0.111 → 0.182 (tune 0.018 → 0.028).
+
+**Left as written.** The dated entries below keep their p95-only tables (the 2026-11-04 audit entry and this one carry the p99 of the ones the audit re-scored), the baseline tables (speed against B1-B3+, not regret distributions), `plan.md` (frozen; its gates G1/G5 are defined on p95) and the figures. Two numbers in `AGENTS.md` come from a session with no stored p99 (`topkd` cold ≥ 50 µs and graph rows) and quote the `topki` session's p99, labelled as such.
+
+**Reproduce** (CPU only):
+```bash
+D=data/rtx3080_sm86_68sms_10gb
+python -m analysis.plots --data $D                                  # results_overview.md with p99
+python -m tune analyze --data $D --results results_lock1755.jsonl   # noise summary with range_p99 / paired_p99 (other sections of a regenerated file differ from the committed ones: the committed ones predate later data; only the noise table was spliced)
+python -m analysis.zero_shot score --data data/rtx3090_sm86_82sms_24gb --report reports/zero_shot_rtx3090_sm86_82sms_24gb/k3 --k 3   # and k5
+# cross_gpu: the command of the 2026-11-03 entry
+```
+
 ## Update 2026-11-04 (audit): the joint-search tables rescored against an oracle that sees the proposals — ranker top-5 is 0.5% / 5.5% / 1.4%, not 0.4% / 4.7% / 1.2%; its win over the heuristic stands, its win over k-NN8 is not shown
 
 **Why.** An audit of every number quoting the ranker's win (re-running `analysis.ranker_compare`, `lt_rank_ab`, `lt_knn_ab`, `confirm_ab` on the stored rows: all reproduce the earlier reports exactly) found one scoring flaw. The "joint oracle" of `lt_rank_ab`, `confirm_ab`, `analysis.router` and `analysis.joint_rank` was the best Triton config of the session and B3+. The stage-2 session also times the k-NN proposals and the learned ranker's top-16 (`cublaslt_knn:8`, `cublaslt_rank:16`), and those configs were not in the oracle, so a pool that picked one was scored against an oracle that cannot see it: **negative regret on 4 shapes for the ranker top-5 (worst −2.5%), 4 for k-NN8 (worst −4.9%)**. `lt_knn_ab` already printed an extended oracle next to the old one; the other scripts did not. The extended oracle (`orc_x` in `analysis.ranker_compare.references`) is now the one every script uses; it differs from the old one on 12 of 86 shapes and equals it in sessions that timed no proposals (`ranker_compare.md` is byte-identical). No measurement was re-run; this is a re-scoring of the same rows (cold `results_lock1755_rank16.jsonl`, graph `…_rank16_graph.jsonl`, online `online_joint_diverse_v2_knn8_rank16.jsonl`). `harness_dirty` is true on those rows, as before.
@@ -88,29 +123,29 @@ python -m analysis.ranker_compare --data $D --online v1=online_joint_diverse.jso
 
 **Pools** (`analysis.lt_rank_ab`; v2 top-3 Triton + heuristic top-16 + the named proposals; regret vs the joint oracle of the session = best Triton of the screen top-8 and the picks, and B3+; each pick looked up at its stage-2 time):
 
-| pool | regret median / p95 / mean | shapes > 5% / > 10% off | slower than B3+ | `fresh_random` p95 | `fresh_llm` p95 |
+| pool | regret median / p95 / p99 / mean | shapes > 5% / > 10% off | slower than B3+ | `fresh_random` p95 | `fresh_llm` p95 |
 |---|---|---|---|---|---|
-| heuristic top-16 only | 1.0% / 17.4% / 3.3% | 9 / 4 | 14 | 6.2% | 17.7% |
-| + k-NN8 | 1.0% / 6.7% / 2.5% | 7 / 2 | 13 | 5.0% | 13.0% |
-| **+ ranker top-5** (shipped) | **0.6% / 5.6% / 1.6%** | **4 / 1** | 10 | 5.0% | **7.4%** |
-| + k-NN8 + ranker top-5 | 0.6% / 5.6% / 1.6% | 4 / 1 | 11 | — | — |
+| heuristic top-16 only | 1.0% / 17.4% / 33.6% / 3.3% | 9 / 4 | 14 | 6.2% | 17.7% |
+| + k-NN8 | 1.0% / 6.7% / 27.6% / 2.5% | 7 / 2 | 13 | 5.0% | 13.0% |
+| **+ ranker top-5** (shipped) | **0.6% / 5.6% / 12.8% / 1.6%** | **4 / 1** | 10 | 5.0% | **7.4%** |
+| + k-NN8 + ranker top-5 | 0.6% / 5.6% / 11.3% / 1.6% | 4 / 1 | 11 | — | — |
 
-(The held-out numbers of the same pools: 0.6 / 11.6 / 2.6% → 0.6 / 6.8 / 1.6% → 0.4 / 4.7 / 1.2%; 12 / 9 / 4 shapes > 5% off.) Against the extended oracle that also contains the proposals (the proposals can then be the oracle): ranker top-5 0.7% / 5.6% / 1.8%. Paired geometric-mean time ratios (95% bootstrap): ranker top-5 vs heuristic only **0.9851 [0.9692, 0.9973]**, faster on 5 shapes, slower on 0; k-NN8 vs heuristic only 0.9922 [0.9813, 1.0005], 4 / 2; ranker top-10 vs k-NN8 0.9929 [0.9795, 1.0020], 4 / 1 (the interval contains 1, as on held-out). Top-5, 10 and 16 give the same online choice again. By group: the ranker's gain is concentrated on the LLM-layer shapes (p95 17.7% → 7.4%, mean 4.4% → 2.2%); on the random shapes both proposal sources reach the same 5.0% p95.
+(The held-out numbers of the same pools: 0.6 / 11.6 / 22.8 / 2.6% → 0.6 / 6.8 / 8.3 / 1.6% → 0.4 / 4.7 / 8.4 / 1.2%; 12 / 9 / 4 shapes > 5% off. With 60 shapes p99 is essentially the worst shape: 12.8% here is 96×5120×14336, whose oracle is 16% faster than B3+; the heuristic-only pool's 33.6% is the same kind of shape where a deep-search config is missing.) Against the extended oracle that also contains the proposals (the proposals can then be the oracle): ranker top-5 0.7% / 5.6% / 12.9% / 1.8%. The p99 gain over the heuristic-only pool is large (−18.9 points [−36.3, 0.0], paired) but its interval touches 0, like the p95's; the mean (−1.71 [−3.60, −0.31]) is the only one that excludes 0. Paired geometric-mean time ratios (95% bootstrap): ranker top-5 vs heuristic only **0.9851 [0.9692, 0.9973]**, faster on 5 shapes, slower on 0; k-NN8 vs heuristic only 0.9922 [0.9813, 1.0005], 4 / 2; ranker top-10 vs k-NN8 0.9929 [0.9795, 1.0020], 4 / 1 (the interval contains 1, as on held-out). Top-5, 10 and 16 give the same online choice again. By group: the ranker's gain is concentrated on the LLM-layer shapes (p95 17.7% → 7.4%, mean 4.4% → 2.2%); on the random shapes both proposal sources reach the same 5.0% p95.
 
 **Against the vendor baselines** (shipped pool, speed = t_pick / t_baseline, < 1 faster; faster / slower by the tie margin): B2 median 0.924, p10 0.754, **42 / 1**; B3 median 0.981, 25 / 3; B3+ median 1.000, p10 0.871, 11 / 10 (≥ 50 µs: 1.007, < 50 µs: 0.998). Remaining misses (> 5% off the oracle): 96×5120×14336 (17.9%, the oracle is 16% faster than B3+ there), 24×1024×5120 (9.5%), 180×825×258 (6.7%), 469×15832×13 (5.5%). G4 is unchanged: nothing is faster than B3+ by more than the margin where the deep search is the bar.
 
 **Router and confirmation** (`analysis.confirm_ab`, same pools, ranker top-5, k = 3 choice): the router skipped 15 of 60 shapes.
 
-| run | regret median / p95 / mean | > 5% / > 10% | slower than B3+ | first-use cost (no bundle) | skipped |
+| run | regret median / p95 / p99 / mean | > 5% / > 10% | slower than B3+ | first-use cost (no bundle) | skipped |
 |---|---|---|---|---|---|
-| reference: Triton first, no router, no confirm | 0.7% / 5.6% / 1.8% | 4 / 1 | 10 | 0.954 s | 0 |
-| A: Triton first, confirm 3 | 0.5% / 5.6% / 1.7% | 5 / 1 | 9 | 1.005 s | 0 |
-| B: cuBLASLt first, never skip, confirm 3 | 0.8% / 6.4% / 1.9% | 5 / 1 | 7 | 1.020 s | 0 |
-| **C: router, confirm 3** | **0.5% / 5.2% / 1.6%** | 4 / 1 | 8 | **0.855 s (−10%)** | 15 |
+| reference: Triton first, no router, no confirm | 0.7% / 5.6% / 12.9% / 1.8% | 4 / 1 | 10 | 0.954 s | 0 |
+| A: Triton first, confirm 3 | 0.5% / 5.6% / 12.9% / 1.7% | 5 / 1 | 9 | 1.005 s | 0 |
+| B: cuBLASLt first, never skip, confirm 3 | 0.8% / 6.4% / 13.9% / 1.9% | 5 / 1 | 7 | 1.020 s | 0 |
+| **C: router, confirm 3** | **0.5% / 5.2% / 12.9% / 1.6%** | 4 / 1 | 8 | **0.855 s (−10%)** | 15 |
 
 C vs the reference 0.9977 [0.9955, 0.9998] (worse on 1, better on 2); C vs A 0.9996 [0.9973, 1.0016] (1 / 1); C vs B 0.9977 [0.9951, 0.9999] (0 / 2); B vs A 1.0019 [0.9997, 1.0042] (the timing-order effect, worse on 2, better on 1, smaller than on held-out but the same direction). On the 15 skipped shapes the C / A time ratio has geometric mean 0.9978, worst 1.024 (6000×3072×8192: 5001 → 5121 µs, P(win) 0.012). The router's P(win) separates the shapes where Triton's oracle beats B3+ by more than the margin (12 of 60) with **AUC 0.861** (tune out-of-fold 0.823), and none of the 15 skipped shapes was one of them.
 
-**Reading.** All three results replicate on shapes none of the models, thresholds or conclusions had seen: the ranker beats the heuristic-only pool with a paired interval that excludes 1 and is better than k-NN8 on the tail but not significantly in the mean; the router at the rule threshold saves ~10% of the no-bundle first-use cost at no measurable quality cost; the confirmation pass keeps the ordering effect small. The tail is a little heavier than on held-out (p95 5.6% vs 4.7%, one shape > 10% off vs none), mostly one large LLM-layer shape. **Limits.** 60 shapes (31 graph-amortized), one GPU, harness dirty, ~50% of the stage-2 samples power-capped; the cost column is the no-bundle regime (where the router is on); the 3080's models are the only ones exercised.
+**Reading.** All three results replicate on shapes none of the models, thresholds or conclusions had seen: the ranker beats the heuristic-only pool with a paired interval that excludes 1 and is better than k-NN8 on the tail but not significantly in the mean; the router at the rule threshold saves ~10% of the no-bundle first-use cost at no measurable quality cost; the confirmation pass keeps the ordering effect small. The tail is a little heavier than on held-out (p95 5.6% vs 4.7%, p99 12.8% vs 8.4%, one shape > 10% off vs none), mostly one large LLM-layer shape. As on held-out, the router does not move the p99 (12.9% in A and C; the worst shape is not one it skips). **Limits.** 60 shapes (31 graph-amortized), one GPU, harness dirty, ~50% of the stage-2 samples power-capped; the cost column is the no-bundle regime (where the router is on); the 3080's models are the only ones exercised.
 
 **Reproduce.**
 ```bash

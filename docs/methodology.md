@@ -44,8 +44,12 @@ Pooling the samples over 3 placements cuts the noise floor roughly in half. All 
 
 | | 1 allocation | 3 allocations pooled |
 |---|---|---|
-| across-round range of medians, p50 / p95 (cold) | 0.67% / 5.4% | 0.29% / 2.6% |
-| paired kernel-ratio range, p50 / p95 (cold) | 2.1% / 6.2% | 0.33% / 3.5% |
+| across-round range of medians, p50 / p95 / p99 (cold) | 0.67% / 5.4% / 12.5% | 0.29% / 2.6% / 6.3% |
+| paired kernel-ratio range, p50 / p95 / p99 (cold) | 2.1% / 6.2% / 20.0% | 0.33% / 3.5% / 10.3% |
+
+(p99 is essentially the worst of the 60 (shape, kernel) ranges, or of the 30 ratios: pooling cuts the median and p95 by about half and the tail
+by about half too, but a tail kernel still moves 6-10% between rounds. The 1-allocation paired p99 is the single worst ratio.
+Reproduce: `python -m tune analyze` prints `range_p99` / `paired_p99` per session next to the p95s.)
 
 **Tie margin for analysis (revised 2026-10-14): ε = 2% for kernels ≥ 50 µs** measured under the standard conditions below.
 Kernels within 2% of each other count as tied. Kernels under 50 µs keep ε = 5% in per-launch mode; rank them with
@@ -57,18 +61,24 @@ graph-amortized timing instead. Wins under 5% are reported but not relied on for
 driver 595.99.02, 3 allocations pooled per measurement, cold L2 primary. There were three complete sessions, one of them right after a
 reboot:
 
-| session | when | p95 range across rounds (≥ 50 µs), cold / hot |
-|---|---|---|
-| `noise-20261013-232542-642a` | 10-13 23:25 (lock inferred from observed max clock) | 1.3% / 1.2% |
-| `noise-20261014-001639-lock1755` | 10-14 00:16 | 1.8% / 1.8% |
-| `noise-20261014-141218-6985` | 10-14 14:12, 2 min after a reboot | 1.4% / 1.9% |
+| session | when | p95 range across rounds (≥ 50 µs), cold / hot | p99 (≈ worst of 44 / 43 kernels), cold / hot |
+|---|---|---|---|
+| `noise-20261013-232542-642a` | 10-13 23:25 (lock inferred from observed max clock) | 1.3% / 1.2% | 2.0% / 1.7% |
+| `noise-20261014-001639-lock1755` | 10-14 00:16 | 1.8% / 1.8% | 3.1% / 2.8% |
+| `noise-20261014-141218-6985` | 10-14 14:12, 2 min after a reboot | 1.4% / 1.9% | 4.3% / 4.2% |
 
-Across the three sessions, for the same (shape, kernel, mode) at ≥ 50 µs, the range of medians is p50 0.24%, **p95 1.75%**, max 2.5% (cold),
-and **p95 1.78%** (hot). For the ratio between the two kernels, which is what decides selection, it is **p95 1.94%**. The median shift between any
+Across the three sessions, for the same (shape, kernel, mode) at ≥ 50 µs, the range of medians is p50 0.24%, **p95 1.75%**, p99 2.3%, max 2.5% (cold),
+and **p95 1.78%**, p99 2.6%, max 3.0% (hot). For the ratio between the two kernels, which is what decides selection, it is **p95 1.94%**. The median shift between any
 two sessions is ≤ 0.05%. **G1 passes for kernels ≥ 50 µs.**
 
+**What ε = 2% does not cover.** ε is set from the p95. The tail is wider: the worst one or two of 44 kernels move 2.3-2.6% across sessions (p99) and,
+within one session across rounds, 3-4% (the p99 of the 10-14 sessions; the post-reboot session has a 4.8% worst cold kernel). A pick that wins by 2-4% on one
+kernel is therefore not a reliable win, which is why the tables report p99 and the worst shape next to p95 and name the shapes in the tail. (The kernel-ratio
+p99 is not given: the 1.94% p95 above comes from a script that is not in the repo and could not be reproduced from `reports/noise_stats.csv`, which gives
+2.05% cold / 2.11% hot for the ratio range by the obvious definition.)
+
 Caveats:
-- Kernels under 50 µs remain at about 6% p95 in cold per-launch mode, so G1 does not cover them.
+- Kernels under 50 µs remain at about 6% p95 in cold per-launch mode (p99 7-13%, 16 kernels per session, essentially the worst one), so G1 does not cover them.
 - The lock is a ceiling, not a floor. Under sustained heavy load the card still hits the power cap (throttle 0x4) on 14–19% of rows
   and dips to about 1590 MHz. It happens the same way in every session, so it does not hurt reproducibility.
 - These numbers hold only under the standard conditions. A driver update, a different lock, or unlocked clocks means re-running the noise study

@@ -40,22 +40,24 @@ flowchart TD
 
 *Left: the typical shape. Right: the unlucky 5%. Log scale, shorter is better.*
 
-| Selector | Median | Mean | Unlucky 5% |
-|---|---|---|---|
-| One fixed config (B6) | +48.7% | +111% | +486% |
-| Hand-written rule | +7.9% | +13.2% | +37% |
-| 5 nearest shapes (M, N, K) | +2.7% | +9.5% | +23% |
-| Nearest shapes + GPU-fill features | +1.8% | +6.5% | +23% |
-| Best single learned pick (random forest, rank) | +2.9% | +5.1% | +17% |
-| LightGBM ranker, pick 1 | +2.4% | +4.1% | +18% |
-| Ranker, **diverse top-3** + race | **+1.1%** | **+2.6%** | **+9.1%** |
-| Ranker, diverse top-5 + race | +0.7% | +2.4% | +8.5% |
+| Selector | Median | Mean | Unlucky 5% | Worst 1% |
+|---|---|---|---|---|
+| One fixed config (B6) | +48.7% | +111% | +486% | +948% |
+| Hand-written rule | +7.9% | +13.2% | +37% | +68% |
+| 5 nearest shapes (M, N, K) | +2.7% | +9.5% | +23% | +122% |
+| Nearest shapes + GPU-fill features | +1.8% | +6.5% | +23% | +41% |
+| Best single learned pick (random forest, rank) | +2.9% | +5.1% | +17% | +34% |
+| LightGBM ranker, pick 1 | +2.4% | +4.1% | +18% | +24% |
+| Ranker, **diverse top-3** + race | **+1.1%** | **+2.6%** | **+9.1%** | **+20%** |
+| Ranker, diverse top-5 + race | +0.7% | +2.4% | +8.5% | +20% |
+
+*"Worst 1%" is the 99th percentile: with 86 shapes, the single worst shape or the worst two.*
 
 What we learned:
 
 1. **Per shape beats one fixed config** by a very large margin.
 2. **Simple nearest-neighbour methods with GPU-aware features are strong**: better than most "fancier" learned classifiers. Classifier and linear models were worse than k-NN.
-3. **Racing a short list is the biggest single win.** Going from pick-1 to a diverse top-3 cut the unlucky-5% from 18% to 9%.
+3. **Racing a short list is the biggest single win.** Going from pick-1 to a diverse top-3 cut the unlucky-5% from 18% to 9%. The worst 1% moves much less (24% to 20%): a few odd shapes (such as 320×1×79 and 5398×196×774) are still 20% off, and racing three candidates does not rescue a shape the ranker has no good candidate for.
 
 ![Effect of k](figures/03_topk.png)
 
@@ -67,7 +69,7 @@ Cost: the diverse top-3 takes about **0.4 s** the first time a shape is seen (me
 
 ![v1 vs v2](figures/03_ranker_v1_v2.png)
 
-*Triton-only, top-3, 86 unseen shapes. The unlucky-5% regret halves (9.5% to 4.6%) and the mean falls from 2.3% to 1.2%. The paired speed test says this is a real effect.* v2 needs no measurement of the GPU's peak speed, because the gain comes from the tile geometry features. The price is about 0.08 s more per first use.
+*Triton-only, top-3, 86 unseen shapes. The unlucky-5% regret halves (9.5% to 4.6%), the worst 1% falls from 15.1% to 9.6%, and the mean falls from 2.3% to 1.2%. The paired speed test says this is a real effect.* v2 needs no measurement of the GPU's peak speed, because the gain comes from the tile geometry features. The price is about 0.08 s more per first use.
 
 ## 3.5 Joining Triton and cuBLASLt in one race
 
@@ -88,13 +90,13 @@ We repeated the whole recipe on an **RTX 2060** (retrained from scratch on 56 sh
 
 ![Cross GPU](figures/03_cross_gpu.png)
 
-- **Selection quality is similar** on both GPUs (typical shape 0.7–1.5% off the best, unlucky 5% about 7–8% off). With only 27 shapes we can say "no clear difference", not "equal".
+- **Selection quality is similar** on both GPUs (typical shape 0.7–1.5% off the best, unlucky 5% about 7–8% off, worst 1% 9–10% on the 3080 and 13% on the 2060). With only 27 shapes we can say "no clear difference", not "equal".
 - **But the Triton kernels are far slower than cuBLASLt on the 2060** (median 0.43× of B3+, and 0.24× on jobs of 50 µs or more). The compiled Triton code had no tensor-core instructions on this GPU/compiler version. We did not test whether a different setting fixes this.
 - Reading: **the selector transfers, the kernel family may not.** The model is not shared between GPUs (a zero-shot test, using the 3080's trained model on the 2060, is still to do).
 
 ## 3.7 Honest limits
 
-- One main GPU, one driver, 86 test shapes. The 95th percentile is set by only the 4–5 worst shapes.
+- One main GPU, one driver, 86 test shapes. The 95th percentile is set by only the 4–5 worst shapes, and the 99th by one or two.
 - The offline B3+ search still beats our online pick on 14 shapes. Remaining misses are ranker mistakes on odd shapes such as N = 1 or tiny K.
 - We never reach "faster than the best cuBLASLt at big sizes". The value is **never worse than NVIDIA's defaults, and 10% faster than its default on a typical shape, in under a second.**
 - The 150 tail shapes were chosen after seeing where training errors were, and while analysing we had also seen held-out shapes with N ≈ 1. No held-out shape was used in any fit, but that regime was not picked in perfect isolation (noted in `reports/week1.md`).

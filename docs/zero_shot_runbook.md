@@ -74,7 +74,8 @@ Pass `--report` explicitly (`R` is any folder, e.g. `reports/zero_shot_<hw_id>`)
 2. `native` against `as_is`: the gap is what the 3080's numbers in the features cost.
 3. The `fixed` row (the 3080's B6 config reused as-is): if the ranker barely beats it, the transfer is weak.
 4. Per-regime columns (>= 50 us, < 50 us): the < 50 us shapes are noisier and mostly launch-bound.
-5. The "RTX 3080 reference" rows at the bottom are over the 3080's full 86 shapes. For a run on a subset compare on the shared shapes instead:
+5. Regret cells read `median / p95 / p99 (mean)`. With 27 shapes p99 is essentially the worst shape (p95 is the second or third worst): read it as "how bad is the worst pick", next to the `regret > 50%` count. A `_summary.json` written before p99 was stored prints cells without it; rerun `score` (CPU only) to add it.
+6. The "RTX 3080 reference" rows at the bottom are over the 3080's full 86 shapes (same `median / p95 / p99 (mean)` format). For a run on a subset compare on the shared shapes instead:
 
 ```bash
 python -m analysis.cross_gpu \
@@ -146,4 +147,4 @@ Add a dated `## Update YYYY-MM-DD: ...` at the top of `reports/week1.md`: sessio
   `online_triton_cache/*/*/_matmul_kernel.ptx` for `mma.sync`). A second tensor-core GPU is the clean test.
 - The `native` pruner assumes Ampere-style stage buffers, so on Turing it may drop tiles that would run (conservative: a lower bound).
 - Picks the 3080 model proposes can be absent from the new GPU's screen (pruned there but valid when run): they show up as `unscored`.
-- n is small (27 or 86 shapes): read counts of picks > 50% off and intervals, not 1-point differences.
+- n is small (27 or 86 shapes): read counts of picks > 50% off and intervals, not 1-point differences. p99 at that n is the worst one or two shapes, so a gap of a few points in p99 between two variants is one shape's noise.

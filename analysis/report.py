@@ -126,6 +126,7 @@ def noise_analysis(data: Path, figs: Path) -> tuple[str, dict]:
              "n_allocs": int(s["n_allocs"].iloc[0]),
              "range_p50": s["across_round_range_rel"].median(),
              "range_p95": s["across_round_range_rel"].quantile(0.95),
+             "range_p99": s["across_round_range_rel"].quantile(0.99),   # ~ the worst (shape, kernel) of the session at these n
              "range_max": s["across_round_range_rel"].max(),
              "range_p95_ge50us": big["across_round_range_rel"].quantile(0.95) if len(big) else np.nan,
              "range_p95_lt50us": small["across_round_range_rel"].quantile(0.95) if len(small) else np.nan,
@@ -133,6 +134,7 @@ def noise_analysis(data: Path, figs: Path) -> tuple[str, dict]:
         if paired is not None:
             d["paired_p50"] = s["paired_ratio_range_rel"].median()
             d["paired_p95"] = s["paired_ratio_range_rel"].quantile(0.95)
+            d["paired_p99"] = s["paired_ratio_range_rel"].quantile(0.99)
         summ.append(d)
         out[f"{sess}/{cm}"] = d
     summary = pd.DataFrame(summ)

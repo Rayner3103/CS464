@@ -456,7 +456,7 @@ for k in (3, 5):
     if k > k_max or not p.exists():
         continue
     s = json.loads(p.read_text())
-    out.append(f"## Online search, k = {k} (Triton-only choice), regret vs this GPU's own oracle: median / p95 (mean)\n")
+    out.append(f"## Online search, k = {k} (Triton-only choice), regret vs this GPU's own oracle: median / p95 / p99 (mean)\n")
     out.append(f"{s['n_screen_shapes']} held-out shapes in the screen.\n")
     out.append("| variant | shapes | all | >= 50 us | < 50 us |\n|---|---|---|---|---|")
     for v, d in s["variants"].items():

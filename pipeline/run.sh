@@ -311,7 +311,7 @@ if md.exists():
             k in l for k in ("| knnf |", "diverse online top-3", "plain online top-3", "diverse online top-1"))]
         n = next((l for l in body.splitlines() if "rows," in l), "")
         out.append(f"### Held-out stage 2, {title}\n\n{n}\n")
-        out.append("Regret vs the per-shape Triton oracle, median / p95 (mean); last column = speed vs the searched cuBLASLt (B3+):\n")
+        out.append("Regret vs the per-shape Triton oracle, median / p95 / p99 (mean); last column = speed vs the searched cuBLASLt (B3+):\n")
         hdr = [l for l in body.splitlines() if l.startswith("|")][:2]
         out.extend(hdr)
         out.extend(rows)

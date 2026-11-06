@@ -343,7 +343,7 @@ def fig_noise(ctx: Ctx):
                 if len(d):
                     ax[1].step(100 * d, np.arange(1, len(d) + 1) / len(d), where="post", color=col, ls="-" if s == order[0] else "--", lw=1.8)
                     summary.append({"quantity": "across-round range", "session": s, "mode": cm, "n": len(d),
-                                    "p50": np.median(d), "p95": np.percentile(d, 95), "max": d.max()})
+                                    "p50": np.median(d), "p95": np.percentile(d, 95), "p99": np.percentile(d, 99), "max": d.max()})
         if len(order) >= 2:
             piv = st.pivot_table(index=["shape", "kernel_family", "cache_mode"], columns="session_id", values="median_us").dropna()
             piv = piv[piv[order].min(axis=1) >= SMALL_US]
@@ -354,7 +354,7 @@ def fig_noise(ctx: Ctx):
                 if len(d):
                     ax[2].step(100 * d, np.arange(1, len(d) + 1) / len(d), where="post", color=col, lw=1.8)
                     summary.append({"quantity": "cross-session |difference|", "session": f"{order[0][-12:]} vs {order[-1][-12:]}",
-                                    "mode": cm, "n": len(d), "p50": np.median(d), "p95": np.percentile(d, 95), "max": d.max()})
+                                    "mode": cm, "n": len(d), "p50": np.median(d), "p95": np.percentile(d, 95), "p99": np.percentile(d, 99), "max": d.max()})
         for a_, t_ in ((ax[1], "Across-round range, kernels >= 50 us"), (ax[2], "Cross-session difference, kernels >= 50 us")):
             a_.axvline(100 * EPS_BIG, color=th.rule, ls="--", lw=1)
             a_.set_xlim(0, 6)
@@ -553,14 +553,14 @@ def fig_selectors(ctx: Ctx):
         fig.tight_layout(rect=(0, 0, 1, 0.91))
         _title(fig, th, "Selector regret on the 86 held-out shapes (cold L2, stage-2 re-timing)",
                "no held-out shape was used to fit anything; dashed line = 2% tie margin; each selector is scored against its own session's oracle")
-        ctx.add("selectors", _save(fig, ctx.out, "selectors_heldout_regret.png"), "Median / mean / p95 regret of every selector on held-out shapes.")
+        ctx.add("selectors", _save(fig, ctx.out, "selectors_heldout_regret.png"), "Median / mean / p95 regret of every selector on held-out shapes (p99 is in the table below).")
         df = pd.DataFrame([{"selector": r[0], "family": FAMILY[r[1]], "median": r[2]["p50"], "mean": r[2]["mean"], "p95": r[2]["p95"],
-                            "max": r[2]["max"], "within 5%": r[2]["frac_le_5pct"]} for r in rows])
+                            "p99": r[2].get("p99", float("nan")), "max": r[2]["max"], "within 5%": r[2]["frac_le_5pct"]} for r in rows])
         ctx.text("selectors", "### Held-out regret, cold L2, all 86 shapes (t / oracle - 1)\n\n" + _md_table(df, "{:.3f}") + "\n")
         for grp, mode in ((">= 50 us", "cold"), ("< 50 us", "cold"), ("all", "graph")):
             rr = selector_rows(ctx.report, mode, grp)
             if rr:
-                sub = pd.DataFrame([{"selector": r[0], "median": r[2]["p50"], "mean": r[2]["mean"], "p95": r[2]["p95"], "n": r[2]["n"]} for r in rr
+                sub = pd.DataFrame([{"selector": r[0], "median": r[2]["p50"], "mean": r[2]["mean"], "p95": r[2]["p95"], "p99": r[2].get("p99", float("nan")), "n": r[2]["n"]} for r in rr
                                     if r[0] in ("B6 best single config", "k-NN + GPU-fill features", "LightGBM top-1", "plain online top-3", "diverse online top-3 (bar)")])
                 ctx.text("selectors", f"### {'graph-amortized, shapes < 50 us' if mode == 'graph' else 'cold, ' + grp}\n\n" + _md_table(sub, "{:.3f}") + "\n")
 
@@ -729,8 +729,9 @@ def fig_selection(ctx: Ctx):
         ctx.add("selection", _save(fig, ctx.out, "selection_portfolio.png"), "Portfolio size vs regret (in-sample and held-out) and regret CDFs.")
         sub = [r for r in hp["rows"] if r["size"] in (1, 5, 10, 20, 30, 60, 100)]
         ctx.text("selection", "### Static portfolio (greedy, fit on tune shapes)\n\n" + _md_table(pd.DataFrame([
-            {"size": str(r["size"]), "tune mean": r["in_sample"]["mean"], "tune p95": r["in_sample"]["p95"], "held-out mean": r["heldout[all]"]["mean"],
-             "held-out p95": r["heldout[all]"]["p95"]} for r in sub]), "{:.3f}") + "\n")
+            {"size": str(r["size"]), "tune mean": r["in_sample"]["mean"], "tune p95": r["in_sample"]["p95"], "tune p99": r["in_sample"].get("p99", float("nan")),
+             "held-out mean": r["heldout[all]"]["mean"], "held-out p95": r["heldout[all]"]["p95"],
+             "held-out p99": r["heldout[all]"].get("p99", float("nan"))} for r in sub]), "{:.3f}") + "\n")
 
     # --- parameter importance
     if p:

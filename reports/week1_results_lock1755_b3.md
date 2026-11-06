@@ -25,20 +25,20 @@ Only compare sessions with the same driver and clock state; ignore sessions with
 
 ### Noise summary per session (relative; 0.01 = 1%)
 
-| session | cache_mode | clock | complete | n_allocs | range_p50 | range_p95 | range_max | range_p95_ge50us | range_p95_lt50us | within_iqr_p50 | paired_p50 | paired_p95 |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| noise-20261013-231817-2a31 | cold | unrecorded | NO | 3 | 0.0000 | 0.0013 | 0.0532 | 0.0009 | 0.0133 | 0.0066 | 0.0000 | 0.0111 |
-| noise-20261013-231817-2a31 | hot | unrecorded | NO | 3 | 0.0000 | 0.0005 | 0.0071 | 0.0016 | 0.0000 | 0.0057 | 0.0000 | 0.0030 |
-| noise-20261013-232542-642a | cold | unrecorded | yes | 3 | 0.0006 | 0.0390 | 0.0837 | 0.0134 | 0.0786 | 0.0055 | 0.0038 | 0.0837 |
-| noise-20261013-232542-642a | hot | unrecorded | yes | 3 | 0.0000 | 0.0125 | 0.0188 | 0.0120 | 0.0038 | 0.0036 | 0.0013 | 0.0162 |
-| noise-20261014-001639-lock1755 | cold | locked@1755 | yes | 3 | 0.0027 | 0.0361 | 0.0762 | 0.0184 | 0.0615 | 0.0062 | 0.0064 | 0.0566 |
-| noise-20261014-001639-lock1755 | hot | locked@1755 | yes | 3 | 0.0010 | 0.0187 | 0.0316 | 0.0182 | 0.0118 | 0.0056 | 0.0029 | 0.0332 |
-| noise-20261014-141218-6985 | cold | locked@1755 | yes | 3 | 0.0011 | 0.0359 | 0.1494 | 0.0137 | 0.0642 | 0.0063 | 0.0036 | 0.0415 |
-| noise-20261014-141218-6985 | hot | locked@1755 | yes | 3 | 0.0001 | 0.0216 | 0.0463 | 0.0185 | 0.0230 | 0.0049 | 0.0038 | 0.0251 |
-| noise-s1-20261009 | cold | unrecorded | yes | 1 | 0.0067 | 0.0537 | 0.2000 | 0.0521 | 0.0922 | 0.0071 | 0.0207 | 0.0621 |
-| noise-s1-20261009 | hot | unrecorded | yes | 1 | 0.0070 | 0.0544 | 0.0667 | 0.0538 | 0.0515 | 0.0067 | 0.0151 | 0.0667 |
-| noise-s2-multialloc-20261009 | cold | unrecorded | yes | 3 | 0.0029 | 0.0264 | 0.0958 | 0.0239 | 0.0438 | 0.0091 | 0.0033 | 0.0348 |
-| noise-s2-multialloc-20261009 | hot | unrecorded | yes | 3 | 0.0021 | 0.0266 | 0.0408 | 0.0175 | 0.0282 | 0.0090 | 0.0064 | 0.0419 |
+| session | cache_mode | clock | complete | n_allocs | range_p50 | range_p95 | range_p99 | range_max | range_p95_ge50us | range_p95_lt50us | within_iqr_p50 | paired_p50 | paired_p95 | paired_p99 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| noise-20261013-231817-2a31 | cold | unrecorded | NO | 3 | 0.0000 | 0.0013 | 0.0283 | 0.0532 | 0.0009 | 0.0133 | 0.0066 | 0.0000 | 0.0111 | 0.0532 |
+| noise-20261013-231817-2a31 | hot | unrecorded | NO | 3 | 0.0000 | 0.0005 | 0.0048 | 0.0071 | 0.0016 | 0.0000 | 0.0057 | 0.0000 | 0.0030 | 0.0089 |
+| noise-20261013-232542-642a | cold | unrecorded | yes | 3 | 0.0006 | 0.0390 | 0.0797 | 0.0837 | 0.0134 | 0.0786 | 0.0055 | 0.0038 | 0.0837 | 0.0960 |
+| noise-20261013-232542-642a | hot | unrecorded | yes | 3 | 0.0000 | 0.0125 | 0.0176 | 0.0188 | 0.0120 | 0.0038 | 0.0036 | 0.0013 | 0.0162 | 0.0188 |
+| noise-20261014-001639-lock1755 | cold | locked@1755 | yes | 3 | 0.0027 | 0.0361 | 0.0647 | 0.0762 | 0.0184 | 0.0615 | 0.0062 | 0.0064 | 0.0566 | 0.0981 |
+| noise-20261014-001639-lock1755 | hot | locked@1755 | yes | 3 | 0.0010 | 0.0187 | 0.0267 | 0.0316 | 0.0182 | 0.0118 | 0.0056 | 0.0029 | 0.0332 | 0.0351 |
+| noise-20261014-141218-6985 | cold | locked@1755 | yes | 3 | 0.0011 | 0.0359 | 0.0898 | 0.1494 | 0.0137 | 0.0642 | 0.0063 | 0.0036 | 0.0415 | 0.1494 |
+| noise-20261014-141218-6985 | hot | locked@1755 | yes | 3 | 0.0001 | 0.0216 | 0.0409 | 0.0463 | 0.0185 | 0.0230 | 0.0049 | 0.0038 | 0.0251 | 0.0303 |
+| noise-s1-20261009 | cold | unrecorded | yes | 1 | 0.0067 | 0.0537 | 0.1252 | 0.2000 | 0.0521 | 0.0922 | 0.0071 | 0.0207 | 0.0621 | 0.2000 |
+| noise-s1-20261009 | hot | unrecorded | yes | 1 | 0.0070 | 0.0544 | 0.0647 | 0.0667 | 0.0538 | 0.0515 | 0.0067 | 0.0151 | 0.0667 | 0.0682 |
+| noise-s2-multialloc-20261009 | cold | unrecorded | yes | 3 | 0.0029 | 0.0264 | 0.0633 | 0.0958 | 0.0239 | 0.0438 | 0.0091 | 0.0033 | 0.0348 | 0.1027 |
+| noise-s2-multialloc-20261009 | hot | unrecorded | yes | 3 | 0.0021 | 0.0266 | 0.0396 | 0.0408 | 0.0175 | 0.0282 | 0.0090 | 0.0064 | 0.0419 | 0.0454 |
 
 `range` = (max - min) / median of the per-round medians for the same (shape, kernel, cache mode), over 3 rounds. `paired` = the same statistic for the ratio of the two kernels' times (the quantity that decides which kernel wins). `within_iqr` = IQR / median of one run's samples.
 

@@ -3,7 +3,7 @@
 The saved lgbm_rank (analysis/learned.py `Ranker`) was fit on RTX 3080 screens: its candidate pool, its learned regrets
 and the GPU numbers behind its fill features are all 3080's. This runs it unchanged on a different GPU and scores the
 picks against that GPU's own screen oracle, in the same units as the 3080 numbers in reports/learned_topk.md
-("Screen" table: median / p95 (mean) regret vs the held-out screen oracle), so the two are comparable.
+("Screen" table: median / p95 / p99 (mean) regret vs the held-out screen oracle), so the two are comparable.
 
 Two variants separate what the model gets wrong from what the features get wrong:
   as_is   the ranker exactly as saved: the 3080's SM count, shared memory and register limits feed the fill features
@@ -80,11 +80,12 @@ EPS = 0.02       # tie margin at >= 50 us (AGENTS.md section 6, G1)
 OVER = 0.5       # a screen row cut as `slow` was > 1.5x the best so far at its first sample, so its regret is > 50%
 SMALL_US = 50.0
 VARIANTS = ("as_is", "native")
-# The 3080 reference rows (median, p95, mean; all 86 held-out shapes, regret vs the held-out screen oracle, diverse picks):
+# The 3080 reference rows (median, p95, p99, mean; all 86 held-out shapes, regret vs the held-out screen oracle, diverse picks;
+# p99 = essentially the worst shape; every row re-derived from the stored online files with `cross_gpu.screen_table` / `score_rows`):
 # rank v1 from reports/learned_topk.md "Screen" table; rank v2 from reports/week1.md 2026-11-01 (same method).
-REFERENCE_3080 = {"top-1": (0.036, 0.181, 0.055), "best-of-3 (diverse)": (0.020, 0.106, 0.034)}
-REFERENCE_3080_V2 = {"top-1": (0.028, 0.130, 0.046), "best-of-3 (diverse)": (0.010, 0.093, 0.021),
-                     "best-of-5 (diverse)": (0.005, 0.078, 0.017)}
+REFERENCE_3080 = {"top-1": (0.036, 0.181, 0.240, 0.055), "best-of-3 (diverse)": (0.020, 0.106, 0.159, 0.034)}
+REFERENCE_3080_V2 = {"top-1": (0.028, 0.130, 0.262, 0.046), "best-of-3 (diverse)": (0.010, 0.093, 0.130, 0.021),
+                     "best-of-5 (diverse)": (0.005, 0.078, 0.130, 0.017)}
 # B6 on the 3080 (AGENTS.md section 6): the "just reuse the single best 3080 config" baseline.
 FIXED_3080 = "bm32_bn32_bk32_w4_s5_g1_sk1"
 
@@ -262,7 +263,7 @@ def score_rows(screen: dict, rows: list[dict], k: int, fixed: str | None = None)
 
 
 def summarize(vals: list, mask: np.ndarray | None = None) -> dict:
-    """median / p90 / p95 / mean / worst, the share within EPS and `over_50` (picks with regret > 50%) over the scorable shapes;
+    """median / p90 / p95 / p99 / mean / worst, the share within EPS and `over_50` (picks with regret > 50%) over the scorable shapes;
     `unscored` counts picks that are absent from the screen (pruned or failed there: excluded, so read it) and `no_pick` counts
     shapes with no valid pick (counted at CAP)."""
     v = np.array([np.nan if x is None else x for x in vals], float)
@@ -272,14 +273,15 @@ def summarize(vals: list, mask: np.ndarray | None = None) -> dict:
     if not len(x):
         return {"n": 0, "unscored": unscored, "no_pick": 0}
     return {"n": int(len(x)), "median": float(np.median(x)), "p90": float(np.percentile(x, 90)),
-            "p95": float(np.percentile(x, 95)), "mean": float(x.mean()), "worst": float(x.max()),
+            "p95": float(np.percentile(x, 95)), "p99": float(np.percentile(x, 99)), "mean": float(x.mean()), "worst": float(x.max()),
             "within_eps": float((x <= EPS).mean()), "over_50": int((x > OVER).sum()), "unscored": unscored, "no_pick": int((x == CAP).sum())}
 
 
 def fmt(s: dict) -> str:
     if not s.get("n"):
         return "n/a"
-    return f"{100 * s['median']:.1f}% / {100 * s['p95']:.1f}% ({100 * s['mean']:.1f}%)"
+    p99 = f" / {100 * s['p99']:.1f}%" if "p99" in s else ""   # p99 is essentially the worst shape at these n; summaries written before it was stored print without
+    return f"{100 * s['median']:.1f}% / {100 * s['p95']:.1f}%{p99} ({100 * s['mean']:.1f}%)"
 
 
 def build(data: Path, report: Path, *, screen_name: str = "sweep_screen_heldout", k: int = 3,
@@ -310,7 +312,7 @@ def build(data: Path, report: Path, *, screen_name: str = "sweep_screen_heldout"
                 "scores": {name: {g: summarize(vals, m) for g, m in masks.items()} for name, vals in sc.items()}}
     lines = [f"# Zero-shot selector transfer: `{data.name}`", "",
              f"Source models: lgbm_rank (v1) and, when present, lgbm_rank_v2, fit on another GPU, no refit. Oracle: this GPU's held-out screen "
-             f"(`{screen_name}`, {len(screen)} complete shapes). Cells are median / p95 (mean) regret vs the screen oracle, "
+             f"(`{screen_name}`, {len(screen)} complete shapes). Cells are median / p95 / p99 (mean) regret vs the screen oracle, "
              f"the format of the 3080 `Screen` table in `reports/learned_topk.md`. A shape with no valid pick counts as "
              f"{100 * CAP:.0f}% regret. Scored at k = {k}; the screen holds Triton configs only, so joint rows are scored on their "
              f"Triton-only choice (the joint choice is scored in a stage-2 session: `picks`, then analysis.ranker_compare).", ""]
@@ -326,7 +328,7 @@ def build(data: Path, report: Path, *, screen_name: str = "sweep_screen_heldout"
                          f"{g['all'].get('no_pick', 0)} | {g['all'].get('unscored', 0)} |")
         lines.append("")
     lines += ["## RTX 3080 reference (same method, its own screen)", "", "| pick | rank v1 | rank v2 |", "|---|---|---|"]
-    fm = lambda t: f"{100 * t[0]:.1f}% / {100 * t[1]:.1f}% ({100 * t[2]:.1f}%)"
+    fm = lambda t: f"{100 * t[0]:.1f}% / {100 * t[1]:.1f}% / {100 * t[2]:.1f}% ({100 * t[3]:.1f}%)"
     names = list(dict.fromkeys([*REFERENCE_3080, *REFERENCE_3080_V2]))
     lines += [f"| {n} | {fm(REFERENCE_3080[n]) if n in REFERENCE_3080 else 'n/a'} | "
               f"{fm(REFERENCE_3080_V2[n]) if n in REFERENCE_3080_V2 else 'n/a'} |" for n in names]

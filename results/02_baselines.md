@@ -46,13 +46,13 @@ flowchart TD
 
 ![One config for every shape](figures/02_single_config_regret.png)
 
-*One fixed config (the best on average, `bm32_bn32_bk32_w4_s5`) tested on 86 unseen shapes. Typical shape: +49%. Unlucky 5%: +486% (up to 12× at the worst). This is the strongest argument for a selector.*
+*One fixed config (the best on average, `bm32_bn32_bk32_w4_s5`) tested on 86 unseen shapes. Typical shape: +49%. Unlucky 5%: +486%. Worst 1%: +948% (up to 12× at the very worst). This is the strongest argument for a selector.*
 
 A fixed **menu** of configs also does not solve it. We kept the best 1, 5, 10 … 100 configs and always took the best on the menu:
 
 ![Menu size vs extra time](figures/03_portfolio.png)
 
-*The orange line (unseen shapes) stops improving at around 11% in the worst 5%, even with 100 configs, while the menu looks better on the shapes it was built from (blue). A menu cannot cover the odd shapes, so we need a selector that looks at each shape.*
+*The orange line (unseen shapes) stops improving at around 11% in the worst 5% (and 18% in the worst 1%), even with 100 configs, while the menu looks better on the shapes it was built from (blue). A menu cannot cover the odd shapes, so we need a selector that looks at each shape.*
 
 ## 2.4 How noisy is timing? (gate G1)
 
@@ -63,7 +63,7 @@ If two timings differ by less than the noise, we cannot say which is faster.
 What we found and did:
 
 - The biggest noise source was **where the input data sits in GPU memory** (up to 3.7% on memory-bound shapes), not temperature or clock. Heat drift over 10 minutes was +0.01%.
-- Fix: time each shape on **3 different memory placements** and pool them. The unlucky-case noise fell from 5.4% to 2.6%.
+- Fix: time each shape on **3 different memory placements** and pool them. The unlucky-case noise fell from 5.4% to 2.6%, and the worst 1% from 12.5% to 6.3%.
 - Also: lock the clock, clear the GPU's cache before every timing ("cold L2"), and discard weak runs.
 - Result: **differences under 2% (jobs ≥ 50 µs) or 5% (shorter jobs) are called ties.** For very short jobs (under about 50 µs) we rank by launching 50 copies in a CUDA graph and dividing, since single launches are only measured in steps of about 1 µs.
 
@@ -75,7 +75,7 @@ What we found and did:
 | G2 | Is our kernel family ≥ 90% as fast as B3+? | **Pass** (98.8%) |
 | G3 | Does picking per shape beat one fixed config? | **Pass** (one fixed config is a median 48–74% slower than the per-shape best) |
 | G4 | Does it beat B3+ somewhere that matters? | **Fail** at ≥ 50 µs. Narrow pass for tiny jobs |
-| G5 | Is a small fixed menu enough? | Pass on training shapes, **fails on unseen shapes** (worst 5% stays ≥ 8–11% slow) |
+| G5 | Is a small fixed menu enough? | Pass on training shapes, **fails on unseen shapes** (worst 5% stays ≥ 8–11% slow, worst 1% ≥ 18%) |
 
 G5 failing is why we then trained selectors. See [3. Model training](03_model_training.md).
 
