@@ -134,9 +134,11 @@ def variant_ranker(stem: Path, variant: str, native_gpu: dict | None):
 
 def lt_rank_env(variant: str, model: Path | None) -> dict:
     """Environment that points baselines.cublaslt_rank at the right model for one Triton variant: `model` = None -> this GPU's own
-    (data/<hw>/lt_rank), else that stem as a zero-shot foreign model with the variant's SM count (as_is: the model's, native: ours)."""
+    (data/<hw>/lt_rank), else that stem as a zero-shot foreign model with the variant's SM count (as_is: the model's, native: ours).
+    With None `TUNE_LT_RANK` is left alone: `pipeline/zero_shot.sh --lt-mode retrain` exports it to the run directory's own fit, and
+    clearing it sent the lookup to the repo's data/<hw>/ and then to the committed 3080 snapshot, which a 2060 refuses."""
     if model is None:
-        return {"TUNE_LT_RANK": None, "TUNE_LT_RANK_FOREIGN": None, "TUNE_LT_RANK_SMS": None}
+        return {"TUNE_LT_RANK_FOREIGN": None, "TUNE_LT_RANK_SMS": None}
     return {"TUNE_LT_RANK": str(model), "TUNE_LT_RANK_FOREIGN": "1", "TUNE_LT_RANK_SMS": "native" if variant == "native" else None}
 
 

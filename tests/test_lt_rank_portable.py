@@ -84,7 +84,8 @@ def test_router_sms_and_guard(tmp_path, monkeypatch):
 
 def test_zero_shot_lt_rank_env():
     from analysis.zero_shot import lt_rank_env
-    assert lt_rank_env("as_is", None) == {"TUNE_LT_RANK": None, "TUNE_LT_RANK_FOREIGN": None, "TUNE_LT_RANK_SMS": None}
+    # own model: TUNE_LT_RANK (set by the pipeline to the run's fit) must survive
+    assert lt_rank_env("as_is", None) == {"TUNE_LT_RANK_FOREIGN": None, "TUNE_LT_RANK_SMS": None}
     a, n = lt_rank_env("as_is", Path("/m/lt_rank")), lt_rank_env("native", Path("/m/lt_rank"))
     assert a["TUNE_LT_RANK_FOREIGN"] == n["TUNE_LT_RANK_FOREIGN"] == "1" and a["TUNE_LT_RANK"] == "/m/lt_rank"
     assert a["TUNE_LT_RANK_SMS"] is None and n["TUNE_LT_RANK_SMS"] == "native"
