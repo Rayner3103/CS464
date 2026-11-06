@@ -8,8 +8,8 @@
 #################################################
 
 #SBATCH --nodes=1                   # How many nodes required? Usually 1
-#SBATCH --cpus-per-task=8           # CPUs: the Triton sweeps compile configs in parallel (one worker per CPU, ~1.25 GiB RAM each); lower it if the QOS refuses
-#SBATCH --mem=32GB                  # How much memory does your job require? (8 workers x ~1.25 GiB + the fits)
+#SBATCH --cpus-per-task=4           # CPUs: the Triton sweeps compile configs in parallel (one worker per CPU, ~1.25 GiB RAM each); lower it if the QOS refuses
+#SBATCH --mem=16GB                  # How much memory does your job require? (8 workers x ~1.25 GiB + the fits)
 #SBATCH --gres=gpu:1                # One GPU: the measurements need the whole card to themselves (this script refuses a node that is not EXPECT_GPU)
 #SBATCH --time=01-00:00:00          # <DD-HH:MM:SS>. A full run is ~35 h on a 3080: it will not fit one job. Every stage resumes (see CHAIN / resubmit)
 #SBATCH --mail-type=BEGIN,END,FAIL  # When should you receive an email?
