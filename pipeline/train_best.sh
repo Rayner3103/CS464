@@ -2,7 +2,7 @@
 # Full training of the shipped selector on THIS GPU (e.g. an RTX 3090): every learned component of `tune.online.select_kernel`, fitted
 # from this GPU's own measurements, then checked on the held-out shapes. Nothing is borrowed from the 3080.
 #
-#   pipeline/train_best.sh [--full | --smoke] [options]
+#   pipeline/train_best.sh [--full | --quick | --smoke] [options]
 #
 # What "the best model" is (AGENTS.md section 6, reports/week1.md 2026-11-04/05): rank v2 over the Triton family (analytic features, near-top
 # weights, the tail suite as extra tune data) + the learned cuBLASLt ranker (top-5 on top of cuBLASLt's heuristic top-16) + the cost-only
@@ -63,6 +63,8 @@ Usage: pipeline/train_best.sh [mode] [options]
 
 Modes (default --full):
   --full            the whole study on this GPU: 477 tune + 150 tail shapes, 86 held-out shapes, all 652 cuBLASLt screen shapes
+  --quick           a reduced run for slow cards (RTX 2060: its Triton sweep took 17.7 h for 27 held-out shapes, so --full would take weeks): ~56 tune,
+                    ~27 held-out and 30 tail shapes, 160 cuBLASLt screen shapes, B3+ at 10 s per shape. The fits are smaller, not meaningless
   --smoke           plumbing check with a handful of shapes per stage (the fits are meaningless; still hours of GPU time)
 
 Options:
@@ -94,6 +96,7 @@ say() { printf '\n==> %s\n' "$*"; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --smoke) MODE=smoke ;;
+    --quick) MODE=quick ;;
     --full) MODE=full ;;
     --clock-lock) LOCK="${2:?}"; shift ;;
     --allow-unlocked) ALLOW_UNLOCKED=1 ;;
@@ -132,6 +135,7 @@ echo "$MODE" > "$RUN_DIR/mode"
 # over the size-sorted set otherwise); DEEP_S = seconds per shape of the cuBLASLt enumerate-and-screen baseline (B3+).
 case "$MODE" in
   smoke) TUNE_PS=3;    HELD_PS=3;    TAIL_PS=3;    LT_SHAPES=12; DEEP_S=2;  CHECK_SUITE=S1 ;;
+  quick) TUNE_PS=8;    HELD_PS=12;   TAIL_PS=30;   LT_SHAPES=160; DEEP_S=10; CHECK_SUITE=edge ;;
   full)  TUNE_PS=1000; HELD_PS=1000; TAIL_PS=1000; LT_SHAPES=0;  DEEP_S=20; CHECK_SUITE=edge ;;
   *) die "unknown mode '$MODE'" ;;
 esac
@@ -339,6 +343,24 @@ EOF
 # CPU: LightGBM classifier P(Triton's best beats the cuBLASLt value by > the tie margin); the skip threshold comes from a rule fixed in
 # analysis/router.py (out-of-fold mean loss <= 0.1%) -> data/<hw>/router.{txt,json}.
 stage_router_fit() {
+  # The router predicts "Triton's best beats cuBLASLt by more than the tie margin". On a GPU where it (almost) never does (the 2060: Triton
+  # compiles to FMAs, 0.44x of B3+) there is nothing to learn: the fit would crash on a single class, so no router is trained, and
+  # select_kernel then runs both halves, as it does on any GPU without a router model.
+  local npos
+  npos="$("$PY" - "$DATA" <<'EOF' | tail -1
+import sys
+from pathlib import Path
+from analysis.router import tune_table
+shapes, X, lt, tri, eps = tune_table(Path(sys.argv[1]))
+print(int((tri * eps < lt).sum()))
+EOF
+)"
+  echo "Triton beats B3+ by more than the tie margin on $npos tune shapes"
+  if [[ "${npos:-0}" -lt 8 ]]; then
+    echo "fewer than 8 positives: no router is trained for this GPU (the search will run both halves)"
+    echo "Triton wins on $npos tune shapes" > "$DATA/router.skipped"
+    return 0
+  fi
   "$PY" -u -m analysis.router fit --data "$DATA" --save "$DATA/router"
   "$PY" - "$DATA/router.json" <<'EOF'
 import json, sys
@@ -413,6 +435,7 @@ stage_package() {
   local f missing=0
   for f in lgbm_rank lgbm_rank_v2 lt_rank router; do
     if [[ -f "$DATA/$f.txt" && -f "$DATA/$f.json" ]]; then cp "$DATA/$f.txt" "$DATA/$f.json" "$RUN_DIR/models/"
+    elif [[ "$f" == router && -f "$DATA/router.skipped" ]]; then echo "router: none trained ($(<"$DATA/router.skipped"))"
     else echo "MISSING: $DATA/$f.{txt,json} (its stage did not finish)"; missing=1; fi
   done
   cp "$DATA/env.json" "$RUN_DIR/models/env.json"
@@ -424,7 +447,7 @@ Run: $(basename "$RUN_DIR") (mode $MODE), clock lock $LOCK, commit $(git rev-par
 
 Install into a checkout of this repo on the same machine (data/ is gitignored; check MD5SUMS after copying):
 
-    mkdir -p data/$HW && cp models/{lgbm_rank,lgbm_rank_v2,lt_rank,router}.{txt,json} data/$HW/
+    mkdir -p data/$HW && for f in lgbm_rank lgbm_rank_v2 lt_rank router; do [ -f models/\$f.txt ] && cp models/\$f.txt models/\$f.json data/$HW/; done
 
 \`tune.online.select_kernel\` then finds them (\`data/<hw>/lt_rank\`, \`data/<hw>/router\`; the Triton ranker is passed by the caller:
 \`analysis.learned.Ranker.load('data/$HW/lgbm_rank_v2')\`). Every component refuses a model whose hw_id differs from the GPU it runs on.
@@ -450,7 +473,7 @@ out = [f"# Full training of the shipped selector, `{run.name}` ({mode} mode)\n",
 for stem, label in (("lgbm_rank", "rank v1 (Triton)"), ("lgbm_rank_v2", "rank v2 (Triton, shipped)"), ("lt_rank", "cuBLASLt ranker"), ("router", "family router")):
     p = data / f"{stem}.json"
     if not p.exists():
-        out.append(f"| {label} | missing | stage did not finish |")
+        out.append(f"| {label} | none | " + ("not trained: Triton (almost) never beats B3+ on this GPU, the search runs both halves" if stem == "router" and (data / "router.skipped").exists() else "stage did not finish") + " |")
         continue
     m = json.loads(p.read_text())
     note = {"lgbm_rank": lambda: f"pool {len(m['pool'])} configs, hp {m['hp']}",
