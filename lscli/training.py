@@ -27,11 +27,12 @@ from lscli.files import read_json, write_json
 STAGES = ("preflight", "env", "check", "roofline", "tune_sweep", "heldout_sweep", "selectors", "train_v1", "tail_sweep",
           "train_v2", "lt_screen", "lt_fit", "tune_stage2_cold", "tune_stage2_graph", "router_fit", "bundle", "package",
           "summary")
-CPU_STAGES = frozenset({"preflight", "train_v2", "lt_fit", "router_fit", "package", "summary"})
+# preflight is NOT CPU-only: train_best's check_prereqs refuses a GPU with compute processes on it.
+CPU_STAGES = frozenset({"train_v2", "lt_fit", "router_fit", "package", "summary"})
 RETRAIN = {
-    "cublaslt": ("lt_screen", "lt_fit", "tune_stage2_cold", "tune_stage2_graph", "router_fit", "package", "summary"),
-    "triton": ("tune_sweep", "heldout_sweep", "selectors", "train_v1", "tail_sweep", "train_v2", "tune_stage2_cold",
-               "tune_stage2_graph", "router_fit", "bundle", "package", "summary"),
+    "cublaslt": ("env", "lt_screen", "lt_fit", "tune_stage2_cold", "tune_stage2_graph", "router_fit", "package", "summary"),
+    "triton": ("env", "check", "tune_sweep", "heldout_sweep", "selectors", "train_v1", "tail_sweep", "train_v2",
+               "tune_stage2_cold", "tune_stage2_graph", "router_fit", "bundle", "package", "summary"),
 }
 # What each stage writes, relative to the run directory (DATA = data/<hw_id>). Deleted before a stage re-runs in a
 # seeded directory, so nothing of the previous environment is resumed. Caches that depend on the environment
@@ -51,11 +52,15 @@ OUTPUTS = {
                          "DATA/inflight.json"),
     "tune_stage2_graph": ("DATA/results_lock1755_tune477_graph.jsonl", "DATA/results_lock1755_tune477_graph.raw.jsonl"),
     "router_fit": ("DATA/router.txt", "DATA/router.json", "DATA/router.skipped"),
-    "bundle": ("bundle", "models/bundle.tar.xz"),
-    "package": ("models",),
+    "env": ("DATA/env.json", "DATA/env"),
+    "check": ("DATA/check-*.json",),
+    "bundle": ("bundle", "models/bundle.tar.xz", "DATA/bundle_build_cache"),
+    "package": ("models/*.txt", "models/*.json", "models/MD5SUMS", "models/INSTALL.md"),
     "summary": ("SUMMARY.md",),
 }
 MAX_STAGE_FAILURES = 2
+LINK_MIN_BYTES = 1 << 20     # seeding hard-links only big files of frozen outputs; small ones (subset files a later
+                             # stage may rewrite in place, e.g. sweep_screen/subset_lt50us_477.json) are copied
 
 
 def stages_for(change: set[str], with_bundle: bool) -> list[str]:
@@ -123,7 +128,7 @@ def seed(prev: Path | None, new: Path, stages: list[str]) -> None:
                 continue
             if src.is_symlink():
                 os.symlink(os.readlink(src), dst)
-            elif any(r == d or d in r.parents for d in frozen):
+            elif any(r == d or d in r.parents for d in frozen) and src.stat().st_size >= LINK_MIN_BYTES:
                 os.link(src, dst)
             else:
                 shutil.copy2(src, dst)
@@ -158,16 +163,19 @@ class Training:
         done = self.done()
         return next((s for s in self.state["stages"] if s not in done), None)
 
-    def begin(self, change: set[str], stages: list[str], env: dict, reason: str) -> None:
-        """Start a training run for `stages` in a new run directory (seeded from the previous one unless first)."""
+    def begin(self, change: set[str], stages: list[str], env: dict, reason: str, request_t: float | None = None) -> None:
+        """Start a training run for `stages` (run in train_best order) in a new run directory, seeded from the previous
+        one unless this is a full training. The number is one past every existing directory: a lost state file must
+        never make it reuse (and delete) a finished run."""
         prev = self.run_dir
-        n = int(self.state.get("run") or 0) + 1
+        nums = [int(d.name) for d in self.root.glob("*") if d.is_dir() and d.name.isdigit()]
+        n = max(nums + [int(self.state.get("run") or 0)]) + 1
         new = self.root / str(n)
-        if new.exists():
-            shutil.rmtree(new)
         seed(prev if "first" not in change else None, new, stages)
-        self.state = {"run": n, "stages": stages, "change": sorted(change), "reason": reason, "env": env,
-                      "status": "running", "started": time.time(), "failures": {}, "previous": self.state.get("run")}
+        self.state = {"run": n, "stages": [s for s in STAGES if s in set(stages)], "change": sorted(change),
+                      "reason": reason, "env": env, "status": "running", "started": time.time(), "failures": {},
+                      "previous": self.state.get("run"),
+                      "request_t": request_t if request_t is not None else self.state.get("request_t")}
         self.save()
 
     def record_failure(self, stage: str) -> int:
@@ -177,6 +185,10 @@ class Training:
             self.state["status"] = "failed"
         self.save()
         return f[stage]
+
+    def record_success(self, stage: str) -> None:
+        if self.state.get("failures", {}).pop(stage, None) is not None:
+            self.save()
 
     def finish(self) -> None:
         self.state["status"] = "done"
@@ -212,8 +224,12 @@ def activate(paths, hw_id: str, run_dir: Path, trained_env: dict) -> Path:
     if "triton" not in found:
         shutil.rmtree(tmp)
         raise FileNotFoundError(f"{src}: no Triton ranker to activate")
+    from lscli.models import model_id
+    for kind, m in found.items():
+        m["id"] = model_id(tmp / m["stem"])
+    stages = sorted(p.name[:-5] for p in (run_dir / "stamps").glob("*.done")) if (run_dir / "stamps").exists() else []
     write_json(tmp / "MODELS.json", {"hw_id": hw_id, "source": "native", "models": found, "trained_env": trained_env,
-                                     "run": str(run_dir), "activated": time.time()})
+                                     "run": str(run_dir), "stages": stages, "activated": time.time()})
     old = None
     if final.exists():
         old = paths.models / f".{hw_id}.old-{int(time.time())}"

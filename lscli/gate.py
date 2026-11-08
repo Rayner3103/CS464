@@ -48,9 +48,10 @@ def on_battery(sys_root: str | os.PathLike = "/sys/class/power_supply") -> bool:
     return False
 
 
-def lock_held(path: str | os.PathLike, locks: str = "/proc/locks") -> bool:
-    """True when some process holds a flock on `path` (train_best.sh's pipeline/.lock). Read from /proc/locks, never by
-    trying the lock: a probe that took it, even for a microsecond, could make a concurrent `flock -n` fail."""
+def lock_held(path: str | os.PathLike, locks: str = "/proc/locks", exclude=frozenset()) -> bool:
+    """True when a process outside `exclude` holds a flock on `path` (train_best.sh's pipeline/.lock). Read from
+    /proc/locks, never by trying the lock: a probe that took it, even for a microsecond, could make a concurrent
+    `flock -n` fail. `exclude` = the running job's tree: the daemon's own train_best run holds that lock."""
     try:
         st = os.stat(path)
         text = Path(locks).read_text()
@@ -63,7 +64,7 @@ def lock_held(path: str | os.PathLike, locks: str = "/proc/locks") -> bool:
             continue
         try:
             maj, mnr, ino = parts[5].split(":")
-            if (int(maj, 16), int(mnr, 16), int(ino)) == want:
+            if (int(maj, 16), int(mnr, 16), int(ino)) == want and int(parts[4]) not in exclude:
                 return True
         except ValueError:
             continue
