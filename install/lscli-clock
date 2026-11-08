@@ -15,10 +15,10 @@ NVSMI=/usr/bin/nvidia-smi
 case "$1" in
   lock)
     [[ -f $CONF && ! -L $CONF && "$(stat -c %u "$CONF")" == 0 ]] || { echo "lscli-clock: $CONF must be a root-owned file" >&2; exit 3; }
-    mhz="$(sed -n 's/^lock_mhz=\([0-9]\{3,4\}\)$/\1/p' "$CONF" | head -n1)"
+    mhz="$(sed -n 's/^lock_mhz=\([1-9][0-9]\{2,3\}\)$/\1/p' "$CONF" | head -n1)"
     [[ -n $mhz ]] || { echo "lscli-clock: no valid lock_mhz in $CONF" >&2; exit 3; }
     max="$("$NVSMI" -i 0 --query-gpu=clocks.max.sm --format=csv,noheader,nounits | tr -d ' ')"
-    [[ $max =~ ^[0-9]+$ ]] && (( mhz >= 300 && mhz <= max )) || { echo "lscli-clock: $mhz MHz outside [300, $max]" >&2; exit 3; }
+    [[ $max =~ ^[1-9][0-9]*$ ]] && (( 10#$mhz >= 300 && 10#$mhz <= 10#$max )) || { echo "lscli-clock: $mhz MHz outside [300, $max]" >&2; exit 3; }
     exec "$NVSMI" -i 0 -lgc "$mhz,$mhz"
     ;;
   reset)

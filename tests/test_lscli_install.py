@@ -35,12 +35,57 @@ def _clean_commit() -> str:
     return subprocess.run(["git", "rev-parse", "HEAD"], cwd=REPO, capture_output=True, text=True).stdout.strip()
 
 
-@pytest.mark.skipif(subprocess.run(["nvidia-smi", "-L"], capture_output=True).returncode != 0, reason="needs nvidia-smi")
-def test_install_then_uninstall(tmp_path):
+def _archive(tmp_path, name, evil=False):
+    import hashlib
+    sys.path.insert(0, str(REPO / "install"))
+    import pack_zero_shot
+    d = tmp_path / f"m-{name}"
+    d.mkdir()
+    for ext in (".txt", ".json"):
+        (d / f"tri{ext}").write_text("x")
+    out = tmp_path / f"{name}.tar.gz"
+    pack_zero_shot.pack({"triton": d / "tri"}, "rtx3080_sm86_68sms_10gb", out)
+    if evil:                                                                 # add a symlink member pointing outside
+        import io
+        with tarfile.open(out, "r:gz") as t:
+            members = [(m, t.extractfile(m).read()) for m in t.getmembers()]
+        with tarfile.open(out, "w:gz") as t:
+            for m, data in members:
+                t.addfile(m, io.BytesIO(data))
+            link = tarfile.TarInfo("escape")
+            link.type, link.linkname = tarfile.SYMTYPE, "/etc"
+            t.addfile(link)
+    return f"file://{out}", hashlib.sha256(out.read_bytes()).hexdigest()
+
+
+needs_gpu = pytest.mark.skipif(subprocess.run(["nvidia-smi", "-L"], capture_output=True).returncode != 0,
+                               reason="needs nvidia-smi")
+
+
+@needs_gpu
+def test_install_refuses_an_archive_with_links(tmp_path):
     home, env = _sandbox(tmp_path)
+    url, digest = _archive(tmp_path, "evil", evil=True)
     r = subprocess.run(["bash", str(REPO / "install/install.sh"), "--repo", str(REPO), "--ref", _clean_commit(),
                         "--python", sys.executable, "--reuse-site", sys.executable, "--no-clock-helper", "--no-linger",
-                        "--yes"], env=env, capture_output=True, text=True, timeout=900, stdin=subprocess.DEVNULL)
+                        "--yes", "--models-url", url, "--models-sha256", digest], env=env, capture_output=True, text=True,
+                       timeout=900, stdin=subprocess.DEVNULL)
+    assert r.returncode != 0 and "unsafe or broken model archive" in r.stderr
+    r = subprocess.run(["bash", str(REPO / "install/install.sh"), "--repo", str(REPO), "--ref", _clean_commit(),
+                        "--python", sys.executable, "--reuse-site", sys.executable, "--no-clock-helper", "--no-linger",
+                        "--yes", "--models-url", url, "--models-sha256", "0" * 64], env=env, capture_output=True,
+                       text=True, timeout=900, stdin=subprocess.DEVNULL)
+    assert r.returncode != 0 and "sha256 mismatch" in r.stderr
+
+
+@needs_gpu
+def test_install_then_uninstall(tmp_path):
+    home, env = _sandbox(tmp_path)
+    url, digest = _archive(tmp_path, "good")
+    r = subprocess.run(["bash", str(REPO / "install/install.sh"), "--repo", str(REPO), "--ref", _clean_commit(),
+                        "--python", sys.executable, "--reuse-site", sys.executable, "--no-clock-helper", "--no-linger",
+                        "--yes", "--models-url", url, "--models-sha256", digest], env=env, capture_output=True, text=True,
+                       timeout=900, stdin=subprocess.DEVNULL)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
     lh = home / ".local/share/lscli"
     assert (lh / "src/.git").is_dir() and oct(lh.stat().st_mode & 0o777) == "0o700"
@@ -49,6 +94,7 @@ def test_install_then_uninstall(tmp_path):
     assert f"Environment=LSCLI_HOME={lh}" in unit and f"ExecStart={lh}/venv/bin/python -m lscli daemon run" in unit
     calls = (tmp_path / "calls.log").read_text()
     assert "--user daemon-reload" in calls and "--user enable --now lscli.service" in calls and "enable-linger" not in calls
+    assert json.loads((lh / "models/zero_shot/MODELS.json").read_text())["source"] == "zero_shot"
     v = subprocess.run([str(home / ".local/bin/lscli"), "--version"], env=env, capture_output=True, text=True)
     assert v.returncode == 0 and "lscli" in v.stdout
     st = subprocess.run([str(home / ".local/bin/lscli"), "--json", "status"], env=env, capture_output=True, text=True)
@@ -120,9 +166,74 @@ def test_doctor_reports_and_flags_a_lock_without_helper(tmp_path, monkeypatch, c
 def test_clock_helper_refuses_anything_but_lock_and_reset():
     for argv in ([], ["lock", "1500"], ["set"], ["--help"]):
         r = subprocess.run(["bash", str(REPO / "install/lscli-clock"), *argv], capture_output=True, text=True)
-        assert r.returncode in (2, 3), argv
-    r = subprocess.run(["bash", str(REPO / "install/lscli-clock"), "lock"], capture_output=True, text=True)
-    assert r.returncode == 3 or Path("/etc/lscli/clock.conf").exists()      # no root-owned clock.conf here
+        assert r.returncode == 2, argv
+
+
+def _helper_copy(tmp_path):
+    """The helper with its two paths pointed at a stub nvidia-smi and a test clock.conf, and the root-owner check
+    accepting this user (the installed helper never takes paths from its environment)."""
+    stub = tmp_path / "nvidia-smi"
+    stub.write_text('#!/bin/sh\ncase "$*" in *clocks.max.sm*) echo 1950 ;; *) echo "CALLED $*" ;; esac\n')
+    stub.chmod(0o755)
+    conf = tmp_path / "clock.conf"
+    text = (REPO / "install/lscli-clock").read_text()
+    text = text.replace("CONF=/etc/lscli/clock.conf", f"CONF={conf}").replace("NVSMI=/usr/bin/nvidia-smi", f"NVSMI={stub}")
+    text = text.replace('"$(stat -c %u "$CONF")" == 0', f'"$(stat -c %u "$CONF")" == {os.getuid()}')
+    helper = tmp_path / "lscli-clock"
+    helper.write_text(text)
+    return helper, conf
+
+
+@pytest.mark.parametrize("content, ok", [("lock_mhz=1500\n", True), ("lock_mhz=0800\n", False), ("lock_mhz=2500\n", False),
+                                        ("lock_mhz=200\n", False), ("lock_mhz=1500; rm -rf /\n", False), ("", False)])
+def test_clock_helper_lock_validates_the_conf(tmp_path, content, ok):
+    helper, conf = _helper_copy(tmp_path)
+    conf.write_text(content)
+    r = subprocess.run(["bash", str(helper), "lock"], capture_output=True, text=True)
+    assert (r.returncode == 0 and "CALLED -i 0 -lgc 1500,1500" in r.stdout) if ok else r.returncode == 3, (content, r)
+
+
+def test_clock_helper_rejects_a_symlinked_conf_and_resets(tmp_path):
+    helper, conf = _helper_copy(tmp_path)
+    (tmp_path / "real.conf").write_text("lock_mhz=1500\n")
+    conf.symlink_to(tmp_path / "real.conf")
+    assert subprocess.run(["bash", str(helper), "lock"], capture_output=True).returncode == 3
+    r = subprocess.run(["bash", str(helper), "reset"], capture_output=True, text=True)
+    assert r.returncode == 0 and "CALLED -i 0 -rgc" in r.stdout
+
+
+def test_purge_refuses_home_and_foreign_dirs_and_removes_only_the_config_file(tmp_path, monkeypatch, capsys):
+    from lscli import cli
+    home, env = _sandbox(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", env["PATH"])
+    monkeypatch.setenv("FAKE_LOG", env["FAKE_LOG"])
+    shared = tmp_path / "projects"
+    shared.mkdir()
+    (shared / "work.txt").write_text("keep me")
+    monkeypatch.setenv("LSCLI_CONFIG", str(shared / "c.toml"))
+    (shared / "c.toml").write_text("")
+    for root in (home, tmp_path / "empty"):
+        root.mkdir(exist_ok=True)
+        monkeypatch.setenv("LSCLI_HOME", str(root))
+        assert cli.main(["uninstall", "--yes", "--purge"]) == cli.EXIT_FAIL and root.exists()
+    lh = tmp_path / "lh"
+    (lh / "venv").mkdir(parents=True)
+    monkeypatch.setenv("LSCLI_HOME", str(lh))
+    foreign = home / ".local" / "bin" / "lscli"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("#!/bin/sh\necho my own lscli tool\n")
+    assert cli.main(["uninstall", "--yes", "--purge"]) == 0
+    assert not lh.exists() and not (shared / "c.toml").exists() and (shared / "work.txt").exists()
+    assert foreign.exists()                                                 # not install.sh's wrapper: left alone
+
+
+def test_install_refuses_a_home_that_is_not_its_own(tmp_path):
+    home, env = _sandbox(tmp_path)
+    for bad in (str(home), "/", "relative/dir", f"{home}/with space"):
+        r = subprocess.run(["bash", str(REPO / "install/install.sh"), "--home", bad, "--check-only"], env=env,
+                           capture_output=True, text=True)
+        assert r.returncode != 0, bad
 
 
 def test_pack_zero_shot(tmp_path):
