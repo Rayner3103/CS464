@@ -27,7 +27,7 @@ baselines/   B0 roofline, B1 torch.matmul (cuBLAS), B5 Triton tutorial kernel
 suites/      shape suites (versioned JSON; regenerate with `python -m suites.generate`)
 analysis/    report generation (plots + tables)
 lscli/       the lscli CLI, client patch, daemon, training orchestration (docs/lscli/spec.md)
-install/     lscli installer, systemd unit, clock helper, zero-shot model packer
+install/     lscli installer, systemd unit, clock helper, the committed zero-shot model set and its packer
 tests/       unit tests (`python -m pytest`)
 data/<hw>/   results + env.json (gitignored)
 reports/     write-ups and figures
