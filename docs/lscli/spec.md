@@ -131,7 +131,8 @@ offset to 0.
 {"3f2a91c0d4e5": {"python": "/home/u/miniconda3/envs/llm/bin/python", "prefix": "/home/u/miniconda3/envs/llm",
                   "torch": "2.13.0+cu130", "triton": "3.7.1", "cuda_runtime": "13.0", "registered": 1762560000.0}}
 ```
-`env_id` = first 12 hex of sha256 of the interpreter's real path. Written by `lscli enable-env`; the worker reports its
+`env_id` = first 12 hex of sha256 of the interpreter's absolute path, **not** resolved: a venv's `bin/python` is a
+symlink to the base interpreter, and resolving it would lose the venv. Written by `lscli enable-env`; the worker reports its
 versions with every result and the daemon updates the record when they changed.
 
 ### 3.6 Winner cache `winners.jsonl`
@@ -144,7 +145,10 @@ adds (`env_extra`, written to `client.json` so the client and the worker declare
   user's program runs at. Entries timed under one policy are soft-stale under another, for the client as well, because
   the client declares the policy from `client.json`;
 * `models`: `{"triton": <id>, "lt_rank": <id>, "router": <id>, "source": "native" | "zero_shot"}` from `MODELS.json`
-  (an absent model is `null`).
+  (an absent model is `null`);
+* `env_id`: the registered env that timed it. Another env's winner is soft-stale here: served after the correctness
+  check, then re-searched in this env. `env_id` also scopes `compact()`, so compacting with one env's environment
+  never drops another env's lines.
 
 lscli entries also carry `torch_us` (torch.matmul's short cold time for the shape, measured by the worker in the same
 session) for the client's dispatch rule (section 5.3).

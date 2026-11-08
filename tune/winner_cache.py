@@ -199,6 +199,12 @@ class WinnerCache:
                 return self._out(r)
         return None
 
+    def entries(self, allow_stale: bool = True) -> list[dict]:
+        """Every entry `get` could return for some width: the current one of each shape and, with allow_stale, the
+        soft-stale one (both, when a shape has both)."""
+        tiers = ("current", "soft") if allow_stale else ("current",)
+        return [self._out(v[t]) for v in self._rows.values() for t in tiers if t in v]
+
     def stale_entries(self) -> list[dict]:
         """The soft-stale entries of shapes with no current entry: what an idle-time re-search should redo."""
         return [self._out(v["soft"]) for v in self._rows.values() if "soft" in v and "current" not in v]
@@ -232,8 +238,10 @@ class WinnerCache:
             os.fsync(f.fileno())
 
     def put(self, M: int, N: int, K: int, dtype: str, *, k: int, lt_n: int, choice: dict, candidates: list[dict] | None = None,
-            order: str | None = None, ranker: str | None = None, lt_knn: int = 0, lt_rank: int = 0) -> dict | None:
+            order: str | None = None, ranker: str | None = None, lt_knn: int = 0, lt_rank: int = 0,
+            extra: dict | None = None) -> dict | None:
         """Store a search result's winner in the current environment. Searches that found no valid kernel are not stored.
+        `extra` adds caller fields to the line (lscli: `torch_us`); they cannot overwrite the entry's own fields.
         Returns the entry."""
         if not choice or choice.get("key") is None:
             return None
@@ -244,6 +252,7 @@ class WinnerCache:
                "choice": {x: choice.get(x) for x in ("key", "family", "mode", "rank", "compile_s", "time_s")},
                "winner_us": win.get("graph_us") if choice.get("mode") == "graph" else win.get("cold_us"),
                "timestamp": time.time()}
+        row = {**{k: v for k, v in (extra or {}).items() if k not in _RESERVED}, **row}
         self._append(row)
         self._rows.setdefault(self._key(M, N, K, dtype), {})["current"] = {**row, "_stale": []}
         return row
@@ -259,7 +268,9 @@ class WinnerCache:
     def compact(self) -> dict:
         """Rewrite the file without the lines a re-search made obsolete; returns {"before", "after"} line counts.
 
-        Per (shape, dtype, GPU): the last line per distinct environment is a candidate. When a line is current in this
+        Per (shape, dtype, GPU, env_id): the last line per distinct environment is a candidate. `env_id` (set by lscli,
+        one per registered interpreter; None otherwise) scopes the rewrite, so compacting with one env's environment
+        never drops another env's lines. When a line is current in this
         environment, the last current line stays and an older candidate stays only if its search was wider in some
         dimension (k, lt_n, lt_knn, lt_rank), because `get(allow_stale=True)` can still serve it for a wider request;
         otherwise every candidate stays (soft-stale entries are kept until re-searched). Verification lines stay while
@@ -275,7 +286,8 @@ class WinnerCache:
                 (verified if r.get("kind") == "verified" else entries).append((r, line))
             groups: dict[tuple, list] = {}
             for i, (r, line) in enumerate(entries):
-                groups.setdefault((r["M"], r["N"], r["K"], r["dtype"], (r.get("env") or {}).get("hw_id")), []).append(i)
+                e = r.get("env") or {}
+                groups.setdefault((r["M"], r["N"], r["K"], r["dtype"], e.get("hw_id"), e.get("env_id")), []).append(i)
             width = ("k", "lt_n", "lt_knn", "lt_rank")
             keep: set[int] = set()
             for idx in groups.values():
