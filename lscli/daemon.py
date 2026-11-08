@@ -32,7 +32,9 @@ TICK_S = 5.0
 MERGE_EVERY_S = 60.0
 COMPACT_EVERY_S = 86400.0
 ENV_REFRESH_S = 86400.0
+ENV_RETRY_S = 600.0                  # a registered env whose probe failed is retried this often (not every tick)
 PROPOSE_TIMEOUT_S = 300.0
+HEARTBEAT_S = 5.0
 
 
 class Daemon:
@@ -50,6 +52,11 @@ class Daemon:
         self.backoff_until: float | None = None
         self.failures: dict[tuple, int] = {}
         self.env_docs: dict[tuple, tuple[float, dict]] = {}
+        self.env_failed: dict[str, float] = {}               # env id -> last failed probe
+        self.unknown_envs: set[str] = set()                  # registered, but no environment yet (probe failed)
+        self.wcs: dict[str, tuple] = {}                      # env id -> (env doc, file stamp, WinnerCache)
+        self.last_heartbeat = 0.0
+        self.daemon_env: dict = {}
         self.last_merge = self.last_compact = 0.0
         self.reload_seen = control.read_control(self.paths).get("reload")
         self.job_info: dict | None = None
@@ -63,13 +70,25 @@ class Daemon:
     # ------------------------------------------------------------------------------------------------ set-up
     def start(self) -> None:
         self.identity = gate.gpu_identity()
-        doc = self._worker_env(self.python, {})
-        self.hw_id = (doc or {}).get("hw_id")
+        self.resolve_hw()
         self.log.info("lscli %s daemon: GPU %s (%s), hw_id %s", __version__, self.identity.get("name"),
                       self.identity.get("uuid"), self.hw_id)
         if self.identity.get("count", 0) > 1:
             self.log.warning("%d GPUs: lscli v1 uses device 0 only", self.identity["count"])
         self.load_models()
+
+    def resolve_hw(self) -> bool:
+        """Probe the daemon venv's environment (hw_id, versions) in a worker; retried on later ticks until it works
+        (the driver may not be ready at login). Returns True when it just became known."""
+        if self.hw_id:
+            return False
+        doc = self._worker_env(self.python, {})
+        if not doc:
+            return False
+        self.daemon_env, self.hw_id = doc, doc.get("hw_id")
+        if not self.identity.get("uuid"):
+            self.identity = gate.gpu_identity()
+        return bool(self.hw_id)
 
     def load_models(self) -> None:
         self.models = models.active(self.paths, self.hw_id)
@@ -97,28 +116,57 @@ class Daemon:
             self.log.warning("environment of %s unavailable: %s", python, e)
         return None
 
+    def _env_key(self, eid: str, rec: dict) -> tuple:
+        return (eid, json.dumps(self.env_extra(eid), sort_keys=True), rec.get("updated"))
+
     def caches(self) -> dict:
-        """{env_id: WinnerCache in that env's environment}. Environments are probed (by running the env's interpreter)
-        once a day or when the env's record or the model set changed."""
+        """{env_id: WinnerCache in that env's environment}. An environment is probed (by running the env's interpreter)
+        once a day, when the env's record or the model set changed, or when a worker reported a different one; a failed
+        probe is retried after ENV_RETRY_S and the env is listed in `unknown_envs` (its requests stay queued). A cache
+        instance is kept per env and re-read only when winners.jsonl changed."""
         from tune.winner_cache import WinnerCache
-        out = {}
+        out, self.unknown_envs = {}, set()
         now = self.clock()
+        try:
+            st = self.paths.winners.stat()
+            stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            stamp = None
         for eid, rec in envs.load(self.paths).items():
-            extra = self.env_extra(eid)
-            key = (eid, json.dumps(extra, sort_keys=True), rec.get("updated"))
+            key = self._env_key(eid, rec)
             t, doc = self.env_docs.get(key, (0.0, None))
             if doc is None or now - t > ENV_REFRESH_S:
-                doc = self._worker_env(rec["python"], extra)
-                if doc is None:
-                    continue
-                self.env_docs[key] = (now, doc)
-            out[eid] = WinnerCache(self.paths.winners, env=doc)
+                if now - self.env_failed.get(eid, -1e18) < ENV_RETRY_S:
+                    doc = None
+                else:
+                    doc = self._worker_env(rec["python"], self.env_extra(eid))
+                    if doc is None:
+                        self.env_failed[eid] = now
+                    else:
+                        self.env_docs[key] = (now, doc)
+                        self.env_failed.pop(eid, None)
+            if doc is None:
+                self.unknown_envs.add(eid)
+                continue
+            have = self.wcs.get(eid)
+            if have is None or have[0] != doc:
+                have = (doc, stamp, WinnerCache(self.paths.winners, env=doc))
+            elif have[1] != stamp:
+                have[2].reload()
+                have = (doc, stamp, have[2])
+            self.wcs[eid] = have
+            out[eid] = have[2]
         return out
 
     # ------------------------------------------------------------------------------------------------ the gate
-    def gate_reasons(self, own: set[int] | None = None) -> list[str]:
+    def gate_reasons(self, own=None) -> list[str]:
+        """Why the gate is closed. `own` = the running job's process tree, or a function returning it: called AFTER the
+        GPU snapshot, so a job process that created its CUDA context just before is in the tree it is compared with."""
         lock = self.paths.src / "pipeline" / ".lock"
-        return self.gate.reasons(snap=self.snapshot(), now=self.clock(), local=self.local_now(), battery=self.battery(),
+        snap = self.snapshot()
+        if callable(own):
+            own = own()
+        return self.gate.reasons(snap=snap, now=self.clock(), local=self.local_now(), battery=self.battery(),
                                  paused=control.paused(control.read_control(self.paths), self.clock()),
                                  backoff_until=self.backoff_until, pipeline_locked=lock.exists() and gate.lock_held(lock),
                                  own=own)
@@ -156,11 +204,9 @@ class Daemon:
             usage.merge(self.paths, self.cfg["search"]["half_life_days"], now=now)
             self.last_merge = now
         if caches is not None:
-            pend, end = queue.pending(self.paths)
-            if pend and all(scheduler.satisfied(r, caches, self.failures) for r in pend):
-                queue.consume(self.paths, end)
-            elif not pend and end:
-                queue.consume(self.paths, end)
+            pend, _ = queue.pending(self.paths)
+            if pend:                                       # drop finished requests, keep the rest (any order)
+                queue.retain(self.paths, lambda r: not scheduler.satisfied(r, caches, self.failures, self.unknown_envs))
             if now - self.last_compact >= COMPACT_EVERY_S and caches:
                 for wc in caches.values():
                     wc.compact()
@@ -175,6 +221,8 @@ class Daemon:
 
     def tick(self) -> scheduler.Task | None:
         """One iteration; returns the task it ran (None if it ran nothing)."""
+        if self.resolve_hw():
+            self.load_models()
         caches = self.caches()
         self.maintenance(caches)
         self.reasons = self.gate_reasons()
@@ -195,16 +243,27 @@ class Daemon:
         return task
 
     # ------------------------------------------------------------------------------------------------ jobs
-    def _watch(self, tree: set[int]) -> bool:
-        r = self.gate_reasons(own=tree | {os.getpid()})
+    def _watch(self, tree_fn) -> bool:
+        if self.stop:                                      # SIGTERM: end the job now, the clock reset still runs
+            self.reasons = ["stopping"]
+            return False
+        r = self.gate_reasons(own=lambda: tree_fn() | {os.getpid()})
         if r:
             self.reasons = r
             self.log.info("preempting %s: %s", self.job_info, "; ".join(r))
+        elif self.clock() - self.last_heartbeat >= HEARTBEAT_S:
+            self.last_heartbeat = self.clock()
+            self.write_state()
         return not r
 
     def run_task(self, task: scheduler.Task) -> None:
         lockf = open(self.paths.gpu_lock, "a")
-        fcntl.flock(lockf, fcntl.LOCK_EX)
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:                            # another lscli daemon (or a stale one) holds it: not now
+            lockf.close()
+            self.log.warning("gpu.lock is held by another process; skipping this tick")
+            return
         self.set_state("running")
         self.job_info = {"kind": task.kind, "shape": [task.M, task.N, task.K], "dtype": task.dtype,
                          "env_id": task.env_id, "k": task.k, "reason": task.reason, "started": self.clock()}
@@ -216,18 +275,19 @@ class Daemon:
             self.failures.pop(task.key, None)
         except jobs.Preempted:
             self.counters["preempted"] += 1
-            self.backoff_until = self.clock() + self.cfg["idle"]["backoff_minutes"] * 60
-            self.set_state("backoff")
-        except jobs.JobError as e:
+            if not self.stop and not any(r == "paused" for r in self.reasons):   # a pause or stop is not a busy GPU
+                self.backoff_until = self.clock() + self.cfg["idle"]["backoff_minutes"] * 60
+        except Exception as e:                             # JobError or anything unexpected: count it, never loop on it
             self.counters["failed"] += 1
             self.failures[task.key] = self.failures.get(task.key, 0) + 1
-            self.log.warning("task %s failed: %s", task, e)
+            self.log.warning("task %s failed: %s: %s", task, type(e).__name__, e)
         finally:
             self.clock_lock("reset")
             self.gate.job_ended(self.clock())
             self.job_info = None
             fcntl.flock(lockf, fcntl.LOCK_UN)
             lockf.close()
+            self.set_state("backoff" if self.backoff_until else "waiting")
             self.write_state()
 
     def _job_log(self, name: str) -> Path:
@@ -261,23 +321,35 @@ class Daemon:
             return {"skip": bool(skip), "p": p, "threshold": router.threshold}
         req = {"M": task.M, "N": task.N, "K": task.K, "dtype": task.dtype, "k": task.k, "lt_n": s["lt_n"],
                "lt_rank": lt_rank, "confirm": 0, "router": router is not None, "proposals": proposals,
-               "cache": str(self.paths.winners), "env_extra": self.env_extra(task.env_id), "order": "diverse",
+               "cache": None, "env_extra": self.env_extra(task.env_id), "order": "diverse",
                "ranker": self.models.stems["triton"].name, "reply_timeout_s": 30, "rank_s": rank_s}
         job = jobs.Job([rec["python"], "-m", "lscli.worker", "measure"], cwd=cwd, log=self._job_log("measure"))
         res = jobs.converse(job, req, watch=self._watch, answer=answer if router is not None else None)
         if res.get("skipped"):
             raise jobs.JobError(f"skipped: {res['skipped']}")
-        if not res.get("written"):
+        if not (res.get("choice") or {}).get("key"):
             raise jobs.JobError("no valid kernel")
+        # Final check, after the worker is gone: a foreign process that appeared since the last watch poll (<= 1 s)
+        # may have overlapped the last samples. Then nothing is written (spec 4.2).
+        late = self.gate_reasons(own=set())
+        if any(r.startswith("compute process") for r in late):
+            self.reasons = late
+            raise jobs.Preempted()
+        from lscli.worker import write_entry
+        write_entry(str(self.paths.winners), res["env"], res["put"])
         self._update_env(task.env_id, rec, res.get("env") or {})
         self.log.info("searched %sx%sx%s %s for %s: %s (%s), torch %.1f us", task.M, task.N, task.K, task.dtype,
                       task.env_id, res["choice"]["key"], res["choice"].get("family"), res.get("torch_us") or -1)
         return res
 
     def _update_env(self, eid: str, rec: dict, env: dict) -> None:
+        """The worker's environment is authoritative: refresh the env's record and the cached environment doc (a driver
+        or cuBLASLt change would otherwise make every fresh entry look stale to the scheduler)."""
         fresh = {k: env.get(k) for k in ("torch", "triton", "cuda_runtime") if env.get(k) is not None}
         if any(rec.get(k) != v for k, v in fresh.items()):
-            envs.register(self.paths, rec["python"], {**rec, **fresh})
+            rec = envs.register(self.paths, rec["python"], {**rec, **fresh})[1]
+        if env:
+            self.env_docs[self._env_key(eid, rec)] = (self.clock(), env)
 
     def clock_lock(self, action: str) -> None:
         """Lock / reset the SM clock through the optional helper (spec 4.6); a no-op without lock_mhz."""

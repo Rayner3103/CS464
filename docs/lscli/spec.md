@@ -121,9 +121,10 @@ double-count its parent's calls.
 `reason` is one of `manual` (`lscli prewarm`), `miss` (client fallback), `stale` (soft-stale entry served),
 `superseded` (new models), in that priority order. Duplicates are allowed: the daemon de-duplicates on (shape, dtype,
 env_id), keeping the most urgent reason, and drops requests a current cache entry already satisfies. It records how
-far it consumed in `queue.offset`. When everything is consumed it truncates the file **in place, under the same
-`flock` the appenders take** (the inode never changes, so no writer can append to an unlinked file), and resets the
-offset to 0.
+far it consumed in `queue.offset`. Once requests are done, it rewrites the file **in place, under the same `flock`
+the appenders take**, keeping only the requests that still need work. The inode never changes, so no writer can
+append to an unlinked file, and one request waiting for a slow re-search never holds up the others. A request of a
+registered env whose environment could not be probed yet is kept.
 
 ### 3.5 `envs.json`
 
@@ -218,8 +219,8 @@ While a job runs, a watcher polls every second. When the gate closes (section 4.
 1. The job's process group gets SIGTERM, then SIGKILL after 5 s. Descendants that left the group (spawned compile
    workers) are killed by PID from the last descendant walk.
 2. The clock is reset if it was locked.
-3. The unit in flight is discarded. A search writes nothing, because the worker writes its winner only as its last
-   step and is killed before that. A training stage keeps only the shapes it completed (train_best stages are
+3. The unit in flight is discarded. A search writes nothing: the daemon writes the winner only after the worker has
+   finished and a final gate check passed. A training stage keeps only the shapes it completed (train_best stages are
    resumable per shape).
 4. `backoff_minutes` of backoff starts.
 
@@ -255,7 +256,9 @@ For a (shape, dtype, env_id):
 3. **Measurement**: `<env python> -m lscli.worker measure` (protocol in section 7) with all the proposal keys. The
    worker queries its own library's heuristic top `lt_n`, rebuilds the pool (`backends_from_keys`), short-times
    torch.matmul for the shape (`torch_us`), runs `tune.online.measure` (with the router round trip when a router is
-   active), and writes the winner to `winners.jsonl` with its own environment plus `env_extra`.
+   active), and returns the winner with its own environment plus `env_extra`. After the worker has exited, the daemon
+   checks the gate once more, then writes the winner to `winners.jsonl` (so a foreign process that appeared within
+   the last watch interval voids the result instead of storing it).
 
 The worker uses the user's normal `TRITON_CACHE_DIR`, so the kernels it compiles are already cached when the user's
 program first runs them.
@@ -443,8 +446,11 @@ It writes JSON lines to its **protocol channel**:
 * `{"op": "route", "t_lt_us": 41.2}` when `router` is true, after the cuBLASLt half is timed. The daemon answers on
   stdin with `{"skip": false, "p": 0.31, "threshold": 0.02}`. With no answer within `reply_timeout_s`, the worker
   does not skip.
-* `{"op": "result", "choice": {...}, "candidates": [...], "router": {...}, "torch_us": 812.0, "written": true,
-  "env": {...}}` as the last line. `env` is the worker's environment, used to update `envs.json`.
+* `{"op": "result", "choice": {...}, "candidates": [...], "router": {...}, "torch_us": 812.0, "written": false,
+  "env": {...}, "put": {...}}` as the last line:
+  * `env` is the worker's environment, used to update `envs.json` and the daemon's view of that env;
+  * `put` is the cache entry. The daemon writes it after its final gate check, so the daemon's requests carry
+    `"cache": null`. With a cache path (standalone use), the worker writes it itself.
 * `{"op": "error", "error": "..."}` for any failure (the exit status is non-zero too).
 
 The channel is the worker's original stdout. At start-up the worker duplicates fd 1 to a private descriptor, then

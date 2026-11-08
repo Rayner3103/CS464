@@ -34,6 +34,7 @@ class Job:
                                   stderr=self.log, start_new_session=True)
         self.seen: set[int] = {self.p.pid}
         self.buf = b""
+        self.eof = False
 
     def tree(self) -> set[int]:
         if self.p.poll() is None:
@@ -57,6 +58,7 @@ class Job:
                 continue
             chunk = os.read(fd, 65536)
             if not chunk:
+                self.eof = True
                 return None
             self.buf += chunk
         line, self.buf = self.buf.split(b"\n", 1)
@@ -112,29 +114,38 @@ def _alive(pid: int) -> bool:
         return False
 
 
-def converse(job: Job, request: dict, *, watch: Callable[[set], bool], answer: Callable[[dict], dict] | None = None,
-             silence_s: float = 600.0) -> dict:
-    """Send one request, then read protocol lines until the result, answering `route` questions; `watch(tree)` is
-    called about once a second and returning False preempts. Returns the result document; raises Preempted or
-    JobError."""
+def converse(job: Job, request: dict, *, watch: Callable[[Callable[[], set]], bool],
+             answer: Callable[[dict], dict] | None = None, silence_s: float = 600.0) -> dict:
+    """Send one request, then read protocol lines until the result, answering `route` questions. `watch(tree_fn)` is
+    called about once a second (it takes the GPU snapshot first and only then walks the tree, so a grandchild that
+    just created its CUDA context is not mistaken for a foreign process); returning False preempts. Returns the result
+    document; raises Preempted or JobError. On ANY way out other than a result (an exception in `answer` or `watch`,
+    KeyboardInterrupt, a silent or dead leader) the whole tree is killed, so no orphan keeps measuring unwatched."""
+    try:
+        return _converse(job, request, watch, answer, silence_s)
+    except BaseException:
+        job.kill()
+        raise
+
+
+def _converse(job, request, watch, answer, silence_s):
     try:
         job.send(request)
     except (BrokenPipeError, OSError) as e:
-        job.kill()
         raise JobError(f"job exited before taking its request: {e}") from None
     last = time.monotonic()
     while True:
-        if not watch(job.tree()):
-            job.kill()
+        if not watch(job.tree):
             raise Preempted()
         line = job.readline(1.0)
         if line is None:
-            if job.p.poll() is not None and not job.buf:
-                code = job.p.returncode
-                job.close()
-                raise JobError(f"job exited ({code}) without a result")
+            if job.eof or job.p.poll() is not None:
+                try:
+                    job.p.wait(5)
+                except subprocess.TimeoutExpired:
+                    pass
+                raise JobError(f"job closed its output (exit {job.p.poll()}) without a result")
             if time.monotonic() - last > silence_s:
-                job.kill()
                 raise JobError(f"no output for {silence_s:.0f}s")
             continue
         last = time.monotonic()
@@ -153,13 +164,8 @@ def converse(job: Job, request: dict, *, watch: Callable[[set], bool], answer: C
             try:
                 job.p.wait(30)
             except subprocess.TimeoutExpired:
-                job.kill()
-            job.close()
+                pass
+            job.kill()                                   # reaps any straggling descendant; a no-op otherwise
             return msg
         elif op == "error":
-            try:
-                job.p.wait(30)
-            except subprocess.TimeoutExpired:
-                job.kill()
-            job.close()
             raise JobError(msg.get("error", "unknown error"))

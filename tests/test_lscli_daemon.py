@@ -52,13 +52,23 @@ def test_battery(tmp_path):
     assert gate.on_battery(tmp_path) and not gate.on_battery(tmp_path / "none")
 
 
-def test_lock_held(tmp_path):
+def test_lock_held_reads_proc_locks_and_never_takes_the_lock(tmp_path):
     p = tmp_path / ".lock"
+    p.touch()
     assert not gate.lock_held(p)
-    with open(p, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        assert gate.lock_held(p)
+    holder = subprocess.Popen(["flock", str(p), "sleep", "3"])          # another process holds it, as train_best does
+    time.sleep(0.3)
+    assert gate.lock_held(p)
+    holder.wait()
     assert not gate.lock_held(p)
+    # a concurrent `flock -n` (train_best.sh) must never fail because of the probe
+    stop, fails = time.monotonic() + 2, 0
+    prober = subprocess.Popen([sys.executable, "-c", f"import sys; sys.path.insert(0, {str(REPO)!r}); from lscli import gate\n"
+                               f"import time\nt = time.monotonic() + 2\nwhile time.monotonic() < t: gate.lock_held({str(p)!r})"])
+    while time.monotonic() < stop:
+        fails += subprocess.run(["flock", "-n", str(p), "true"]).returncode != 0
+    prober.wait()
+    assert fails == 0
 
 
 def _snap(pids=(), util=0):
@@ -116,8 +126,8 @@ def test_preemption_kills_the_whole_tree_including_new_sessions(tmp_path):
     job = jobs.Job([sys.executable, str(script)])
     seen, t0 = [], time.monotonic()
 
-    def watch(tree):
-        seen.append(set(tree))
+    def watch(tree_fn):
+        seen.append(set(tree_fn()))
         return time.monotonic() - t0 < 2
     with pytest.raises(jobs.Preempted):
         jobs.converse(job, {"sleep": 30}, watch=watch, answer=lambda m: {"skip": False})
@@ -127,9 +137,22 @@ def test_preemption_kills_the_whole_tree_including_new_sessions(tmp_path):
     assert not [p for p in tree if jobs._alive(p)]
 
 
+def test_an_exception_while_conversing_kills_the_tree(tmp_path):
+    script = tmp_path / "w.py"
+    script.write_text(TREE)
+    job = jobs.Job([sys.executable, str(script)])
+
+    def bad_answer(msg):
+        raise ValueError("router exploded")
+    with pytest.raises(ValueError):
+        jobs.converse(job, {"sleep": 30}, watch=lambda t: True, answer=bad_answer)
+    time.sleep(0.3)
+    assert not [p for p in job.seen if jobs._alive(p)]
+
+
 def test_a_job_that_dies_is_an_error(tmp_path):
     job = jobs.Job([sys.executable, "-c", "import sys; sys.stdin.readline(); sys.exit(3)"])
-    with pytest.raises(jobs.JobError, match="exited"):
+    with pytest.raises(jobs.JobError, match="without a result"):
         jobs.converse(job, {}, watch=lambda t: True)
 
 
@@ -139,6 +162,7 @@ class FakeCache:
         self.rows = rows
 
     def get(self, M, N, K, dtype, **kw):
+        assert kw == {"k": 1, "lt_n": 0, "allow_stale": True}       # any width, stale entries included
         return self.rows.get((M, N, K, dtype))
 
 
@@ -167,6 +191,21 @@ def test_scheduler_classes_and_order():
     assert [t.M for t in scheduler.plan(cfg, prof, pending, caches, {(4096, 4096, 4096, "fp16", "e1"): 2}, now)][:1] == [2048]
     assert scheduler.satisfied({"M": 64, "N": 64, "K": 64, "dtype": "fp16", "env_id": "e1"}, caches, {})
     assert not scheduler.satisfied(pending[0], caches, {}) and scheduler.satisfied({**pending[0], "env_id": "x"}, caches, {})
+    assert not scheduler.satisfied({**pending[0], "env_id": "x"}, caches, {}, unknown={"x"})   # probe failed: keep it
+
+
+def test_queue_retain_keeps_unfinished_requests_and_new_lines(home):
+    queue.request(home, 8, 8, 8, "fp16", "e", "miss")
+    queue.request(home, 9, 9, 9, "fp16", "e", "stale")
+    queue.request(home, 9, 9, 9, "fp16", "e", "manual")
+    with open(home.queue, "a") as f:
+        f.write('{"op": "search", "M": 10')                          # being appended right now
+    ino = home.queue.stat().st_ino
+    assert queue.retain(home, lambda r: r["M"] != 8) == (3, 1)
+    text = home.queue.read_text()
+    assert text.endswith('{"op": "search", "M": 10') and home.queue.stat().st_ino == ino
+    rows = [json.loads(x) for x in text.splitlines()[:-1]]
+    assert [(r["M"], r["reason"]) for r in rows] == [(9, "manual")]
 
 
 def _model(d: Path, stem: str, content: str = "x"):
@@ -238,6 +277,18 @@ def test_miss_is_searched_by_the_daemon_and_then_dispatched(home):
     assert out.stdout.strip() == "True", out.stderr[-1500:]
 
 
+def test_sigterm_ends_a_running_job_without_backoff(home, tmp_path):
+    from lscli.daemon import Daemon
+    d = Daemon(home, None, snapshot=lambda: gate.GpuSnapshot([], 0, True, {}), battery=lambda: False)
+    script = tmp_path / "w.py"
+    script.write_text(TREE)
+    job = jobs.Job([sys.executable, str(script)])
+    d.stop = True
+    with pytest.raises(jobs.Preempted):
+        jobs.converse(job, {"sleep": 30}, watch=d._watch, answer=lambda m: {"skip": False})
+    assert d.reasons == ["stopping"]
+
+
 @requires_cuda
 @pytest.mark.skipif(not Path(str(RANKER_2060) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
 def test_a_foreign_process_preempts_the_search_and_nothing_is_written(home):
@@ -247,14 +298,38 @@ def test_a_foreign_process_preempts_the_search_and_nothing_is_written(home):
                                    text=True).stdout.splitlines()[-1])["env"]["hw_id"]
     _setup_models(home, hw)
     queue.request(home, 2048, 2048, 2048, "fp16", eid, "manual")
-    calls = []
+    d = None
 
-    def snapshot():
-        calls.append(1)
-        return gate.GpuSnapshot([999999] if len(calls) > 3 else [], 0, True, {999999: "user training job"})
+    def snapshot():                                  # a user's job appears as soon as the search job has started
+        busy = d is not None and d.job_info is not None
+        return gate.GpuSnapshot([999999] if busy else [], 0, True, {999999: "user training job"})
     d = _daemon(home, snapshot)
     d.tick()
     assert d.counters["preempted"] == 1 and d.backoff_until and not home.winners.exists()
     st = json.loads(home.state.read_text())
     assert st["state"] == "backoff" and st["job"] is None
-    assert any("compute process 999999" in r for r in d.gate_reasons())
+    assert any("compute process 999999" in r for r in d.reasons)        # why it was preempted
+
+
+@requires_cuda
+@pytest.mark.skipif(not Path(str(RANKER_2060) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
+def test_a_process_that_appears_as_the_worker_finishes_voids_the_result(home, monkeypatch):
+    """The last <= 1 s of timing is not covered by a watch poll: the daemon checks once more before writing."""
+    envs.register(home, sys.executable)
+    eid = envs.env_id(sys.executable)
+    hw = json.loads(subprocess.run([sys.executable, "-m", "lscli.worker", "env"], cwd=REPO, capture_output=True,
+                                   text=True).stdout.splitlines()[-1])["env"]["hw_id"]
+    _setup_models(home, hw)
+    queue.request(home, 1024, 1024, 1024, "fp16", eid, "miss")
+    late = []
+    orig = jobs.converse
+
+    def converse(job, req, **kw):
+        res = orig(job, req, **kw)
+        if "proposals" in req:                       # the measure worker (not the proposer) just returned
+            late.append(1)
+        return res
+    monkeypatch.setattr(jobs, "converse", converse)
+    d = _daemon(home, lambda: gate.GpuSnapshot([424242] if late else [], 0, True, {424242: "late"}))
+    d.tick()
+    assert d.counters["preempted"] == 1 and not home.winners.exists()

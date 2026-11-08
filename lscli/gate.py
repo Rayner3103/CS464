@@ -12,7 +12,6 @@ rules are testable without a GPU. The daemon process itself never creates a CUDA
 from __future__ import annotations
 
 import datetime as _dt
-import fcntl
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,18 +48,26 @@ def on_battery(sys_root: str | os.PathLike = "/sys/class/power_supply") -> bool:
     return False
 
 
-def lock_held(path: str | os.PathLike) -> bool:
-    """True when another process holds an exclusive flock on `path` (train_best.sh's pipeline/.lock)."""
+def lock_held(path: str | os.PathLike, locks: str = "/proc/locks") -> bool:
+    """True when some process holds a flock on `path` (train_best.sh's pipeline/.lock). Read from /proc/locks, never by
+    trying the lock: a probe that took it, even for a microsecond, could make a concurrent `flock -n` fail."""
     try:
-        with open(path, "a") as f:
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            fcntl.flock(f, fcntl.LOCK_UN)
-            return False
+        st = os.stat(path)
+        text = Path(locks).read_text()
     except OSError:
         return False
+    want = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 6 or parts[1] == "->":                 # "->" lines are waiters, not holders
+            continue
+        try:
+            maj, mnr, ino = parts[5].split(":")
+            if (int(maj, 16), int(mnr, 16), int(ino)) == want:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def descendants(pid: int, proc: str = "/proc") -> set[int]:

@@ -1,17 +1,18 @@
 # lscli daemon (docs/lscli/spec.md section 4). Installed by install/install.sh into ~/.config/systemd/user/.
+# No Nice= / IOSchedulingClass=: jobs inherit them and an unprivileged process cannot undo them, which would skew the
+# measurements; the daemon itself only polls (every 5 s, every 1 s during a job).
 [Unit]
 Description=lscli: idle-time GEMM kernel selection
-After=default.target
 
 [Service]
 Type=simple
 ExecStart=%h/.local/share/lscli/venv/bin/python -m lscli daemon run
 WorkingDirectory=%h/.local/share/lscli/src
+# reset a clock a crashed / killed daemon left locked; '-' = fine when the optional helper is not installed
+ExecStartPre=-/usr/bin/sudo -n /usr/local/libexec/lscli-clock reset
+ExecStopPost=-/usr/bin/sudo -n /usr/local/libexec/lscli-clock reset
 Restart=on-failure
 RestartSec=30
-Nice=19
-IOSchedulingClass=idle
-# never leave a job's process tree behind
 KillMode=control-group
 TimeoutStopSec=30
 
