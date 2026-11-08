@@ -588,6 +588,9 @@ def train_ranker_v2(data: Path, extra_screens: tuple[str, ...] = V2_EXTRA_SCREEN
     data = Path(data)
     ctx = context(data, extra_screens)
     hp = json.loads((data / "lgbm_rank.json").read_text())["hp"]
+    # v2 is a weighted regression on log regret (`fit_rank_v2`); a GPU whose v1 CV picked lambdarank (it needs query
+    # groups and a negated score, the 3090 run) keeps v1's size hyperparameters but is fit and scored as a regression.
+    hp = {**hp, "objective": "regression"}
     cfgs = [parse_key(k) for k in ctx["keys"]]
     gpu = json.loads((data / "env.json").read_text())["gpu"]
     from kernels.config_space import full_space, prune
@@ -606,7 +609,7 @@ def train_ranker_v2(data: Path, extra_screens: tuple[str, ...] = V2_EXTRA_SCREEN
                 {"features": FEATURES_V2, "tag": v2_tag(ctx, hp), "n_tune_shapes": len(ctx["shapes"]),
                  "extra_screens": list(extra_screens), "pool_top": POOL_TOP, "near_top": NEAR_TOP,
                  "near_weight": NEAR_WEIGHT, "diverse_rule": rules[0]["rule"], "inner_rule": inner,
-                 "diverse_k": DIVERSE_K, "hp_from": "lgbm_rank.json (v1 CV-chosen, not re-searched)"})
+                 "diverse_k": DIVERSE_K, "hp_from": "lgbm_rank.json (v1 CV-chosen, not re-searched; objective forced to regression)"})
     rk.save(data / out_stem)
     return rk, {"ctx": ctx, "pool": pool, "rules": rules, "S": S}
 
