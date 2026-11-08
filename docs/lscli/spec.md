@@ -503,6 +503,9 @@ curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/<tag>/install/inst
    `src` in editable mode. `$LSCLI_HOME` is created with mode 0700.
 3. Download the zero-shot models (GitHub release assets of `<tag>`) into `models/zero_shot/`. Their sha256 sums are
    **pinned in `install.sh`** itself, not fetched from the release. Unpack `kernels/bundle.tar.xz`.
+   `install/pack_zero_shot.py` builds the archive and prints the hash to pin. Until an asset is published, the pin is
+   empty and the installer skips this step: the daemon then trains this GPU's models first and selects nothing with a
+   Triton ranker until they exist. `--models-url URL --models-sha256 HEX` installs another archive.
 4. Write `~/.config/lscli/config.toml` if absent. Link `~/.local/bin/lscli`. Install and start `lscli.service`
    (`systemctl --user enable --now`). Run `loginctl enable-linger` when the user agrees (prompt; `--linger` /
    `--no-linger`).

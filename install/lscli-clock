@@ -1,0 +1,29 @@
+#!/bin/bash
+# lscli SM clock helper (docs/lscli/spec.md section 4.6). Installed root-owned (0755) at /usr/local/libexec/lscli-clock
+# and allowed through /etc/sudoers.d/lscli for exactly two command lines: `lscli-clock lock` and `lscli-clock reset`.
+# It takes no other argument: the clock comes from the root-owned /etc/lscli/clock.conf, re-validated on every use
+# against the card's maximum SM clock. The environment is scrubbed and nvidia-smi is called by absolute path.
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+umask 022
+CONF=/etc/lscli/clock.conf
+NVSMI=/usr/bin/nvidia-smi
+
+[[ $# -eq 1 ]] || { echo "usage: lscli-clock lock|reset" >&2; exit 2; }
+[[ -x $NVSMI ]] || { echo "lscli-clock: $NVSMI not found" >&2; exit 3; }
+case "$1" in
+  lock)
+    [[ -f $CONF && ! -L $CONF && "$(stat -c %u "$CONF")" == 0 ]] || { echo "lscli-clock: $CONF must be a root-owned file" >&2; exit 3; }
+    mhz="$(sed -n 's/^lock_mhz=\([0-9]\{3,4\}\)$/\1/p' "$CONF" | head -n1)"
+    [[ -n $mhz ]] || { echo "lscli-clock: no valid lock_mhz in $CONF" >&2; exit 3; }
+    max="$("$NVSMI" -i 0 --query-gpu=clocks.max.sm --format=csv,noheader,nounits | tr -d ' ')"
+    [[ $max =~ ^[0-9]+$ ]] && (( mhz >= 300 && mhz <= max )) || { echo "lscli-clock: $mhz MHz outside [300, $max]" >&2; exit 3; }
+    exec "$NVSMI" -i 0 -lgc "$mhz,$mhz"
+    ;;
+  reset)
+    exec "$NVSMI" -i 0 -rgc
+    ;;
+  *)
+    echo "usage: lscli-clock lock|reset" >&2; exit 2 ;;
+esac
