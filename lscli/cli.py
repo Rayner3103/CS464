@@ -280,8 +280,8 @@ def _py(python: str, *argv: str, timeout: float = 120) -> str:
 
 def _pth_text(src: Path) -> str:
     return (f"{src}\n"
-            "import os; (os.environ.get('LSCLI_PATCH') == '1' and os.environ.get('LSCLI_DISABLE') != '1') "
-            "and __import__('lscli.boot')\n")
+            "import os, importlib.util; (os.environ.get('LSCLI_PATCH') == '1' and os.environ.get('LSCLI_DISABLE') != '1' "
+            "and importlib.util.find_spec('lscli') is not None) and __import__('lscli.boot')\n")
 
 
 def cmd_enable_env(args, paths: Paths) -> int:
@@ -307,7 +307,14 @@ def cmd_enable_env(args, paths: Paths) -> int:
     except (RuntimeError, ValueError, OSError) as e:
         print(f"lscli enable-env: cannot inspect {python}: {e}", file=sys.stderr)
         return EXIT_FAIL
-    clash = {n: o for n, o in found.items() if o and not Path(o).resolve().is_relative_to(src)}
+    ours = [src]
+    try:                                            # an earlier enable-env that pointed at another (moved) src/ is ours too
+        old = (site / PTH).read_text().splitlines()[0].strip()
+        if old:
+            ours.append(Path(old).resolve())
+    except (OSError, IndexError):
+        pass
+    clash = {n: o for n, o in found.items() if o and not any(Path(o).resolve().is_relative_to(d) for d in ours)}
     if clash:
         print("lscli enable-env: the env already has packages named like lscli's ("
               + ", ".join(f"{n} at {o}" for n, o in clash.items()) + "); refusing to shadow them", file=sys.stderr)
@@ -321,8 +328,12 @@ def cmd_enable_env(args, paths: Paths) -> int:
         r = subprocess.run([python, "-m", "pip", "install", *missing])
         if r.returncode != 0:
             return EXIT_FAIL
-    site.mkdir(parents=True, exist_ok=True)
-    (site / PTH).write_text(_pth_text(src))
+    try:
+        site.mkdir(parents=True, exist_ok=True)
+        (site / PTH).write_text(_pth_text(src))
+    except OSError as e:
+        print(f"lscli enable-env: cannot write {site / PTH}: {e}", file=sys.stderr)
+        return EXIT_FAIL
     eid, rec = envs.register(paths.ensure(), python, info)
     prof = usage.load(paths)
     n = 0

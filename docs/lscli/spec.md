@@ -314,22 +314,27 @@ program first runs them.
 ### 5.1 Enabling
 
 * `import lscli; lscli.enable()` patches for the rest of the process; `lscli.disable()` restores torch.
-* `LSCLI_PATCH=1` in the environment enables it at interpreter start-up, through `lscli.pth` (installed by
-  `lscli enable-env`), which imports nothing unless the variable is set.
+* `LSCLI_PATCH=1` in the environment enables it through `lscli.pth` (installed by `lscli enable-env`). The hook
+  imports nothing unless the variable is set. It then enables the client right after the program's own `import
+  torch`: it never imports torch or initializes CUDA itself, so `CUDA_VISIBLE_DEVICES` set in-script still works and
+  programs without torch pay nothing.
 * `LSCLI_DISABLE=1` overrides both (a kill switch).
 
 ### 5.2 Which calls are dispatched
 
-`torch.matmul(a, b)`, `a @ b` and `torch.mm(a, b)` are handled when all of these hold:
+`torch.matmul(a, b)`, `a @ b`, `torch.mm(a, b)`, `a.matmul(b)` and `a.mm(b)` are handled when all of these hold:
 
-* both are CUDA tensors on the current device;
+* exactly two positional arguments: keyword calls (`input=`, `out=`, ...) go to torch with their arguments as given;
+* both are plain tensors or `nn.Parameter`s (other subclasses keep their own dispatch), on CUDA;
+* the tensors' device is the current device;
 * that device's UUID equals the daemon's GPU (`gpu_uuid` in `client.json`), so `CUDA_VISIBLE_DEVICES` cannot route a
   winner to another card;
 * the dtype is fp16 or bf16, both operands have the same dtype, and both are 2-D;
 * M, N and K are in [1, 16384];
 * both are contiguous with 16-byte-aligned data pointers;
 * `out=` is not given;
-* the call is not inside `torch.compile` tracing or CUDA-graph capture.
+* the call is not inside `torch.compile` tracing (compiled code uses torch's op), CUDA-graph capture, `torch.autocast`
+  (torch's cast semantics apply), a `torch.func` transform (`grad`, `vmap`, `jvp`) or forward-mode AD.
 
 The kernel runs inside an `autograd.Function` only when an operand requires grad. Its backward calls the **original**
 (unpatched) `torch.matmul`.
@@ -361,8 +366,14 @@ Every other call goes to the original torch function untouched. `F.linear` is wr
    * `torch_us - winner_us >= max(min_saving_us, 0.02 · torch_us)`: the 2 % tie margin of the study.
    Otherwise call torch, which is still counted as a hit: the selector chose torch.
 
-A dispatched call never raises a new exception type. On any error the client calls torch, disables dispatch for that
-shape for the rest of the process, and logs one warning.
+A dispatched call never raises a new exception type. Routing errors are contained and the call goes to torch. On
+a kernel error the client calls torch, disables dispatch for that shape for the rest of the process, and logs one
+warning.
+
+* **Threads.** Decisions run outside the client's lock with a per-shape guard. While one thread decides a shape,
+  other threads calling it get torch. Reloading the table swaps it in atomically.
+* **Large soft-stale entries.** A soft-stale entry whose correctness check would allocate more than 512 MiB in the
+  user's process is not checked there: the call uses torch and a `stale` re-search is queued.
 
 ### 5.4 Overhead budget
 
@@ -374,8 +385,14 @@ printed):
   launch itself costs more than torch's (a Triton launch from Python takes tens of µs). This is why dispatch is limited
   to kernels of at least `min_kernel_us`, where the launch runs ahead of the GPU.
 
-First measurement (RTX 2060 box, x86_64): +1.4 µs undispatched (torch 11.2 µs); +8.9 µs dispatched over a 36.4 µs
-Triton launch.
+Measured on the RTX 2060 box (x86_64), after all the scope checks of 5.2:
+
+* +2.3 µs for an early exit (fp32; torch takes 11.5 µs);
+* +3.7 µs for a late exit (fp16, non-contiguous);
+* +13.5 µs for a dispatched call over a 36.9 µs Triton launch.
+
+The test syncs often enough that the launch queue never fills, because a full queue would count GPU time as host
+overhead.
 
 ## 6. CLI
 
