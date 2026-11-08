@@ -71,7 +71,8 @@ lscli/       the learned-selector CLI and daemon (docs/lscli/spec.md is the cont
   daemon.py      idle-time loop: gate.py (NVML + window + power + locks), scheduler.py, jobs.py (process trees, preemption),
                  models.py (native / zero-shot sets), propose.py (cuBLASLt ranker proposals), training.py (train_best stages)
   cli.py         `lscli` commands; config.py, files.py, envs.py, usage.py, search_queue.py, control.py, doctor.py
-install/     install.sh (curl | bash), lscli.service (systemd --user), lscli-clock (optional root clock helper), pack_zero_shot.py
+install/     install.sh (curl | bash), lscli.service (systemd --user), lscli-clock (optional root clock helper),
+             zero_shot.tar.xz (the 3080 zero-shot model set the installer unpacks; rebuilt with pack_zero_shot.py, reproducibly)
 tests/       pytest unit tests (~300 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
@@ -249,6 +250,9 @@ Other findings to keep in mind:
 - **Winners are timed where they run**: the worker runs under the registered env's interpreter; the daemon writes the
   entry only after a final gate check. Entries carry `env_extra` (clock policy, model ids, `env_id`); see the
   winner-cache tiers in `tune/winner_cache.py`.
+- **No model set = cuBLASLt-only searches**: `select_kernel(tune.online.LT_ONLY, ...)` / a daemon with no models
+  searches cuBLASLt alone and stores `k = 0`; lookups ask for `k = 0` so such an entry counts, and it is widened once a
+  ranker exists. Do not pass `None` for "no ranker": `None` is the tests' placeholder for a faked search.
 - **Daemon measurements are not study data**: they run at stock or helper-locked clocks with no noise study and are
   never written into `data/<hw>/` result files or reports.
 - **Branches**: nothing is committed directly to `learned-selector-cli` (or `learned-selectors`); every change is a PR

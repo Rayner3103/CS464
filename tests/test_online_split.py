@@ -114,3 +114,20 @@ def test_inputs_that_do_not_fit_are_a_skip(fakes, monkeypatch):
     r = online.search_shape(ranker, 1 << 20, 1 << 20, 64, 3, lt_n=4)
     assert r["skipped"].startswith("oom_inputs") and r["candidates"] == [] and not log
     assert online.measure(8, 8, 8, torch.float16, [], [], lt_n=0)["skipped"].startswith("oom_inputs")
+
+
+def test_no_ranker_is_a_cuBLASLt_only_search_stored_with_k0(fakes, tmp_path):
+    from tune.winner_cache import WinnerCache
+    log, ranker = fakes
+    assert online.propose_triton(None, 64, 64, 64, 3) == ([], 0.0) and online.propose_triton(ranker, 64, 64, 64, 0) == ([], 0.0)
+    wc = WinnerCache(tmp_path / "w.jsonl", env={"hw_id": "gpu"})
+    r = online.select_kernel(online.LT_ONLY, 64, 64, 64, calls=10**9, lt_n=4, lt_rank=0, lt_knn=0, cache=wc, use_bundle=False,
+                             router=True)
+    assert r["k"] == 0 and r["reason"] == "lt_only" and r["choice"]["family"] == "cublaslt"
+    assert all(c["family"] == "cublaslt" for c in r["candidates"]) and not [x for x in log if x[0] == "rank"]
+    e = wc.get(64, 64, 64, "fp16", k=0)
+    assert e["k"] == 0 and e["ranker"] is None and wc.get(64, 64, 64, "fp16", k=1) is None   # a ranker search is wider
+    again = online.select_kernel(online.LT_ONLY, 64, 64, 64, lt_n=4, lt_rank=0, lt_knn=0, cache=wc, use_bundle=False)
+    assert again["cached"] and again["choice"]["key"] == r["choice"]["key"]
+    none = online.select_kernel(online.LT_ONLY, 64, 64, 64, lt_n=0, cache=wc, use_bundle=False)
+    assert none["choice"] is None and none["reason"] == "no_candidates"

@@ -162,7 +162,7 @@ class FakeCache:
         self.rows = rows
 
     def get(self, M, N, K, dtype, **kw):
-        assert kw == {"k": 1, "lt_n": 0, "allow_stale": True}       # any width, stale entries included
+        assert kw == {"k": 0, "lt_n": 0, "allow_stale": True}       # any width (cuBLASLt-only k = 0 too), stale included
         return self.rows.get((M, N, K, dtype))
 
 
@@ -192,6 +192,25 @@ def test_scheduler_classes_and_order():
     assert scheduler.satisfied({"M": 64, "N": 64, "K": 64, "dtype": "fp16", "env_id": "e1"}, caches, {})
     assert not scheduler.satisfied(pending[0], caches, {}) and scheduler.satisfied({**pending[0], "env_id": "x"}, caches, {})
     assert not scheduler.satisfied({**pending[0], "env_id": "x"}, caches, {}, unknown={"x"})   # probe failed: keep it
+
+
+def test_scheduler_without_a_triton_ranker_plans_cuBLASLt_only_searches():
+    cfg = config.DEFAULTS
+    now = time.time()
+    lt_only = {"stale": [], "k": 0}
+    caches = {"e1": FakeCache({(64, 64, 64, "fp16"): lt_only, (128, 128, 128, "fp16"): {"stale": ["models"], "k": 0},
+                               (256, 256, 256, "fp16"): {"stale": ["models"], "k": 3}})}
+    prof = {"updated": now, "half_life_days": 30, "shapes": [
+        {"M": m, "N": m, "K": m, "dtype": "fp16", "layout": "NN", "calls": 10, "envs": ["e1"]} for m in (64, 128, 256, 512)]}
+    # no ranker: a k = 0 entry is enough; a miss is searched with k = 0; a superseded k = 3 entry stays superseded
+    tasks = scheduler.plan(cfg, prof, [], caches, {}, now, triton=False)
+    assert [(t.kind, t.M, t.k) for t in tasks] == [("search", 512, 0), ("superseded", 128, 0), ("superseded", 256, 0)]
+    assert scheduler.satisfied({"M": 64, "N": 64, "K": 64, "dtype": "fp16", "env_id": "e1"}, caches, {})
+    # a ranker arrives: cuBLASLt-only entries are widened (current or with only `models` stale) before re-ranks
+    tasks = scheduler.plan(cfg, prof, [], caches, {}, now, triton=True)
+    assert [(t.kind, t.M, t.k) for t in tasks] == [("search", 512, 3), ("widen", 64, 3), ("widen", 128, 3),
+                                                   ("superseded", 256, 3)]
+    assert scheduler.classify({"stale": ["driver"], "k": 0}, 3) == "stale"
 
 
 def test_queue_retain_keeps_unfinished_requests_and_new_lines(home):
@@ -275,6 +294,25 @@ def test_miss_is_searched_by_the_daemon_and_then_dispatched(home):
     out = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True, text=True,
                          env={**os.environ, "LSCLI_HOME": str(home.root)})
     assert out.stdout.strip() == "True", out.stderr[-1500:]
+
+
+@requires_cuda
+def test_without_models_the_daemon_searches_cuBLASLt_alone(home, monkeypatch, tmp_path):
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(cfg.read_text() + '[train]\nenabled = false\n')            # no train_best run in a unit test
+    envs.register(home, sys.executable)
+    eid = envs.env_id(sys.executable)
+    queue.request(home, 1024, 1024, 1024, "fp16", eid, "miss")
+    d = _daemon(home, lambda: gate.GpuSnapshot([], 0, True, {}))
+    assert d.models is None
+    task = d.tick()
+    assert task is not None and task.kind == "search" and task.k == 0, d.counters
+    assert d.counters == {"searches": 1, "preempted": 0, "failed": 0}
+    line = [json.loads(x) for x in home.winners.read_text().splitlines()][-1]
+    assert line["k"] == 0 and line["lt_n"] == 16 and line["choice"]["family"] == "cublaslt"
+    assert "models" not in line["env"] and line["ranker"] is None
+    assert [x.name.split("-")[-1] for x in sorted((home.logs / "jobs").glob("*.log"))] == ["measure.log"]
+    assert d.tick() is None and queue.pending(home)[0] == []    # the k = 0 entry counts: nothing searched again
 
 
 def test_sigterm_ends_a_running_job_without_backoff(home, tmp_path):

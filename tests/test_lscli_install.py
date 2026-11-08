@@ -106,6 +106,10 @@ def test_install_then_uninstall(tmp_path):
                         "--yes", "--no-start"], env=env, capture_output=True, text=True, timeout=900, stdin=subprocess.DEVNULL)
     assert r.returncode == 0, r.stderr[-2000:]
     assert (lh / "keep.txt").exists()
+    # no --models-url: the committed archive (install/zero_shot.tar.xz) replaces the downloaded set
+    doc = json.loads((lh / "models/zero_shot/MODELS.json").read_text())
+    assert doc["hw_id"] == "rtx3080_sm86_68sms_10gb" and set(doc["models"]) == {"triton", "lt_rank", "router"}
+    assert (lh / "models/zero_shot/lgbm_rank_v2.txt").stat().st_size > 1_000_000 and "zero-shot models" in r.stdout
     u = subprocess.run([str(home / ".local/bin/lscli"), "uninstall", "--yes"], env=env, capture_output=True, text=True)
     assert u.returncode == 0, u.stderr
     assert not (home / ".config/systemd/user/lscli.service").exists() and not (home / ".local/bin/lscli").exists()
@@ -253,3 +257,37 @@ def test_pack_zero_shot(tmp_path):
     assert doc["source"] == "zero_shot" and doc["models"] == {"triton": {"stem": "tri"}, "lt_rank": {"stem": "lt"}}
     with pytest.raises(ValueError):
         pack_zero_shot.pack({"triton": None}, "x", tmp_path / "y.tar.gz")
+    # .tar.xz, and reproducible: the same models pack to the same bytes (a repack changes no committed byte)
+    stems = {"triton": tmp_path / "tri", "lt_rank": tmp_path / "lt"}
+    assert pack_zero_shot.pack(stems, "h", tmp_path / "a.tar.xz") == pack_zero_shot.pack(stems, "h", tmp_path / "b.tar.xz")
+    with tarfile.open(tmp_path / "a.tar.xz", "r:xz") as t:
+        assert all(m.mtime == 0 and m.uid == 0 and m.isfile() for m in t.getmembers())
+    with pytest.raises(ValueError):
+        pack_zero_shot.pack(stems, "h", tmp_path / "c.zip")
+
+
+def test_the_committed_zero_shot_set(tmp_path):
+    """install/zero_shot.tar.xz: the RTX 3080's rank v2 + cuBLASLt ranker + router, loadable by lscli.models; on another
+    architecture only the Triton ranker is used (spec 3.7)."""
+    from lscli import models
+    from lscli.paths import Paths
+    arc = REPO / "install/zero_shot.tar.xz"
+    assert arc.stat().st_size < 20 * 2**20
+    home = Paths(tmp_path / "home").ensure()
+    with tarfile.open(arc, "r:xz") as t:
+        assert all(m.isfile() and "/" not in m.name for m in t.getmembers())
+        t.extractall(home.models / "zero_shot", filter="data")
+    doc = json.loads((home.models / "zero_shot/MODELS.json").read_text())
+    assert doc == {"hw_id": "rtx3080_sm86_68sms_10gb", "source": "zero_shot",
+                   "models": {"triton": {"stem": "lgbm_rank_v2"}, "lt_rank": {"stem": "lt_rank"}, "router": {"stem": "router"}}}
+    snap = REPO / "reports/snapshot/lock1755"
+    for stem in ("lt_rank", "router"):                                   # the same models as the committed snapshot
+        assert models.model_id(home.models / "zero_shot" / stem).split(":")[1] == models.model_id(snap / stem).split(":")[1]
+    assert (home.models / "zero_shot/lgbm_rank_v2.json").read_bytes() == (snap / "lgbm_rank_v2.json").read_bytes()
+    same = models.active(home, "rtx3090_sm86_82sms_24gb")
+    assert same.source == "zero_shot" and same.complete
+    other = models.active(home, "rtx2060_sm75_30sms_6gb")
+    assert other.stems["triton"] is not None and other.stems["lt_rank"] is None and other.stems["router"] is None
+    pytest.importorskip("lightgbm")
+    r = other.triton()
+    assert r.rank(1024, 1024, 1024, 3, order="diverse")

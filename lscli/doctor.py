@@ -85,7 +85,8 @@ def checks(paths) -> list[dict]:
             hw = None
     ms = models.active(paths, hw)
     if ms is None:
-        add("WARN", "models", "none yet", "the daemon trains this GPU's models in idle time (lscli train status)")
+        add("WARN", "models", "none yet: cuBLASLt-only searches",
+            "the daemon trains this GPU's models in idle time (lscli train status); reinstall to restore the zero-shot set")
     else:
         add("OK", "models", f"{ms.source}: " + ", ".join(f"{k} {'yes' if v else 'no'}" for k, v in ms.stems.items()))
     registered = envs.load(paths)
