@@ -1,23 +1,29 @@
 """The lscli client (spec section 5): an opt-in patch of torch's NN matmul that serves the winner cache.
 
-`enable()` replaces `torch.matmul`, `torch.mm` and `Tensor.__matmul__` / `Tensor.matmul` / `Tensor.mm` with a
-dispatcher, and wraps `torch.nn.functional.linear` to count its (NT) shapes. `disable()` restores the originals.
-Everything not in scope goes to the original function untouched.
+`enable()` replaces `torch.matmul`, `torch.mm` and `Tensor.matmul` / `Tensor.mm` / `Tensor.__matmul__` with a
+dispatcher, and wraps `torch.nn.functional.linear` to count its (NT) shapes. `disable()` restores the originals (and a
+wrapper captured earlier, e.g. `from torch import matmul`, passes straight through once disabled). Anything not in
+scope goes to the original function untouched, with the caller's exact arguments.
 
 Per call:
-  1. count the shape (in memory; flushed to `profile/<pid>-<t0>.jsonl` every 30 s, at exit, and never twice after a fork);
-  2. look it up in the winner table (`tune.winner_cache.WinnerCache` with client.json's env_extra + this env's id;
-     any search width; mtime re-checked at most once a second);
-  3. current entry -> dispatch if the rule allows it; soft-stale entry -> one correctness check per environment
-     (`mark_verified`), dispatch, queue `stale` once; miss -> an inline `select_kernel` for shapes the usage record
-     counts as frequent (once per process, needs lightgbm + the models named in client.json), otherwise torch +
-     queue `miss` once;
-  4. dispatch rule: the entry's `torch_us` >= `min_kernel_us` and `torch_us - winner_us >= max(min_saving_us, 2 %)`;
-     else torch (still a hit: the selector chose torch).
+  1. route: only two positional 2-D CUDA operands of the same fp16 / bf16 dtype on the daemon's GPU, which must also be
+     the current device; contiguous, 16-byte aligned, M, N, K <= 16384; plain tensors or nn.Parameter; not under
+     torch.compile tracing, CUDA-graph capture, autocast, torch.func transforms or forward-mode AD. Everything in this
+     step is inside a try: a failure here means torch, never an exception in the user's program;
+  2. count the shape (in memory; flushed to `profile/<pid>-<t0>.jsonl` every 30 s, at exit, and never twice after fork);
+  3. decide once per shape (and again after the winner file changed): current entry -> the dispatch rule; soft-stale
+     entry -> one correctness check per environment (`mark_verified`; skipped for shapes whose check would allocate more
+     than VERIFY_MAX_BYTES in the user's process: torch is used and a re-search queued), dispatch, queue `stale` once;
+     miss -> an inline `select_kernel` for shapes the usage record counts as frequent (once per process, needs lightgbm
+     and the models in client.json; the ranker is loaded once per process), otherwise torch + queue `miss` once.
+     Decisions run outside the global lock with a per-shape guard: another thread meanwhile gets torch;
+  4. dispatch rule: the entry's `torch_us` >= `min_kernel_us` and `torch_us - winner_us >= max(min_saving_us, 2 %)`.
 A failure of a dispatched kernel falls back to torch, disables that shape for the process and warns once. Under
-autograd the dispatched kernel runs inside an `autograd.Function` whose backward calls the ORIGINAL torch.matmul.
+autograd the kernel runs inside an `autograd.Function` whose backward calls the ORIGINAL torch.matmul.
 
-The fast path is a few attribute checks and two dict lookups; `tests/test_lscli_client.py::test_overhead` measures it.
+CUDA is not touched by `enable()`: the daemon's GPU (by UUID) is matched to a torch device index at the first CUDA
+matmul, when the program has initialized CUDA itself. `lscli.boot` (the LSCLI_PATCH hook) enables only once the
+program imports torch, so a script that never does pays nothing.
 """
 from __future__ import annotations
 
@@ -34,8 +40,32 @@ _ORIG: dict = {}
 _STATE: "_Client | None" = None
 _LOCK = threading.Lock()
 _DTYPES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
+_PLAIN = (torch.Tensor, torch.nn.Parameter)
 MAX_DIM = 16384
 FLUSH_S = 30.0
+VERIFY_MAX_BYTES = 512 << 20
+_UNSET = object()
+
+
+def _functorch_wrapped(t) -> bool:
+    try:
+        return torch._C._functorch.is_functorch_wrapped_tensor(t)
+    except Exception:
+        return False
+
+
+def _forward_ad_active() -> bool:
+    try:
+        return torch.autograd.forward_ad._current_level >= 0
+    except Exception:
+        return False
+
+
+def _autocast_on() -> bool:
+    try:
+        return torch.is_autocast_enabled("cuda")
+    except TypeError:
+        return torch.is_autocast_enabled()
 
 
 class _Mm(torch.autograd.Function):
@@ -55,58 +85,89 @@ class _Mm(torch.autograd.Function):
         return ga, gb, None
 
 
+def dispatch_rule(entry: dict, settings: dict) -> bool:
+    """Spec 5.3 step 6: dispatch only kernels where torch takes >= min_kernel_us (below that the Python-side launch costs
+    as much as the kernel) and the winner saves >= max(min_saving_us, 2 %) (the study's tie margin). An entry without
+    `torch_us` (written outside lscli) is never dispatched."""
+    t, w = entry.get("torch_us"), entry.get("winner_us")
+    if t is None or w is None or t < settings["min_kernel_us"]:
+        return False
+    return t - w >= max(settings["min_saving_us"], 0.02 * t)
+
+
+def _env_id(paths) -> str:
+    """This interpreter's registered env id: the record whose prefix is this sys.prefix (python vs python3, or a symlink
+    to the interpreter, must not look like another env); else the id of sys.executable."""
+    from lscli import envs
+    for eid, rec in envs.load(paths).items():
+        if rec.get("prefix") and os.path.realpath(rec["prefix"]) == os.path.realpath(sys.prefix):
+            return eid
+    return envs.env_id(sys.executable)
+
+
 class _Client:
     def __init__(self, paths=None):
-        from lscli import envs
+        from lscli.config import DEFAULTS, client_document
         from lscli.files import read_json
         from lscli.paths import Paths
         from lscli.usage import UsageLog
         self.paths = paths or Paths()
-        doc = read_json(self.paths.client, None) or {}
-        from lscli.config import DEFAULTS, client_document
-        doc = {**client_document(DEFAULTS), **doc}
+        doc = {**client_document(DEFAULTS), **(read_json(self.paths.client, None) or {})}
         self.settings, self.search, self.doc = doc["client"], doc["search"], doc
-        self.env_id = envs.env_id(sys.executable)
+        self.env_id = _env_id(self.paths)
         self.env_extra = {**(doc.get("env_extra") or {}), "env_id": self.env_id}
         self.log = UsageLog(self.paths, self.env_id)
-        self.device = None                                   # torch device index of the daemon's GPU (None: unknown)
-        uuid = doc.get("gpu_uuid")
-        if uuid and torch.cuda.is_available():
-            for i in range(torch.cuda.device_count()):
-                if str(getattr(torch.cuda.get_device_properties(i), "uuid", "")) in (uuid, uuid.removeprefix("GPU-")):
-                    self.device = i
-        elif torch.cuda.is_available() and torch.cuda.device_count() == 1 and not uuid:
-            self.device = 0                                  # no daemon has written the GPU yet: the only one
+        self.device = _UNSET                                 # torch index of the daemon's GPU, resolved at first use
         self.wc = None
         self._wc_mtime = None
         self._wc_checked = 0.0
         self._last_flush = time.monotonic()
         self.runs: dict[tuple, tuple] = {}                   # shape -> (backend | None for torch, table has an entry)
+        self.deciding: set = set()
         self.queued: set = set()
         self.disabled: set = set()
         self.inline_tried: set = set()
         self.inline_ok = True                                # False after the first failure (no lightgbm / models here)
+        self.ranker = None
         self.profile = None
+
+    # ------------------------------------------------------------------ device
+    def _resolve_device(self):
+        """The torch device index whose UUID is the daemon's GPU (None: not this process's GPU / no daemon yet with
+        several GPUs). Called at the first in-scope CUDA call, when CUDA is initialized already."""
+        uuid = self.doc.get("gpu_uuid")
+        n = torch.cuda.device_count()
+        if not uuid:
+            return 0 if n == 1 else None
+        want = uuid.removeprefix("GPU-")
+        for i in range(n):
+            if str(getattr(torch.cuda.get_device_properties(i), "uuid", "")).removeprefix("GPU-") == want:
+                return i
+        return None
 
     # ------------------------------------------------------------------ winner table
     def _cache(self):
+        """The table, reloaded (under the lock, swapped atomically) when the file changed; checked at most once a second."""
         now = time.monotonic()
-        if now - self._wc_checked < 1.0 and self.wc is not None:
+        if self.wc is not None and now - self._wc_checked < 1.0:
             return self.wc
-        self._wc_checked = now
-        try:
-            m = self.paths.winners.stat().st_mtime_ns
-        except FileNotFoundError:
-            m = None
-        if self.wc is None or m != self._wc_mtime:
-            from tune.winner_cache import WinnerCache
-            from lscli.worker import environment
-            if self.wc is None:
-                self.wc = WinnerCache(self.paths.winners, env=environment(self.env_extra))
-            else:
-                self.wc.reload()
-            self._wc_mtime = m
-            self.runs = {k: v for k, v in self.runs.items() if k in self.disabled}  # re-decide with the new table
+        with _LOCK:
+            if self.wc is not None and now - self._wc_checked < 1.0:
+                return self.wc
+            self._wc_checked = now
+            try:
+                m = self.paths.winners.stat().st_mtime_ns
+            except OSError:
+                m = None
+            if self.wc is None or m != self._wc_mtime:
+                if self.wc is None:
+                    from lscli.worker import environment
+                    from tune.winner_cache import WinnerCache
+                    self.wc = WinnerCache(self.paths.winners, env=environment(self.env_extra))
+                else:
+                    self.wc.reload()
+                self._wc_mtime = m
+                self.runs = {k: v for k, v in dict(self.runs).items() if k in self.disabled}  # re-decide the rest
         return self.wc
 
     def _queue(self, key, reason: str) -> None:
@@ -114,38 +175,39 @@ class _Client:
             return
         self.queued.add((key, reason))
         try:
-            from lscli import search_queue as queue
-            queue.request(self.paths, key[0], key[1], key[2], key[3], self.env_id, reason)
+            from lscli import search_queue
+            search_queue.request(self.paths, key[0], key[1], key[2], key[3], self.env_id, reason)
         except OSError as e:
             warnings.warn(f"lscli: could not queue {key}: {e}")
 
     def _frequent_calls(self, key) -> float:
+        from lscli import usage
         if self.profile is None:
-            from lscli import usage
-            self.profile = (usage.load(self.paths), usage.lookup(usage.load(self.paths)))
+            prof = usage.load(self.paths)
+            self.profile = (prof, usage.lookup(prof))
         prof, look = self.profile
         s = look.get((*key, "NN"))
-        from lscli.usage import calls_now
-        return calls_now(prof, s) if s else 0.0
+        return usage.calls_now(prof, s) if s else 0.0
 
     def _inline(self, key, dtype):
-        """select_kernel for a frequent shape, once per process; None when it cannot run here."""
+        """select_kernel for a frequent shape, once per process per shape; None when it cannot run here."""
         self.inline_tried.add(key)
-        if not self.inline_ok:
+        if not self.inline_ok or not self.settings.get("inline_search"):
             return None
         try:
             calls = self._frequent_calls(key)
-            if not self.settings.get("inline_search") or calls < self.search["frequent_calls"]:
+            if calls < self.search["frequent_calls"]:
                 return None
             stem = (self.doc.get("models") or {}).get("triton")
             if not stem:
                 return None
-            from analysis.learned import Ranker
+            if self.ranker is None:
+                from analysis.learned import Ranker
+                self.ranker = Ranker.load(stem)
             from tune.online import KPolicy, select_kernel
             pol = KPolicy(self.search["k"], self.search["k_frequent"], self.search["frequent_calls"])
-            sel = select_kernel(Ranker.load(stem), *key[:3], calls=int(calls), policy=pol, lt_n=self.search["lt_n"],
-                                dtype=dtype, cache=self._cache(), use_bundle=False, serve_stale=True)
-            self.wc.reload()
+            sel = select_kernel(self.ranker, *key[:3], calls=int(calls), policy=pol, lt_n=self.search["lt_n"],
+                                dtype=dtype, cache=self.wc, use_bundle=False, serve_stale=True)
             return self.wc.get(*key, k=1, lt_n=0, allow_stale=True) if sel.get("choice") else None
         except Exception as e:                       # lightgbm / models missing in this env: behave as a miss
             self.inline_ok = False
@@ -153,8 +215,7 @@ class _Client:
             return None
 
     def _decide(self, key, dtype) -> tuple:
-        """(backend to dispatch | None for torch, whether the table had a usable entry). Called once per shape (and
-        again after the table changed on disk)."""
+        """(backend to dispatch | None for torch, whether the table had a usable entry)."""
         wc = self._cache()
         e = wc.get(*key, k=1, lt_n=0, allow_stale=True)
         if e is None and key not in self.inline_tried:
@@ -169,8 +230,13 @@ class _Client:
             return None, False
         if e["stale"]:
             if not e["verified"]:
+                M, N, K = key[:3]
+                need = 2 * (M * K + K * N) + 6 * M * N + 4 * (M * K + K * N)   # inputs, output, fp32 reference
+                if need > VERIFY_MAX_BYTES:
+                    self._queue(key, "stale")         # too big to check inside the user's job: torch until re-searched
+                    return None, True
                 from tune.correctness import validate
-                if not validate(b, key[0], key[1], key[2], dtype).valid:
+                if not validate(b, M, N, K, dtype).valid:
                     self._queue(key, "miss")
                     return None, False
                 wc.mark_verified(e)
@@ -178,10 +244,6 @@ class _Client:
         return (b if dispatch_rule(e, self.settings) else None), True
 
     # ------------------------------------------------------------------ per call
-    def maybe_flush(self) -> None:
-        if time.monotonic() - self._last_flush > FLUSH_S:
-            self.flush()
-
     def flush(self) -> None:
         self._last_flush = time.monotonic()
         try:
@@ -189,35 +251,64 @@ class _Client:
         except OSError:
             pass
 
-    def matmul(self, orig, a, b):
-        """The dispatcher; `orig` is the original torch function for this entry point."""
-        if (type(a) is not torch.Tensor or type(b) is not torch.Tensor or a.ndim != 2 or b.ndim != 2
-                or not a.is_cuda or a.dtype not in _DTYPES or b.dtype is not a.dtype or not b.is_cuda):
-            return orig(a, b)
+    def _route(self, a, b):
+        """The backend for this call, or None for torch. Raises only on unexpected errors (the caller uses torch)."""
+        if (torch.compiler.is_compiling() or type(a) not in _PLAIN or type(b) not in _PLAIN or a.ndim != 2
+                or b.ndim != 2 or not a.is_cuda or not b.is_cuda or a.dtype not in _DTYPES or b.dtype is not a.dtype):
+            return None
         M, K = a.shape
         K2, N = b.shape
         if K != K2 or not (0 < M <= MAX_DIM and 0 < N <= MAX_DIM and 0 < K <= MAX_DIM):
-            return orig(a, b)
-        if (self.device is None or a.device.index != self.device or b.device.index != self.device
-                or not a.is_contiguous() or not b.is_contiguous() or a.data_ptr() % 16 or b.data_ptr() % 16
-                or torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing()):
-            return orig(a, b)
+            return None
+        if not a.is_contiguous() or not b.is_contiguous() or _functorch_wrapped(a) or _functorch_wrapped(b):
+            return None                                      # (functorch first: data_ptr raises on wrapped tensors)
+        if a.data_ptr() % 16 or b.data_ptr() % 16:
+            return None
+        if self.device is _UNSET:
+            self.device = self._resolve_device()
+        dev = a.device.index
+        if (self.device is None or dev != self.device or b.device.index != dev or torch._C._cuda_getDevice() != dev
+                or torch._C._cuda_isCurrentStreamCapturing() or _autocast_on() or _forward_ad_active()):
+            return None
         key = (M, N, K, _DTYPES[a.dtype])
         if time.monotonic() - self._wc_checked >= 1.0:
             self._cache()                                    # picks up winners the daemon wrote since
-        try:
-            be, hit = self.runs[key]
-        except KeyError:
-            with _LOCK:
-                try:
-                    be, hit = self.runs[key] = (None, False) if key in self.disabled or not self.settings.get("dispatch") \
-                        else self._decide(key, a.dtype)
-                except Exception as e:
-                    warnings.warn(f"lscli: selection for {key} failed ({type(e).__name__}: {e}); using torch")
-                    self.disabled.add(key)
-                    be, hit = self.runs[key] = (None, False)
+        hit_be = self.runs.get(key)
+        if hit_be is None:
+            hit_be = self._decide_once(key, a.dtype)
+        be, hit = hit_be
         self.log.add(M, N, K, key[3], "NN", hit=hit)
-        self.maybe_flush()
+        if time.monotonic() - self._last_flush > FLUSH_S:
+            self.flush()
+        return be
+
+    def _decide_once(self, key, dtype) -> tuple:
+        with _LOCK:
+            if key in self.runs:
+                return self.runs[key]
+            if key in self.deciding:                         # another thread is deciding: torch for this call
+                return None, False
+            if key in self.disabled or not self.settings.get("dispatch"):
+                self.runs[key] = (None, False)
+                return self.runs[key]
+            self.deciding.add(key)
+        try:
+            out = self._decide(key, dtype)
+        except Exception as e:
+            warnings.warn(f"lscli: selection for {key} failed ({type(e).__name__}: {e}); using torch")
+            self.disabled.add(key)
+            out = (None, False)
+        with _LOCK:
+            self.deciding.discard(key)
+            self.runs[key] = out
+        return out
+
+    def matmul(self, orig, a, b):
+        """The dispatcher; `orig` is the original torch function for this entry point."""
+        try:
+            be = self._route(a, b)
+        except Exception:
+            be = None
         if be is None:
             return orig(a, b)
         try:
@@ -225,38 +316,34 @@ class _Client:
                 return _Mm.apply(a, b, lambda x, y: be.make_runner(x, y)())
             return be.make_runner(a, b)()
         except Exception as e:
+            key = (a.shape[0], b.shape[1], a.shape[1], _DTYPES[a.dtype])
             warnings.warn(f"lscli: kernel for {key} failed ({type(e).__name__}: {e}); using torch for it")
             self.disabled.add(key)
             self.runs[key] = (None, False)
             return orig(a, b)
 
-    def linear(self, x, w, bias=None):
+    def count_linear(self, args, kw) -> None:
         try:
-            if type(x) is torch.Tensor and x.is_cuda and x.dtype in _DTYPES and w.ndim == 2:
-                M = x.numel() // x.shape[-1] if x.ndim else 1
-                self.log.add(M, w.shape[0], w.shape[1], _DTYPES[x.dtype], "NT")
-                self.maybe_flush()
+            x = args[0] if args else kw.get("input")
+            w = args[1] if len(args) > 1 else kw.get("weight")
+            if isinstance(x, torch.Tensor) and isinstance(w, torch.Tensor) and x.is_cuda and x.dtype in _DTYPES \
+                    and w.ndim == 2 and x.ndim >= 1 and not torch.compiler.is_compiling():
+                self.log.add(x.numel() // max(x.shape[-1], 1), w.shape[0], w.shape[1], _DTYPES[x.dtype], "NT")
+                if time.monotonic() - self._last_flush > FLUSH_S:
+                    self.flush()
         except Exception:
             pass
-        return _ORIG["linear"](x, w, bias)
-
-
-def dispatch_rule(entry: dict, settings: dict) -> bool:
-    """Spec 5.3 step 6: dispatch only kernels where torch takes >= min_kernel_us (below that the Python-side launch costs
-    as much as the kernel) and the winner saves >= max(min_saving_us, 2 %) (the study's tie margin). An entry without
-    `torch_us` (written outside lscli) is never dispatched."""
-    t, w = entry.get("torch_us"), entry.get("winner_us")
-    if t is None or w is None or t < settings["min_kernel_us"]:
-        return False
-    return t - w >= max(settings["min_saving_us"], 0.02 * t)
 
 
 def _reset_after_fork() -> None:
-    """A forked child (DataLoader worker) must not re-count or re-flush its parent's calls."""
+    """A forked child (DataLoader worker) must not re-count its parent's calls, nor inherit a lock another thread held."""
+    global _LOCK
+    _LOCK = threading.Lock()
     c = _STATE
     if c is not None:
         from lscli.usage import UsageLog
         c.log = UsageLog(c.paths, c.env_id)
+        c.deciding = set()
 
 
 def enabled() -> bool:
@@ -276,18 +363,26 @@ def enable(paths=None) -> bool:
                  t_rmatmul=torch.Tensor.__matmul__, linear=F.linear)
 
     def _wrap(orig):
-        def f(a, b, *args, **kw):
-            if args or kw:                                   # out= or anything unusual: not ours
-                return orig(a, b, *args, **kw)
-            return c.matmul(orig, a, b)
+        def f(*args, **kw):
+            if kw or len(args) != 2 or _STATE is not c:     # keywords (input=, out=, ...) or disabled: not ours
+                return orig(*args, **kw)
+            return c.matmul(orig, args[0], args[1])
         f.__wrapped__ = orig
+        f.__name__, f.__qualname__, f.__doc__ = orig.__name__, getattr(orig, "__qualname__", orig.__name__), orig.__doc__
         return f
+
+    def linear(*args, **kw):
+        if _STATE is c:
+            c.count_linear(args, kw)
+        return _ORIG["linear"](*args, **kw)
+    linear.__wrapped__ = _ORIG["linear"]
+    linear.__name__, linear.__doc__ = "linear", _ORIG["linear"].__doc__
     torch.matmul = _wrap(_ORIG["matmul"])
     torch.mm = _wrap(_ORIG["mm"])
     torch.Tensor.matmul = _wrap(_ORIG["t_matmul"])
     torch.Tensor.mm = _wrap(_ORIG["t_mm"])
     torch.Tensor.__matmul__ = _wrap(_ORIG["t_rmatmul"])
-    F.linear = lambda x, w, bias=None: c.linear(x, w, bias)
+    F.linear = linear
     _STATE = c
     atexit.register(_atexit)
     if not getattr(enable, "_fork_hooked", False):
