@@ -396,7 +396,7 @@ stage_validate_score() {
 
 # Stage 2: every pick re-timed with the full protocol in one session next to torch, the screen's best tiles, B2/B3, the ranker's own cuBLASLt
 # picks and B3+. `picks` writes the Triton picks file and the list of held-out shapes under 50 us (CPU).
-VAL_BACKENDS_TAIL="cublaslt:16,cublaslt_rank:5"
+VAL_BACKENDS_TAIL="cublaslt:16,cublaslt_rank:5:skip16"   # skip16: the same list the online search timed (else ranker picks have no stage-2 time)
 stage_validate_stage2_cold() {
   validated || { echo "skipped (--skip-validation)"; return; }
   zs picks --data "$DATA"

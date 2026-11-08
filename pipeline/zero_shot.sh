@@ -392,7 +392,7 @@ stage_picks() { zs picks --data "$DATA"; }
 # Stage 2: every pick re-timed with the full protocol in one session with B1, the screen's best tiles, B2/B3 and B3+.
 stage2_env() { export TUNE_SWEEP_DIR="$DATA/sweep_screen_heldout" TUNE_PICKS="$DATA/zero_shot_stage2_picks.json"; lt_env; }
 STAGE2_BACKENDS="torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:$DEEP_S"
-[[ "$LT_RANK" -gt 0 ]] && STAGE2_BACKENDS="torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_rank:$LT_RANK,cublaslt_deep:$DEEP_S"
+[[ "$LT_RANK" -gt 0 ]] && STAGE2_BACKENDS="torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_rank:$LT_RANK:skip16,cublaslt_deep:$DEEP_S"
 
 # One benchmark pass per cuBLASLt-ranker variant. `cublaslt_rank:M` expands to whatever the ranker in this process proposes, so a
 # zero-shot model needs one pass as_is and one native (the SM count differs, so may the picks); `benchmark` resumes per (shape,
