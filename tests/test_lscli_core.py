@@ -214,11 +214,18 @@ def test_pause_resume(paths):
 
 def test_status_without_and_with_a_daemon(paths, capsys):
     assert run("status") == 0 and "not running" in capsys.readouterr().out
-    write_json(paths.state, {"pid": os.getpid(), "state": "waiting", "since": time.time(),
-                             "gate": {"open": False, "reasons": ["outside window 01:00-07:00"]}})
-    assert run("--json", "status") == 0
-    doc = json.loads(capsys.readouterr().out)
-    assert doc["daemon"]["running"] and doc["daemon"]["gate"]["reasons"] == ["outside window 01:00-07:00"]
+    write_json(paths.state, {"pid": os.getpid(), "state": "waiting", "since": time.time()})
+    assert run("--json", "status") == 0                              # a live pid that is not lscli (pid reuse)
+    assert not json.loads(capsys.readouterr().out)["daemon"]["running"]
+    fake = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "lscli", "daemon", "run"])
+    try:
+        write_json(paths.state, {"pid": fake.pid, "state": "waiting", "since": time.time(),
+                                 "gate": {"open": False, "reasons": ["outside window 01:00-07:00"]}})
+        assert run("--json", "status") == 0
+        doc = json.loads(capsys.readouterr().out)
+        assert doc["daemon"]["running"] and doc["daemon"]["gate"]["reasons"] == ["outside window 01:00-07:00"]
+    finally:
+        fake.kill()
 
 
 # ---------------------------------------------------------------------------------------------- prewarm / profile / cache

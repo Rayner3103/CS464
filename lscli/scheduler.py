@@ -34,9 +34,10 @@ class Task:
     calls: float = 0.0
     reason: str = ""
     stage: str | None = None
+    t: float = 0.0                       # queue time of a request: equal-score requests go oldest first
 
     def __post_init__(self):
-        self.sort_key = (CLASSES[self.kind], -self.calls * t_est_s(self.M or 1, self.N or 1, self.K or 1))
+        self.sort_key = (CLASSES[self.kind], -self.calls * t_est_s(self.M or 1, self.N or 1, self.K or 1), self.t)
 
     @property
     def key(self) -> tuple:
@@ -67,7 +68,8 @@ def plan(cfg: dict, prof: dict, pending: list[dict], caches: dict, failures: dic
     for r in pending:
         key = (int(r["M"]), int(r["N"]), int(r["K"]), r["dtype"], r["env_id"])
         if key[4] in caches:
-            want.setdefault(key, {"calls": 0.0})["reason"] = r.get("reason", "miss")
+            w = want.setdefault(key, {"calls": 0.0})
+            w["reason"], w["t"] = r.get("reason", "miss"), r.get("t") or 0.0
     tasks = []
     for key, w in want.items():
         if failures.get(key, 0) >= MAX_FAILURES:
@@ -76,13 +78,17 @@ def plan(cfg: dict, prof: dict, pending: list[dict], caches: dict, failures: dic
         e = caches[key[4]].get(*key[:4], k=1, lt_n=0, allow_stale=True)
         kind = classify(e, need_k)
         if kind is not None:
-            tasks.append(Task(kind, *key[:4], env_id=key[4], k=need_k, calls=w["calls"], reason=w["reason"]))
+            tasks.append(Task(kind, *key[:4], env_id=key[4], k=need_k, calls=w["calls"], reason=w["reason"],
+                              t=w.get("t", 0.0)))
     return sorted(tasks)
 
 
-def satisfied(request: dict, caches: dict, failures: dict) -> bool:
-    """A queued request needs no more work: its env is gone, it failed out, or a current entry serves it."""
+def satisfied(request: dict, caches: dict, failures: dict, unknown: set = frozenset()) -> bool:
+    """A queued request needs no more work: its env is no longer registered, it failed out, or a current entry serves
+    it. An env that is registered but whose environment could not be probed yet (`unknown`) keeps its requests."""
     key = (int(request["M"]), int(request["N"]), int(request["K"]), request["dtype"], request["env_id"])
+    if key[4] in unknown:
+        return False
     if key[4] not in caches or failures.get(key, 0) >= MAX_FAILURES:
         return True
     e = caches[key[4]].get(*key[:4], k=1, lt_n=0, allow_stale=True)
