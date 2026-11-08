@@ -328,3 +328,72 @@ def test_select_kernel_serves_a_stale_entry_after_one_correctness_check(tmp_path
                                                     choice={"key": KEY, "family": "triton"})
     c = online.select_kernel(None, 65, 64, 64, cache=WinnerCache(p, env=ENV), serve_stale=True, **kw)
     assert not c["cached"] and len(fake_search) == 2                                       # failed the gate: searched
+
+
+def test_compact_keeps_an_older_wider_stale_search(tmp_path):
+    p = tmp_path / "w.jsonl"
+    WinnerCache(p, env={**ENV2, "driver": "590"}).put(8, 8, 8, "fp16", k=5, lt_n=16, choice={"key": "wide", "family": "triton"})
+    WinnerCache(p, env={**ENV2, "driver": "591"}).put(8, 8, 8, "fp16", k=3, lt_n=16, choice={"key": "narrow-old", "family": "triton"})
+    wc = WinnerCache(p, env=ENV2)
+    wc.put(8, 8, 8, "fp16", k=3, lt_n=16, choice={"key": KEY, "family": "triton"})
+    assert wc.compact() == {"before": 3, "after": 2}
+    assert wc.get(8, 8, 8, "fp16", k=5, lt_n=16, allow_stale=True)["choice"]["key"] == "wide"
+    assert wc.get(8, 8, 8, "fp16", k=3, lt_n=16)["choice"]["key"] == KEY
+
+
+def test_a_put_after_a_torn_line_is_not_glued_onto_it(tmp_path):
+    p = tmp_path / "w.jsonl"
+    p.write_text('{"schema": 2, "env"')
+    WinnerCache(p, env=ENV2).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})
+    assert WinnerCache(p, env=ENV2).get(8, 8, 8, "fp16")["choice"]["key"] == KEY
+
+
+def test_parseable_lines_missing_key_fields_are_skipped(tmp_path):
+    p = tmp_path / "w.jsonl"
+    p.write_text(json.dumps({"schema": 2, "env": ENV2, "M": 8}) + "\n")
+    wc = WinnerCache(p, env=ENV2)
+    assert len(wc) == 0 and wc.compact() == {"before": 1, "after": 0}
+
+
+def test_a_triton_winner_stored_without_a_family_is_still_hard_on_kernel_source(tmp_path):
+    p = tmp_path / "w.jsonl"
+    WinnerCache(p, env=ENV2).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": KEY})          # family None
+    assert WinnerCache(p, env={**ENV2, "kernel_src": "bbbb"}).get(8, 8, 8, "fp16", allow_stale=True) is None
+
+
+def test_mark_verified_writes_one_line_per_entry_and_environment(tmp_path):
+    p = tmp_path / "w.jsonl"
+    WinnerCache(p, env={**ENV2, "driver": "590"}).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})
+    wc = WinnerCache(p, env=ENV2)
+    hit = wc.get(8, 8, 8, "fp16", allow_stale=True)
+    wc.mark_verified(hit)
+    wc.mark_verified(hit)
+    wc.mark_verified(wc.get(8, 8, 8, "fp16", allow_stale=True))
+    assert len(p.read_text().splitlines()) == 2
+
+
+def _writer(path, start, n):
+    wc = WinnerCache(path, env=ENV2)
+    for i in range(start, start + n):
+        wc.put(i, 8, 8, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})
+
+
+def _compactor(path, n):
+    wc = WinnerCache(path, env=ENV2)
+    for _ in range(n):
+        wc.compact()
+
+
+def test_concurrent_puts_and_compactions_lose_nothing(tmp_path):
+    import multiprocessing as mp
+    p = tmp_path / "w.jsonl"
+    ctx = mp.get_context("spawn")
+    procs = [ctx.Process(target=_writer, args=(p, s, 60)) for s in (1000, 2000)]
+    procs += [ctx.Process(target=_compactor, args=(p, 40)) for _ in range(2)]
+    for x in procs:
+        x.start()
+    for x in procs:
+        x.join(60)
+        assert x.exitcode == 0
+    wc = WinnerCache(p, env=ENV2)
+    assert len(wc) == 120 and not list(tmp_path.glob("*.tmp-*"))

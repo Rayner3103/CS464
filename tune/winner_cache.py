@@ -101,7 +101,7 @@ def tier(row: dict, env: dict) -> tuple[str, list[str]]:
     """("current" | "soft" | "hard", differing fields) of a stored line against the environment `env`."""
     row_env = row.get("env") or {}
     fields = stale_fields(row_env, env)
-    family = (row.get("choice") or {}).get("family", "triton")
+    family = (row.get("choice") or {}).get("family") or "triton"
     # A field the line does not carry (written before it existed) is unknown, not changed: soft, never hard.
     if any(f in row_env and (f in HARD_FIELDS or (f in TRITON_HARD_FIELDS and family == "triton")) for f in fields):
         return "hard", fields
@@ -144,8 +144,10 @@ class WinnerCache:
                 r = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(r, dict) and r.get("schema") in READS:
-                yield r, line
+            if not isinstance(r, dict) or r.get("schema") not in READS:
+                continue
+            if r.get("kind") == "verified" or all(x in r for x in ("M", "N", "K", "dtype", "k", "lt_n")):
+                yield r, line                 # an entry missing its key fields is unusable: skipped like a torn line
 
     def reload(self) -> None:
         """(Re)read the file; hard-stale lines (another GPU, changed kernel source) and unreadable lines are skipped."""
@@ -186,7 +188,8 @@ class WinnerCache:
             lt_rank: int = 0, allow_stale: bool = False) -> dict | None:
         """The stored entry if its search was at least as wide as (k, lt_n, lt_knn, lt_rank), else None (entries written
         before the kNN proposals / the cuBLASLt ranker existed have lt_knn / lt_rank 0). A current entry is preferred; with
-        allow_stale a soft-stale one is returned when no current one is wide enough. The returned copy carries `stale` (the
+        allow_stale a soft-stale one is returned when no current one is wide enough (so a wider stale search can be served
+        where `allow_stale=False` would re-search; the caller queues the re-search). The returned copy carries `stale` (the
         differing fields, [] when current) and `verified` (True when current, or when `mark_verified` ran for it in this
         environment)."""
         tiers = self._rows.get(self._key(M, N, K, dtype), {})
@@ -200,24 +203,33 @@ class WinnerCache:
         """The soft-stale entries of shapes with no current entry: what an idle-time re-search should redo."""
         return [self._out(v["soft"]) for v in self._rows.values() if "soft" in v and "current" not in v]
 
-    def _append(self, row: dict) -> None:
-        """Append one fsync'd line under the file lock. If `compact` replaced the file while this writer waited for the
-        lock, the handle points at the old (unlinked) file: reopen and write to the new one."""
+    def _locked(self, mode: str):
+        """Open the file and take the exclusive lock, re-opening when `compact` replaced it while this process waited
+        (the handle would point at the old, unlinked file). Returns the open, locked file; closing it releases the lock."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(row) + "\n"
-        for _ in range(10):
-            with open(self.path, "a") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                try:
-                    if os.fstat(f.fileno()).st_ino != os.stat(self.path).st_ino:
-                        continue
-                except FileNotFoundError:
-                    continue
-                f.write(line)
-                f.flush()
-                os.fsync(f.fileno())
-                return
-        raise OSError(f"{self.path}: kept being replaced while appending")
+        for _ in range(20):
+            f = open(self.path, mode)
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                if os.fstat(f.fileno()).st_ino == os.stat(self.path).st_ino:
+                    return f
+            except FileNotFoundError:
+                pass
+            f.close()
+        raise OSError(f"{self.path}: kept being replaced while waiting for its lock")
+
+    def _append(self, row: dict) -> None:
+        """Append one fsync'd line under the file lock. A torn last line (a crash mid-write) is terminated first, so the
+        new line is not glued onto it."""
+        with self._locked("a+b") as f:
+            f.seek(0, os.SEEK_END)
+            torn = False
+            if f.tell() > 0:
+                f.seek(-1, os.SEEK_END)
+                torn = f.read(1) != b"\n"
+            f.write((b"\n" if torn else b"") + (json.dumps(row) + "\n").encode())
+            f.flush()
+            os.fsync(f.fileno())
 
     def put(self, M: int, N: int, K: int, dtype: str, *, k: int, lt_n: int, choice: dict, candidates: list[dict] | None = None,
             order: str | None = None, ranker: str | None = None, lt_knn: int = 0, lt_rank: int = 0) -> dict | None:
@@ -239,7 +251,7 @@ class WinnerCache:
     def mark_verified(self, entry: dict) -> None:
         """Record that a (soft-stale) entry passed the correctness gate in the current environment, so it is not
         re-checked by this or a later process with the same environment."""
-        if entry.get("verified") and not entry.get("stale"):
+        if not entry.get("stale") or entry["id"] in self._verified:
             return
         self._append({"schema": SCHEMA, "kind": "verified", "id": entry["id"], "env": self.env, "timestamp": time.time()})
         self._verified.add(entry["id"])
@@ -247,14 +259,15 @@ class WinnerCache:
     def compact(self) -> dict:
         """Rewrite the file without the lines a re-search made obsolete; returns {"before", "after"} line counts.
 
-        Per (shape, dtype, GPU): when a line is current in this environment, only the last current line stays (every
-        older line of that shape and GPU, stale or not, was re-searched); otherwise the last line per distinct
-        environment stays (soft-stale entries are kept until re-searched). Verification lines stay while their entry
-        does. Unreadable lines are dropped. Atomic (temp file + rename) under the writers' lock."""
+        Per (shape, dtype, GPU): the last line per distinct environment is a candidate. When a line is current in this
+        environment, the last current line stays and an older candidate stays only if its search was wider in some
+        dimension (k, lt_n, lt_knn, lt_rank), because `get(allow_stale=True)` can still serve it for a wider request;
+        otherwise every candidate stays (soft-stale entries are kept until re-searched). Verification lines stay while
+        their entry does. Unreadable lines are dropped. Atomic (temp file + rename) under the writers' lock; a
+        compactor that waited for the lock while another one replaced the file re-opens the new file."""
         if not self.path.exists():
             return {"before": 0, "after": 0}
-        with open(self.path, "a+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+        with self._locked("a+") as f:
             f.seek(0)
             lines = f.read().splitlines()
             entries, verified = [], []
@@ -263,24 +276,33 @@ class WinnerCache:
             groups: dict[tuple, list] = {}
             for i, (r, line) in enumerate(entries):
                 groups.setdefault((r["M"], r["N"], r["K"], r["dtype"], (r.get("env") or {}).get("hw_id")), []).append(i)
+            width = ("k", "lt_n", "lt_knn", "lt_rank")
             keep: set[int] = set()
             for idx in groups.values():
-                cur = [i for i in idx if tier(entries[i][0], self.env)[0] == "current"]
-                if cur:
-                    keep.add(cur[-1])
-                    continue
                 last: dict[str, int] = {}
                 for i in idx:
                     last[json.dumps(entries[i][0].get("env"), sort_keys=True)] = i
-                keep.update(last.values())
+                cur = [i for i in idx if tier(entries[i][0], self.env)[0] == "current"]
+                if not cur:
+                    keep.update(last.values())
+                    continue
+                c = entries[cur[-1]][0]
+                keep.add(cur[-1])
+                keep.update(i for i in last.values() if i != cur[-1] and tier(entries[i][0], self.env)[0] != "current"
+                            and any(entries[i][0].get(w, 0) > c.get(w, 0) for w in width))
             kept_ids = {_row_id(entries[i][0], entries[i][1]) for i in keep}
             out = [entries[i][1] for i in sorted(keep)] + [line for r, line in verified if r.get("id") in kept_ids]
-            tmp = self.path.with_name(self.path.name + f".tmp{os.getpid()}")
+            tmp = self.path.with_name(f"{self.path.name}.tmp-{uuid.uuid4().hex[:12]}")
             with open(tmp, "w") as g:
                 g.write("".join(x + "\n" for x in out))
                 g.flush()
                 os.fsync(g.fileno())
             os.replace(tmp, self.path)
+            d = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(d)                          # make the rename itself durable
+            finally:
+                os.close(d)
         self.reload()
         return {"before": len(lines), "after": len(out)}
 
@@ -293,7 +315,7 @@ def backend_for(choice: dict, M: int, N: int, K: int, dtype=None, lt_n: int = 16
     dtype = dtype or torch.float16
     if choice.get("key") is None:
         return None
-    if choice.get("family", "triton") == "triton":
+    if (choice.get("family") or "triton") == "triton":
         from kernels.triton_matmul import TritonMatmul
         from tune.sweep import parse_key
         return TritonMatmul(parse_key(choice["key"]))

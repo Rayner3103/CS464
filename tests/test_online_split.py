@@ -71,6 +71,12 @@ def test_search_shape_is_propose_then_measure(fakes):
     assert strip(part["candidates"]) == strip(full["candidates"])
     assert [c["config_key"] for c in full["candidates"]][:3] == KEYS and full["lt_rank"] == 2 and "lt_setup_s" in full
     assert not full["candidates"][1]["valid"] and "cold_us" not in full["candidates"][1]
+    # timing order of the original search_shape: without a router the Triton half is timed first, then cuBLASLt
+    log.clear()
+    online.search_shape(ranker, 64, 64, 64, 3, torch.float16, "diverse", lt_n=4, lt_rank=2)
+    benched = [x[1] for x in log if x[0] == "bench"]
+    assert benched[:2] == [KEYS[0], KEYS[2]] and benched[2].startswith("h0_") and benched[-1].startswith("r1_")
+    assert log[0] == ("rank", 3)                     # ranking happens after the cuBLASLt proposals, before any timing
 
 
 def test_a_router_skip_never_ranks_the_triton_half(fakes):
