@@ -169,3 +169,24 @@ def _converse(job, request, watch, answer, silence_s):
             return msg
         elif op == "error":
             raise JobError(msg.get("error", "unknown error"))
+
+
+def supervise(job: Job, *, watch: Callable[[Callable[[], set]], bool], poll_s: float = 1.0) -> int:
+    """Wait for a job that speaks no protocol (a training stage), calling `watch(tree_fn)` every poll; returns its exit
+    code or raises Preempted after killing its tree. Any other way out (an exception in `watch`, KeyboardInterrupt)
+    kills the tree too."""
+    try:
+        job.p.stdin.close()
+    except Exception:
+        pass
+    try:
+        while True:
+            try:
+                return job.p.wait(poll_s)
+            except subprocess.TimeoutExpired:
+                pass
+            if not watch(job.tree):
+                raise Preempted()
+    except BaseException:
+        job.kill()
+        raise

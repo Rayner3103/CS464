@@ -23,12 +23,14 @@ import sys
 import time
 from pathlib import Path
 
-from lscli import __version__, config, control, envs, gate, jobs, models, scheduler, usage
+from lscli import __version__, config, control, envs, gate, jobs, models, scheduler, training, usage
 from lscli import search_queue as queue
 from lscli.files import locked, read_json, write_json
 from lscli.paths import Paths
 
 TICK_S = 5.0
+GPU_REASONS = ("compute process", "GPU idle", "NVML unavailable")   # what a CPU-only training stage may ignore
+TRAIN_CHECK_S = 86400.0
 MERGE_EVERY_S = 60.0
 COMPACT_EVERY_S = 86400.0
 ENV_REFRESH_S = 86400.0
@@ -63,6 +65,7 @@ class Daemon:
         self.reasons: list[str] = ["starting"]
         self.identity: dict = {}
         self.hw_id: str | None = None
+        self.last_train_check = 0.0
         self.models: models.ModelSet | None = None
         self.log = logging.getLogger("lscli.daemon")
         self.counters = {"searches": 0, "preempted": 0, "failed": 0}
@@ -180,7 +183,8 @@ class Daemon:
             "backoff_until": self.backoff_until, "paused_until": ctl.get("paused_until") if control.paused(ctl) else None,
             "gpu": self.identity, "hw_id": self.hw_id,
             "models": {"source": self.models.source if self.models else None,
-                       "ids": self.models.ids() if self.models else None, **extra.get("models", {})},
+                       "ids": self.models.ids() if self.models else None,
+                       "training": training.Training(self.paths, self.hw_id).summary() if self.hw_id else None},
             "queue": {"pending": len(pend)}, "counters": self.counters, "updated": self.clock()})
 
     def set_state(self, s: str) -> None:
@@ -216,8 +220,88 @@ class Daemon:
         pend, _ = queue.pending(self.paths)
         tasks = scheduler.plan(self.cfg, usage.load(self.paths), pend, caches, self.failures, self.clock())
         if self.models is None or self.models.triton() is None:
-            return None
+            tasks = []                                       # nothing to rank with: only training can run
+        stage = self.training_stage()
+        if stage is not None:
+            tasks = sorted(tasks + [scheduler.Task("train", stage=stage)])
         return tasks[0] if tasks else None
+
+    # ------------------------------------------------------------------------------------------------ training
+    def training_stage(self) -> str | None:
+        """The next train_best stage to run, starting a training when one is needed (spec 4.5); None otherwise."""
+        if not self.cfg["train"]["enabled"] or not self.hw_id:
+            return None
+        tr = training.Training(self.paths, self.hw_id)
+        ctl = control.read_control(self.paths)
+        req = ctl.get("retrain")
+        if req and req.get("t") != tr.state.get("request_t"):
+            stages = [s for s in (req.get("stages") or training.STAGES) if s in training.STAGES]
+            change = {"first"} if not req.get("stages") else {"manual"}
+            tr.begin(change, stages if req.get("stages") else training.stages_for({"first"}, self._with_bundle()),
+                     self.daemon_env, "requested (lscli train retrain)")
+            tr.state["request_t"] = req.get("t")
+            tr.save()
+        elif not tr.active() and (tr.state.get("status") != "failed") and \
+                self.clock() - self.last_train_check >= TRAIN_CHECK_S:
+            self.last_train_check = self.clock()
+            ch = training.changes(training.trained_env(self.paths, self.hw_id), self.daemon_env)
+            if ch:
+                tr.begin(ch, training.stages_for(ch, self._with_bundle()), self.daemon_env,
+                         "no models for this GPU" if "first" in ch else "changed: " + ", ".join(sorted(ch)))
+        if not tr.active():
+            return None
+        stage = tr.next_stage()
+        if stage is None:                                    # every stage stamped: activate the new models
+            try:
+                training.activate(self.paths, self.hw_id, tr.run_dir, {k: self.daemon_env.get(k) for k in
+                                                                       ("triton", "cublaslt", "driver", "kernel_src", "torch")})
+                tr.finish()
+                ctl = control.read_control(self.paths)
+                if ctl.get("train_now"):
+                    control.write_control(self.paths, {**ctl, "train_now": False})
+                self.log.info("training run %s done: models activated", tr.state["run"])
+                self.load_models()
+            except OSError as e:
+                self.log.error("activating run %s failed: %s", tr.state["run"], e)
+                tr.state["status"] = "failed"
+                tr.save()
+            return None
+        return stage
+
+    def _with_bundle(self) -> bool:
+        """Build the kernel bundle only when some registered env runs the daemon venv's Triton (else no hit)."""
+        t = self.daemon_env.get("triton")
+        return bool(t) and any(e.get("triton") == t for e in envs.load(self.paths).values())
+
+    def run_training_stage(self, stage: str) -> None:
+        """One train_best stage as a supervised job (spec 4.5). Raises Preempted / JobError."""
+        from lscli.cli import source_dir
+        tr = training.Training(self.paths, self.hw_id)
+        run = tr.run_dir
+        src = source_dir(self.paths)
+        script = Path(os.environ.get("LSCLI_TRAIN_SCRIPT") or src / "pipeline" / "train_best.sh")
+        argv = ["bash", str(script)]
+        argv += ["--resume", str(run)] if (run / "mode").exists() else \
+            ["--run-dir", str(run), "--full" if self.cfg["train"]["mode"] == "full" else "--quick"]
+        mhz = self.cfg["clock"]["lock_mhz"]
+        argv += ["--skip-install", "--skip-validation", "--only", stage]
+        argv += ["--clock-lock", str(mhz)] if mhz else ["--clock-lock", "none", "--allow-unlocked"]
+        if "bundle" in tr.state.get("stages", []):
+            argv.append("--with-bundle")
+        env = {**os.environ, "PATH": f"{Path(self.python).parent}{os.pathsep}{os.environ.get('PATH', '')}"}
+        job = jobs.Job(argv, cwd=src, env=env, log=self._job_log(f"train-{stage}"))
+        try:
+            code = jobs.supervise(job, watch=lambda tree_fn: self._watch(tree_fn, stage))
+        except jobs.Preempted:
+            hw_data = run / "data" / (self.hw_id or "")
+            (hw_data / "inflight.json").unlink(missing_ok=True)   # our kill, not a crash of that candidate
+            raise
+        finally:
+            job.close()
+        if code != 0 or stage not in tr.done():
+            n = tr.record_failure(stage)
+            raise jobs.JobError(f"train_best stage {stage} failed (exit {code}, attempt {n})")
+        self.log.info("training stage %s done (run %s)", stage, tr.state["run"])
 
     def tick(self) -> scheduler.Task | None:
         """One iteration; returns the task it ran (None if it ran nothing)."""
@@ -228,6 +312,12 @@ class Daemon:
         self.reasons = self.gate_reasons()
         if self.backoff_until and self.clock() >= self.backoff_until:
             self.backoff_until = None
+        if self.reasons:                                   # a training stage may still run (spec 4.3 / `train start`)
+            stage = self.training_stage()
+            if stage is not None and not self._remaining(self.reasons, stage):
+                task = scheduler.Task("train", stage=stage)
+                self.run_task(task)
+                return task
         if self.reasons:
             self.set_state("backoff" if self.backoff_until else "paused" if any(r == "paused" for r in self.reasons)
                            else "waiting")
@@ -243,11 +333,23 @@ class Daemon:
         return task
 
     # ------------------------------------------------------------------------------------------------ jobs
-    def _watch(self, tree_fn) -> bool:
+    def _remaining(self, reasons: list[str], stage: str | None) -> list[str]:
+        """The reasons that still block a training stage: a CPU-only stage ignores GPU business, and after `lscli train
+        start` training ignores the time window (the rest of the gate still applies)."""
+        if stage is None:
+            return reasons
+        rest = list(reasons)
+        if stage in training.CPU_STAGES:
+            rest = [r for r in rest if not r.startswith(GPU_REASONS)]
+        if control.read_control(self.paths).get("train_now"):
+            rest = [r for r in rest if not r.startswith("outside window")]
+        return rest
+
+    def _watch(self, tree_fn, stage: str | None = None) -> bool:
         if self.stop:                                      # SIGTERM: end the job now, the clock reset still runs
             self.reasons = ["stopping"]
             return False
-        r = self.gate_reasons(own=lambda: tree_fn() | {os.getpid()})
+        r = self._remaining(self.gate_reasons(own=lambda: tree_fn() | {os.getpid()}), stage)
         if r:
             self.reasons = r
             self.log.info("preempting %s: %s", self.job_info, "; ".join(r))
@@ -265,10 +367,17 @@ class Daemon:
             self.log.warning("gpu.lock is held by another process; skipping this tick")
             return
         self.set_state("running")
-        self.job_info = {"kind": task.kind, "shape": [task.M, task.N, task.K], "dtype": task.dtype,
-                         "env_id": task.env_id, "k": task.k, "reason": task.reason, "started": self.clock()}
+        self.job_info = ({"kind": "train", "stage": task.stage, "started": self.clock()} if task.kind == "train" else
+                         {"kind": task.kind, "shape": [task.M, task.N, task.K], "dtype": task.dtype, "env_id": task.env_id,
+                          "k": task.k, "reason": task.reason, "started": self.clock()})
         self.write_state()
         try:
+            if task.kind == "train":
+                if task.stage not in training.CPU_STAGES:
+                    self.clock_lock("lock")
+                self.run_training_stage(task.stage)
+                self.counters["train_stages"] = self.counters.get("train_stages", 0) + 1
+                return
             self.clock_lock("lock")
             self.search(task)
             self.counters["searches"] += 1
@@ -279,7 +388,8 @@ class Daemon:
                 self.backoff_until = self.clock() + self.cfg["idle"]["backoff_minutes"] * 60
         except Exception as e:                             # JobError or anything unexpected: count it, never loop on it
             self.counters["failed"] += 1
-            self.failures[task.key] = self.failures.get(task.key, 0) + 1
+            if task.kind != "train":                       # a stage's failures are counted by the Training state
+                self.failures[task.key] = self.failures.get(task.key, 0) + 1
             self.log.warning("task %s failed: %s: %s", task, type(e).__name__, e)
         finally:
             self.clock_lock("reset")

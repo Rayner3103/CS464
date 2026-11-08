@@ -290,10 +290,11 @@ program first runs them.
 | Triton version or kernel source | `tune_sweep`, `heldout_sweep`, `selectors`, `train_v1`, `tail_sweep`, `train_v2`, `tune_stage2_cold`, `tune_stage2_graph`, `router_fit`, `bundle`, `package` |
 | driver only | none: every winner becomes soft-stale and is re-searched; `lscli train retrain` forces a full retraining |
 
-  A retraining runs in a **new** run directory `train/<hw_id>/<n+1>/`. The directory is seeded with hard links to the
-  previous run's outputs and stamps of the stages that are **not** re-run, so the stages that are re-run start empty.
-  Reusing the old directory would keep their old rows, because the stages resume per shape and `--only` skips
-  stamped stages.
+  A retraining runs in a **new** run directory `train/<hw_id>/<n+1>/`. The directory is seeded from the previous run
+  without the outputs and stamps of the stages that re-run, so those stages start empty. Reusing the old directory
+  would keep their old rows, because the stages resume per shape and `--only` skips stamped stages.
+  * Outputs of the stages that do **not** re-run are hard links: they are large and never written again.
+  * Every other file is copied, so the new run cannot change the old one through a shared inode.
 
 ### 4.6 Clock
 
