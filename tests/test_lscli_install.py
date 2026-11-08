@@ -260,6 +260,15 @@ def test_pack_zero_shot(tmp_path):
     # .tar.xz, and reproducible: the same models pack to the same bytes (a repack changes no committed byte)
     stems = {"triton": tmp_path / "tri", "lt_rank": tmp_path / "lt"}
     assert pack_zero_shot.pack(stems, "h", tmp_path / "a.tar.xz") == pack_zero_shot.pack(stems, "h", tmp_path / "b.tar.xz")
+    first = pack_zero_shot.pack(stems, "h", tmp_path / "a.tar.gz")
+    import time
+    time.sleep(1.1)                                    # a gzip header with the time in it would differ now
+    assert pack_zero_shot.pack(stems, "h", tmp_path / "other-name.tar.gz") == first
+    (tmp_path / "sub").mkdir()
+    for ext in (".txt", ".json"):
+        (tmp_path / "sub" / f"tri{ext}").write_text("other")
+    with pytest.raises(ValueError, match="two models"):
+        pack_zero_shot.pack({"triton": tmp_path / "tri", "router": tmp_path / "sub/tri"}, "h", tmp_path / "d.tar.xz")
     with tarfile.open(tmp_path / "a.tar.xz", "r:xz") as t:
         assert all(m.mtime == 0 and m.uid == 0 and m.isfile() for m in t.getmembers())
     with pytest.raises(ValueError):
@@ -284,6 +293,9 @@ def test_the_committed_zero_shot_set(tmp_path):
     for stem in ("lt_rank", "router"):                                   # the same models as the committed snapshot
         assert models.model_id(home.models / "zero_shot" / stem).split(":")[1] == models.model_id(snap / stem).split(":")[1]
     assert (home.models / "zero_shot/lgbm_rank_v2.json").read_bytes() == (snap / "lgbm_rank_v2.json").read_bytes()
+    import hashlib                                     # the 3080's rank v2 booster (not committed elsewhere: 35 MB)
+    assert hashlib.sha256((home.models / "zero_shot/lgbm_rank_v2.txt").read_bytes()).hexdigest() == \
+        "7d0ce7610c62af97a2b2c5ac772627869fac25ae0e9b5501729f3d637fbcf06c"
     same = models.active(home, "rtx3090_sm86_82sms_24gb")
     assert same.source == "zero_shot" and same.complete
     other = models.active(home, "rtx2060_sm75_30sms_6gb")

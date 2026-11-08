@@ -129,5 +129,9 @@ def test_no_ranker_is_a_cuBLASLt_only_search_stored_with_k0(fakes, tmp_path):
     assert e["k"] == 0 and e["ranker"] is None and wc.get(64, 64, 64, "fp16", k=1) is None   # a ranker search is wider
     again = online.select_kernel(online.LT_ONLY, 64, 64, 64, lt_n=4, lt_rank=0, lt_knn=0, cache=wc, use_bundle=False)
     assert again["cached"] and again["choice"]["key"] == r["choice"]["key"]
+    # defaults (lt_rank 5, lt_knn auto) are overridden: the heuristic alone, no proposals
+    online.select_kernel(online.LT_ONLY, 96, 64, 64, lt_n=4, cache=wc, use_bundle=False)
+    e = wc.get(96, 64, 64, "fp16", k=0)
+    assert e["k"] == 0 and e["lt_rank"] == 0 and e["lt_knn"] == 0
     none = online.select_kernel(online.LT_ONLY, 64, 64, 64, lt_n=0, cache=wc, use_bundle=False)
     assert none["choice"] is None and none["reason"] == "no_candidates"

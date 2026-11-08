@@ -202,13 +202,17 @@ def test_scheduler_without_a_triton_ranker_plans_cuBLASLt_only_searches():
                                (256, 256, 256, "fp16"): {"stale": ["models"], "k": 3}})}
     prof = {"updated": now, "half_life_days": 30, "shapes": [
         {"M": m, "N": m, "K": m, "dtype": "fp16", "layout": "NN", "calls": 10, "envs": ["e1"]} for m in (64, 128, 256, 512)]}
-    # no ranker: a k = 0 entry is enough; a miss is searched with k = 0; a superseded k = 3 entry stays superseded
+    # no ranker: a k = 0 entry is enough; a miss is searched with k = 0; a k = 3 entry is never re-searched narrower
     tasks = scheduler.plan(cfg, prof, [], caches, {}, now, triton=False)
-    assert [(t.kind, t.M, t.k) for t in tasks] == [("search", 512, 0), ("superseded", 128, 0), ("superseded", 256, 0)]
+    assert [(t.kind, t.M, t.k) for t in tasks] == [("search", 512, 0), ("superseded", 128, 0)]
+    pend = [{"M": 256, "N": 256, "K": 256, "dtype": "fp16", "env_id": "e1", "reason": "manual"}]
+    assert scheduler.plan(cfg, {"shapes": []}, pend, caches, {}, now, triton=False) == []
     assert scheduler.satisfied({"M": 64, "N": 64, "K": 64, "dtype": "fp16", "env_id": "e1"}, caches, {})
-    # a ranker arrives: cuBLASLt-only entries are widened (current or with only `models` stale) before re-ranks
+    assert not scheduler.satisfied(pend[0], caches, {})    # kept until a ranker can search it properly
+    # a ranker arrives: cuBLASLt-only entries are widened (current or with only `models` stale) before re-ranks;
+    # within a class the larger shape (calls x time estimate) goes first
     tasks = scheduler.plan(cfg, prof, [], caches, {}, now, triton=True)
-    assert [(t.kind, t.M, t.k) for t in tasks] == [("search", 512, 3), ("widen", 64, 3), ("widen", 128, 3),
+    assert [(t.kind, t.M, t.k) for t in tasks] == [("search", 512, 3), ("widen", 128, 3), ("widen", 64, 3),
                                                    ("superseded", 256, 3)]
     assert scheduler.classify({"stale": ["driver"], "k": 0}, 3) == "stale"
 
@@ -297,7 +301,7 @@ def test_miss_is_searched_by_the_daemon_and_then_dispatched(home):
 
 
 @requires_cuda
-def test_without_models_the_daemon_searches_cuBLASLt_alone(home, monkeypatch, tmp_path):
+def test_without_models_the_daemon_searches_cuBLASLt_alone(home, tmp_path):
     cfg = tmp_path / "c.toml"
     cfg.write_text(cfg.read_text() + '[train]\nenabled = false\n')            # no train_best run in a unit test
     envs.register(home, sys.executable)

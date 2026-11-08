@@ -116,6 +116,9 @@ preflight() {
   "$PYTHON" -c 'import os, sysconfig, sys; sys.exit(not os.path.exists(os.path.join(sysconfig.get_paths()["include"], "Python.h")))' \
     || die "the Python headers are missing for $PYTHON (e.g. apt install python3-dev); Triton needs them" 4
   "$PYTHON" -c 'import venv' 2>/dev/null || die "$PYTHON has no venv module (e.g. apt install python3-venv)" 4
+  "$PYTHON" -c 'import lzma' 2>/dev/null || die "$PYTHON has no lzma module (the zero-shot models are .tar.xz)" 4
+  "$PYTHON" -c 'import sys, tarfile; sys.exit(not hasattr(tarfile, "data_filter"))' \
+    || die "$PYTHON's tarfile has no extraction filters (needs 3.11.4 or later)" 4
   echo "GPU: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader -i 0); Python: $PYTHON"
 }
 preflight

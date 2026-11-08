@@ -399,7 +399,7 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
         the differing fields, so the caller can queue a re-search. Default False: a stale entry is a miss, as before.
 
     `ranker=LT_ONLY` (no Triton ranker for this GPU yet, e.g. lscli before any model set exists) searches cuBLASLt alone:
-    k = 0 whatever the policy, no router, and the entry is stored with k = 0, so a later search with a ranker is wider
+    k = 0 whatever the policy, no cuBLASLt proposals (lt_knn = lt_rank = 0), no router, and the entry is stored with k = 0, so a later search with a ranker is wider
     and replaces it. With lt_n = 0 too there is nothing to search: choice None, reason "no_candidates"."""
     import warnings
     bundle_serves = False
@@ -408,6 +408,9 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
         info = bundle.install()
         bundle_serves = bool(info.get("installed") and info.get("matches"))
     wc = _winner_cache(cache)
+    lt_only = ranker is LT_ONLY
+    if lt_only:
+        lt_knn = lt_rank = 0                        # the heuristic alone, as the lscli daemon searches without models
     if lt_n and lt_rank:
         from baselines.cublaslt_rank import ranker as _lt_ranker
         if _lt_ranker() is None:
@@ -417,7 +420,6 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
     if not lt_n:
         lt_knn = lt_rank = 0
     rt = None
-    lt_only = ranker is LT_ONLY
     if lt_n and not lt_only and (router is True or (router == "auto" and not bundle_serves)):
         from tune.router import router as _router
         rt = _router()
