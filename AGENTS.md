@@ -31,9 +31,11 @@ tune/        harness package and CLI (python -m tune ...)
   sweep.py       stage-1 screen of the full pruned Triton space (subprocess per shape, parallel compile)
   noise.py       noise-floor study and thermal-drift run
   profile.py     records the device kernel names that vendor backends launch
-  online.py      top-k + short online search with the saved Ranker (compile, validate, short-time, pick); `select_kernel` adds the winner cache and the kernel bundle
+  online.py      top-k + short online search with the saved Ranker (compile, validate, short-time, pick); `select_kernel` adds the winner cache and the kernel bundle.
+                 `search_shape` = `propose_lt` + `propose_triton` (ranking: needs the models / lightgbm) + `measure` (GPU half: needs no model);
+                 `proposal_keys` / `backends_from_keys` carry a proposal to a process running another interpreter
   router.py       cost-only family router: after the cuBLASLt pool is timed, skip the Triton half when P(Triton still wins) < threshold (LightGBM, `data/<hw>/router.*` or `reports/snapshot/lock1755/router.*`); on in `select_kernel` only when the bundle does not serve the Triton kernels
-  winner_cache.py per-shape winner cache: append-only JSONL, one searched shape per line, keyed by GPU + Triton + cuBLASLt + driver; `backend_for` turns a choice into a runnable backend
+  winner_cache.py per-shape winner cache: append-only JSONL (schema 2), one searched shape per line with the environment it was timed in; current / soft-stale / hard-stale tiers, `mark_verified`, `stale_entries`, `compact`; `backend_for` turns a choice into a runnable backend
 kernels/
   triton_matmul.py  parameterized Triton GEMM (MatmulConfig, EVEN_K specialization, deterministic split-K)
   config_space.py   SPACE (19,200 configs), static + shape pruning rules, HANDPICKED configs
@@ -165,6 +167,7 @@ Runbook (standalone version with the prerequisites, scoring and pitfalls: [`docs
 - **Bundle** (`kernels/bundle.py`, `kernels/bundle_build.py`, `docs/kernel_bundle.md`): the online search spends ~2/3 of its first-use cost compiling its top-k Triton configs (~0.13 s each). The bundle holds the compiled binary of every kernel the saved rankers can pick, so a fresh clone loads them instead.
   Triton's own cache cannot just be copied: its group files store absolute paths. `BundleCacheManager` (a `FileCacheManager` selected through `TRITON_CACHE_MANAGER`) looks in this machine's cache, then the read-only bundle, then lets Triton compile (into the user cache, never the repo). `select_kernel(use_bundle=True)` installs it; `tune online --fresh-cache`, `analysis.zero_shot` and the benchmark commands do not, so every measured compile cost stays a true first use.
 - **Winner cache** (`tune/winner_cache.py`): `select_kernel(cache=True)` returns the stored winner of an earlier search at least as wide (k and lt_n) with no ranking, compiling or timing, and stores the winner of every search it runs. Default file `data/<hw>/winner_cache.jsonl` (`TUNE_WINNER_CACHE=<path>` moves it, `=off` disables it). The experiments pass `cache=None`.
+  Each line carries its environment (GPU, Triton, torch, CUDA runtime, cuBLASLt, driver, VBIOS, Triton kernel source hash, declared clock lock, optional model ids). Another GPU, or a changed kernel source for a Triton winner, is **hard-stale** (never served); any other difference is **soft-stale**: a miss by default, served by `select_kernel(serve_stale=True)` after one correctness check in the new environment (`mark_verified`), with `reason: "cached_stale"` so the caller can queue a re-search. `compact()` drops lines a current-environment search replaced.
 
 ### Baselines (plan §4.1)
 B0 roofline · B1 torch.matmul · B2 cuBLASLt heuristic top-1 · B3 best of the heuristic top-N · **B3+** best of B3 and a
@@ -330,7 +333,7 @@ Full training of the shipped selector on another GPU (rank v1 + v2, cuBLASLt ran
 - One GPU's model (3080), refused on another `hw_id` (warns once; the search then runs both halves). Only useful when the Triton kernels compile for real; it skips ~16% of shapes at the rule threshold 0.02 on the held-out set. The cuBLASLt half is timed before Triton, which changes the timing order: always run it with `confirm` (select_kernel does). A skipped shape's winner is cuBLASLt and is what the winner cache stores. Zero-shot on another GPU only with `TUNE_ROUTER_FOREIGN=1` (+ `TUNE_ROUTER_SMS=native`); retraining needs that GPU's whole tune stage 2, so it is a transfer test (runbook section 6b).
 
 **Winner cache** (`tune/winner_cache.py`):
-- Entries are per machine and per environment (GPU id, Triton, cuBLASLt version, driver); a different environment ignores them (they stay in the file). Nothing is shared across GPUs.
-- Nothing expires: a winner is reused until the environment changes, a wider search is requested for that shape, or the file is deleted. A stored winner is the fastest of one short online timing (10 cold samples, one placement, no tie margin), so near-ties are as arbitrary as in `choose`.
+- Entries are per machine and per environment (schema 2: GPU id, Triton, torch, CUDA runtime, cuBLASLt version, driver, VBIOS, kernel source hash, declared clock lock, optional model ids). A soft-stale entry is a miss unless `serve_stale=True`; a hard-stale one (other GPU; Triton winner of other kernel source) is never served. Schema 1 lines (4-field environment) read as soft-stale, so the first lookup after upgrading re-searches once. Lines stay in the file until `compact()`. Nothing is shared across GPUs.
+- Nothing expires by age: a winner is reused until the environment changes, a wider search is requested for that shape, or the file is deleted. A stored winner is the fastest of one short online timing (10 cold samples, one placement, no tie margin), so near-ties are as arbitrary as in `choose`.
 - A cuBLASLt winner is a heuristic key; if the library no longer returns it the entry is a miss and the shape is searched again.
 - A cache hit returns no `candidates` and `rank_s = 0`; callers that read the candidate list (experiments) must pass `cache=None`.

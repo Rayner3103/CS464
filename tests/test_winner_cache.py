@@ -219,3 +219,112 @@ def test_router_is_on_only_when_the_bundle_does_not_serve_the_kernels(tmp_path, 
     monkeypatch.setattr(bundle, "install", lambda *a, **k: {"installed": True, "matches": True})
     online.select_kernel(None, 64, 64, 69, cache=None, router=True, **kw)          # forced on even with a serving bundle
     assert fake_search.router[-1] is rt
+
+
+# ---------------------------------------------------------------------------------------------- schema 2: staleness tiers
+
+ENV2 = {**ENV, "torch": "2.13.0", "cuda_runtime": "13.0", "vbios": "94.02", "kernel_src": "aaaa", "clock_lock": "1755"}
+LT_CHOICE = {"key": "h0_a1_t2_s3_sk1_r0_sw0_c0", "family": "cublaslt"}
+
+
+def test_soft_stale_entry_is_served_only_when_asked(tmp_path):
+    p = tmp_path / "w.jsonl"
+    WinnerCache(p, env=ENV2).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})
+    for field, v in (("driver", "600"), ("torch", "2.14.0"), ("triton", "3.8.0"), ("cuda_runtime", "13.1"),
+                     ("cublaslt", 130100), ("vbios", "94.03"), ("clock_lock", "unlocked"), ("models", {"v2": "x"})):
+        wc = WinnerCache(p, env={**ENV2, field: v})
+        assert wc.get(8, 8, 8, "fp16") is None and len(wc) == 0, field          # default: a stale entry is a miss
+        hit = wc.get(8, 8, 8, "fp16", allow_stale=True)
+        assert hit["choice"]["key"] == KEY and hit["stale"] == [field] and hit["verified"] is False, field
+        assert [e["choice"]["key"] for e in wc.stale_entries()] == [KEY]
+    cur = WinnerCache(p, env=ENV2).get(8, 8, 8, "fp16")
+    assert cur["stale"] == [] and cur["verified"] is True
+
+
+def test_hard_stale_entries_are_never_served(tmp_path):
+    p = tmp_path / "w.jsonl"
+    WinnerCache(p, env=ENV2).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})
+    WinnerCache(p, env=ENV2).put(9, 9, 9, "fp16", k=3, lt_n=4, choice=LT_CHOICE)
+    other_gpu = WinnerCache(p, env={**ENV2, "hw_id": "gpu-b"})
+    assert other_gpu.get(8, 8, 8, "fp16", allow_stale=True) is None and other_gpu.get(9, 9, 9, "fp16", allow_stale=True) is None
+    new_src = WinnerCache(p, env={**ENV2, "kernel_src": "bbbb"})
+    assert new_src.get(8, 8, 8, "fp16", allow_stale=True) is None                 # a Triton key now names other code
+    assert new_src.get(9, 9, 9, "fp16", k=3, lt_n=4, allow_stale=True)["stale"] == ["kernel_src"]  # cuBLASLt: unaffected
+
+
+def test_undeclared_fields_are_not_compared_and_schema1_lines_are_soft(tmp_path):
+    p = tmp_path / "w.jsonl"
+    p.write_text(json.dumps({"schema": 1, "env": ENV, "M": 8, "N": 8, "K": 8, "dtype": "fp16", "k": 3, "lt_n": 0,
+                             "choice": {"key": KEY, "family": "triton"}}) + "\n")
+    wc = WinnerCache(p, env=ENV2)
+    hit = wc.get(8, 8, 8, "fp16", allow_stale=True)
+    assert wc.get(8, 8, 8, "fp16") is None and set(hit["stale"]) == {"torch", "cuda_runtime", "vbios", "kernel_src", "clock_lock"}
+    assert hit["id"]                                                               # derived from the line
+    assert WinnerCache(p, env={**ENV2, "torch": None, "cuda_runtime": None, "vbios": None, "kernel_src": None,
+                                  "clock_lock": None}).get(8, 8, 8, "fp16")["stale"] == []
+
+
+def test_current_entry_wins_over_a_wider_stale_one_only_when_wide_enough(tmp_path):
+    p = tmp_path / "w.jsonl"
+    WinnerCache(p, env={**ENV2, "driver": "590"}).put(8, 8, 8, "fp16", k=5, lt_n=16, choice={"key": "old", "family": "triton"})
+    wc = WinnerCache(p, env=ENV2)
+    wc.put(8, 8, 8, "fp16", k=3, lt_n=16, choice={"key": KEY, "family": "triton"})
+    assert wc.get(8, 8, 8, "fp16", k=3, lt_n=16, allow_stale=True)["choice"]["key"] == KEY
+    assert wc.get(8, 8, 8, "fp16", k=5, lt_n=16, allow_stale=True)["choice"]["key"] == "old"
+    assert wc.get(8, 8, 8, "fp16", k=5, lt_n=16) is None and wc.stale_entries() == []
+
+
+def test_mark_verified_persists_for_the_same_environment_only(tmp_path):
+    p = tmp_path / "w.jsonl"
+    WinnerCache(p, env={**ENV2, "driver": "590"}).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})
+    wc = WinnerCache(p, env=ENV2)
+    wc.mark_verified(wc.get(8, 8, 8, "fp16", allow_stale=True))
+    assert wc.get(8, 8, 8, "fp16", allow_stale=True)["verified"]
+    assert WinnerCache(p, env=ENV2).get(8, 8, 8, "fp16", allow_stale=True)["verified"]          # read back by a new process
+    assert not WinnerCache(p, env={**ENV2, "torch": "x"}).get(8, 8, 8, "fp16", allow_stale=True)["verified"]
+
+
+def test_compact_drops_re_searched_lines_and_keeps_unsearched_stale_ones(tmp_path):
+    p = tmp_path / "w.jsonl"
+    old = {**ENV2, "driver": "590"}
+    WinnerCache(p, env=old).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": "old8", "family": "triton"})
+    WinnerCache(p, env=old).put(9, 9, 9, "fp16", k=3, lt_n=0, choice={"key": "old9", "family": "triton"})
+    WinnerCache(p, env={**ENV2, "hw_id": "gpu-b"}).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": "b8", "family": "triton"})
+    wc = WinnerCache(p, env=ENV2)
+    wc.mark_verified(wc.get(9, 9, 9, "fp16", allow_stale=True))
+    wc.put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": "new8", "family": "triton"})      # 8^3 re-searched here
+    with open(p, "a") as f:
+        f.write('{"schema": 2, "env"')                                                    # torn line
+    assert wc.compact() == {"before": 6, "after": 4}
+    keys = [json.loads(x).get("choice", {}).get("key") for x in p.read_text().splitlines()]
+    assert keys == ["old9", "b8", "new8", None]                                       # None: the verification line
+    again = WinnerCache(p, env=ENV2)
+    assert again.get(8, 8, 8, "fp16")["choice"]["key"] == "new8"
+    assert again.get(9, 9, 9, "fp16", allow_stale=True)["verified"]
+    wc.put(10, 10, 10, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})        # writers still append after the rename
+    assert WinnerCache(p, env=ENV2).get(10, 10, 10, "fp16") is not None
+
+
+def test_select_kernel_serves_a_stale_entry_after_one_correctness_check(tmp_path, fake_search, monkeypatch):
+    p = tmp_path / "w.jsonl"
+    WinnerCache(p, env={**ENV, "driver": "590"}).put(64, 64, 64, "fp16", k=3, lt_n=4, lt_rank=5,
+                                                     choice={"key": KEY, "family": "triton"})
+    checks = []
+
+    class Ok:
+        def __init__(self, v):
+            self.valid = v
+    monkeypatch.setattr(online, "validate", lambda b, *a, **k: checks.append(b) or Ok(True))
+    monkeypatch.setattr("baselines.cublaslt_rank.ranker", lambda stem=None: object())
+    kw = dict(use_bundle=False, lt_n=4)
+    assert not online.select_kernel(None, 64, 64, 64, cache=WinnerCache(p, env=ENV), **kw)["cached"]  # default: a miss
+    p.write_text(p.read_text().splitlines()[0] + "\n")                                     # forget that re-search
+    a = online.select_kernel(None, 64, 64, 64, cache=WinnerCache(p, env=ENV), serve_stale=True, **kw)
+    b = online.select_kernel(None, 64, 64, 64, cache=WinnerCache(p, env=ENV), serve_stale=True, **kw)
+    assert a["cached"] and a["reason"] == "cached_stale" and a["stale"] == ["driver"] and b["reason"] == "cached_stale"
+    assert len(checks) == 1 and len(fake_search) == 1                                      # verified once, never searched
+    monkeypatch.setattr(online, "validate", lambda b, *a, **k: Ok(False))
+    WinnerCache(p, env={**ENV, "driver": "591"}).put(65, 64, 64, "fp16", k=3, lt_n=4, lt_rank=5,
+                                                    choice={"key": KEY, "family": "triton"})
+    c = online.select_kernel(None, 65, 64, 64, cache=WinnerCache(p, env=ENV), serve_stale=True, **kw)
+    assert not c["cached"] and len(fake_search) == 2                                       # failed the gate: searched
