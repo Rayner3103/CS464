@@ -14,7 +14,7 @@ from lscli.files import read_json
 HELPER = Path("/usr/local/libexec/lscli-clock")
 
 
-def _run(*argv: str, timeout: float = 30) -> tuple[int, str]:
+def _run(*argv: str, timeout: float = 15) -> tuple[int, str]:
     try:
         r = subprocess.run(list(argv), capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
         return r.returncode, (r.stdout + r.stderr).strip()
@@ -60,11 +60,14 @@ def checks(paths) -> list[dict]:
     cfg = config.load()
     mhz = cfg["clock"]["lock_mhz"]
     if HELPER.exists():
-        rc, txt = _run("sudo", "-n", "-l", str(HELPER), "reset")
+        rc, txt = _run("sudo", "-n", "-l", str(HELPER), "reset")    # list mode may want a password (listpw)
         conf = Path("/etc/lscli/clock.conf")
-        conf_mhz = conf.read_text().strip().removeprefix("lock_mhz=") if conf.exists() else None
+        try:
+            conf_mhz = conf.read_text().strip().removeprefix("lock_mhz=") if conf.exists() else None
+        except OSError:
+            conf_mhz = "unreadable"
         ok = rc == 0 and mhz and str(mhz) == conf_mhz
-        add("OK" if ok else "WARN", "clock helper", f"installed; sudo {'allowed' if rc == 0 else 'NOT allowed'}; "
+        add("OK" if ok else "WARN", "clock helper", f"installed; sudo rule {'confirmed' if rc == 0 else 'not confirmed'}; "
             f"config {mhz or 'unlocked'} MHz, clock.conf {conf_mhz}",
             "" if ok else "re-run the installer with --clock-helper, or set clock.lock_mhz to clock.conf's value")
     else:
@@ -74,6 +77,12 @@ def checks(paths) -> list[dict]:
     add("OK" if mode == 0o700 else "WARN", "home permissions", f"{paths.root} {oct(mode) if mode is not None else 'missing'}",
         "" if mode == 0o700 else f"chmod 700 {paths.root} (it holds your usage record)")
     hw = (st or {}).get("hw_id")
+    if not hw:                                         # daemon not running: ask torch (doctor is not the daemon)
+        try:
+            from tune.env import hw_id
+            hw = hw_id()
+        except Exception:
+            hw = None
     ms = models.active(paths, hw)
     if ms is None:
         add("WARN", "models", "none yet", "the daemon trains this GPU's models in idle time (lscli train status)")
@@ -85,7 +94,7 @@ def checks(paths) -> list[dict]:
     for eid, rec in registered.items():
         py = rec.get("python", "?")
         try:
-            info = envs.probe(py)
+            info = envs.probe(py, timeout=60)
         except RuntimeError as e:
             add("FAIL", f"env {eid}", f"{py}: {e}", "lscli disable-env, or fix the interpreter")
             continue

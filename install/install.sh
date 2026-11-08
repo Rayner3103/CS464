@@ -3,6 +3,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/learned-selector-cli/install/install.sh | bash
 #
+# The default --ref is the lscli main branch, which moves; pass --ref <tag> (and fetch install.sh from that tag) to
+# install a fixed version. The pinned model hash protects the models, not the source.
+#
 # Installs the learned-selector CLI and its daemon for THIS user: a git clone in $LSCLI_HOME/src, a venv with the pinned
 # versions, the zero-shot models, ~/.local/bin/lscli, the config, and a systemd --user unit. Needs no root, except for
 # the optional clock helper (asked; --clock-helper / --no-clock-helper). Re-running upgrades src/ and the venv and keeps
@@ -54,7 +57,7 @@ die() { echo "lscli install: $*" >&2; exit "${2:-1}"; }
 say() { printf '==> %s\n' "$*"; }
 ask() {  # ask "question" default(y|n) -> 0 for yes
   local q="$1" def="$2" ans=""
-  if [[ $YES == 1 || ! -r /dev/tty ]]; then [[ $def == y ]]; return; fi
+  if [[ $YES == 1 ]] || ! (: </dev/tty) 2>/dev/null; then [[ $def == y ]]; return; fi
   read -r -p "$q [$( [[ $def == y ]] && echo Y/n || echo y/N )] " ans < /dev/tty || ans=""
   ans="${ans:-$def}"; [[ $ans == [yY]* ]]
 }
@@ -81,7 +84,11 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+# The home is written into a systemd unit and a shell wrapper: keep it to characters that need no quoting there, and
+# never let it be $HOME itself or / (it is chmod 700'd here and may be purged by `lscli uninstall --purge`).
+[[ "$LSCLI_HOME" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "--home must be an absolute path of [A-Za-z0-9._/-] characters"
 LSCLI_HOME="$(mkdir -p "$LSCLI_HOME" && cd "$LSCLI_HOME" && pwd)"
+case "$LSCLI_HOME" in "$HOME"|/|"$(dirname "$HOME")") die "--home must be a directory of its own, not $LSCLI_HOME" ;; esac
 chmod 700 "$LSCLI_HOME"
 
 # ------------------------------------------------------------------ preflight (exit 4: unsupported system)
@@ -117,8 +124,9 @@ preflight
 SRC="$LSCLI_HOME/src"
 say "source: $REPO_URL @ $REF -> $SRC"
 if [[ -d "$SRC/.git" ]]; then
+  git -C "$SRC" remote set-url origin "$REPO_URL"
   git -C "$SRC" fetch --quiet origin "$REF"
-  git -C "$SRC" checkout --quiet --detach FETCH_HEAD
+  git -C "$SRC" checkout --quiet --force --detach FETCH_HEAD     # src/ is ours: local edits there are discarded
 else
   rm -rf "$SRC"
   git clone --quiet --branch "$REF" "$REPO_URL" "$SRC" 2>/dev/null || {
@@ -134,9 +142,15 @@ if [[ -n "$REUSE_SITE" ]]; then
   site="$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
   "$REUSE_SITE" -c 'import site; print("\n".join(site.getsitepackages()))' > "$site/lscli-reuse.pth"
 else
-  [[ -x "$VENV/bin/python" ]] || "$PYTHON" -m venv "$VENV"
+  want="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+  have="$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+  if [[ "$have" != "$want" ]]; then                  # missing, broken, or made by another Python: start over
+    rm -rf "$VENV"
+    "$PYTHON" -m venv "$VENV"
+  fi
   "$VENV/bin/python" -m pip install --quiet --upgrade pip
-  torch_pin="$(grep -E '^torch==' "$SRC/requirements.txt" | awk '{print $1}')"
+  torch_pin="$(grep -E '^torch==' "$SRC/requirements.txt" | awk '{print $1}' || true)"
+  [[ -n "$torch_pin" ]] || die "no torch== pin in $SRC/requirements.txt"
   "$VENV/bin/python" -m pip install --quiet "$torch_pin" --index-url "$TORCH_INDEX"
   grep -vE '^torch==' "$SRC/requirements.txt" | "$VENV/bin/python" -m pip install --quiet -r /dev/stdin
 fi
@@ -153,10 +167,19 @@ if [[ -n "$MODELS_URL" ]]; then
   echo "$MODELS_SHA256  $tmp/models.tar.gz" | sha256sum -c --quiet - || die "zero-shot models: sha256 mismatch"
   rm -rf "$LSCLI_HOME/models/zero_shot.new"
   mkdir -p "$LSCLI_HOME/models/zero_shot.new"
-  tar -xzf "$tmp/models.tar.gz" -C "$LSCLI_HOME/models/zero_shot.new" --no-same-owner
+  # regular files only, no absolute paths, no "..", no links (tarfile's "data" filter + an explicit member check)
+  "$VENV/bin/python" - "$tmp/models.tar.gz" "$LSCLI_HOME/models/zero_shot.new" <<'PY' || die "unsafe or broken model archive"
+import sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as t:
+    for m in t.getmembers():
+        if not m.isfile() or m.name.startswith("/") or ".." in m.name.split("/"):
+            sys.exit(f"refusing member {m.name!r}")
+    t.extractall(sys.argv[2], filter="data")
+PY
   [[ -f "$LSCLI_HOME/models/zero_shot.new/MODELS.json" ]] || die "the model archive has no MODELS.json"
-  rm -rf "$LSCLI_HOME/models/zero_shot"
+  [[ -d "$LSCLI_HOME/models/zero_shot" ]] && mv "$LSCLI_HOME/models/zero_shot" "$LSCLI_HOME/models/zero_shot.old"
   mv "$LSCLI_HOME/models/zero_shot.new" "$LSCLI_HOME/models/zero_shot"
+  rm -rf "$LSCLI_HOME/models/zero_shot.old"
 else
   echo "note: no zero-shot models for this release; the daemon trains this GPU's models before it selects kernels"
 fi
@@ -187,12 +210,14 @@ if [[ $CLOCK_HELPER == yes ]]; then
   max="$(nvidia-smi -i 0 --query-gpu=clocks.max.sm --format=csv,noheader,nounits | tr -d ' ')"
   def=$(( max * 85 / 100 ))
   if [[ -z "$CLOCK_MHZ" ]]; then
-    if [[ $YES == 1 || ! -r /dev/tty ]]; then CLOCK_MHZ=$def
+    if [[ $YES == 1 ]] || ! (: </dev/tty) 2>/dev/null; then CLOCK_MHZ=$def
     else read -r -p "Lock MHz (max $max) [$def] " CLOCK_MHZ < /dev/tty || true; CLOCK_MHZ="${CLOCK_MHZ:-$def}"; fi
   fi
-  [[ "$CLOCK_MHZ" =~ ^[0-9]{3,4}$ ]] && (( CLOCK_MHZ <= max )) || die "bad clock $CLOCK_MHZ (max $max)"
+  [[ "$CLOCK_MHZ" =~ ^[1-9][0-9]{2,3}$ ]] && (( 10#$CLOCK_MHZ >= 300 && 10#$CLOCK_MHZ <= max )) \
+    || die "bad clock $CLOCK_MHZ (300..$max MHz)"
   say "clock helper (sudo): /usr/local/libexec/lscli-clock, lock at $CLOCK_MHZ MHz"
   tmp_sudo="$(mktemp)"
+  trap 'rm -f "$tmp_sudo"' EXIT
   printf '%s ALL=(root) NOPASSWD: /usr/local/libexec/lscli-clock lock, /usr/local/libexec/lscli-clock reset\n' \
     "$(id -un)" > "$tmp_sudo"
   sudo visudo -cf "$tmp_sudo" >/dev/null || die "the sudoers rule did not validate"

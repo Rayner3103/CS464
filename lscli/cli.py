@@ -479,6 +479,21 @@ def cmd_doctor(args, paths: Paths) -> int:
 
 # ------------------------------------------------------------------------------------------------------------ uninstall
 CLOCK_FILES = ("/usr/local/libexec/lscli-clock", "/etc/sudoers.d/lscli", "/etc/lscli/clock.conf")
+_MARKERS = ("venv", "src", "state.json", "envs.json", "winners.jsonl", "client.json", "profile", "queue.jsonl")
+
+
+def purge_refusal(root: Path) -> str | None:
+    """Why `--purge` must not delete `root` (None = safe): never /, $HOME or one of its ancestors, and only a
+    directory that looks like an lscli home."""
+    root = root.resolve()
+    home = Path.home().resolve()
+    if root == Path("/") or root == home or root in home.parents:
+        return "it is / or your home directory (or above it)"
+    if not root.is_dir():
+        return "not a directory"
+    if not any((root / m).exists() for m in _MARKERS):
+        return "it does not look like an lscli home"
+    return None
 
 
 def cmd_uninstall(args, paths: Paths) -> int:
@@ -505,10 +520,13 @@ def cmd_uninstall(args, paths: Paths) -> int:
             subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
     helper = Path(CLOCK_FILES[0])
     if helper.exists():
-        subprocess.run(["sudo", "-n", str(helper), "reset"], capture_output=True)
-        r = subprocess.run(["sudo", "rm", "-f", *CLOCK_FILES])            # may ask for a password: the only root step
-        subprocess.run(["sudo", "rmdir", "/etc/lscli"], capture_output=True)
-        done.append("removed the clock helper" if r.returncode == 0 else "could NOT remove the clock helper (sudo)")
+        reset = subprocess.run(["sudo", "-n", str(helper), "reset"], capture_output=True)
+        if reset.returncode != 0:                      # keep the helper: it is the user's way back to stock clocks
+            done.append("clock reset FAILED; the clock helper was kept (run `sudo nvidia-smi -rgc`, then uninstall again)")
+        else:
+            r = subprocess.run(["sudo", "rm", "-f", *CLOCK_FILES])        # may ask for a password: the only root step
+            subprocess.run(["sudo", "rmdir", "/etc/lscli"], capture_output=True)
+            done.append("removed the clock helper" if r.returncode == 0 else "could NOT remove the clock helper (sudo)")
     for eid, rec in list(envs.load(paths).items()):
         try:
             site = Path(_py(rec["python"], "-c", _SITE))
@@ -518,17 +536,28 @@ def cmd_uninstall(args, paths: Paths) -> int:
             done.append(f"env {eid}: could not remove its hook ({e})")
         envs.unregister(paths, eid)
     wrapper = Path.home() / ".local" / "bin" / "lscli"
-    try:
-        if wrapper.exists() and "lscli" in wrapper.read_text(errors="replace"):
+    try:                                               # only the wrapper install.sh writes
+        if wrapper.exists() and '/venv/bin/python" -m lscli "$@"' in wrapper.read_text(errors="replace"):
             wrapper.unlink()
             done.append(f"removed {wrapper}")
     except OSError:
         pass
+    done.append("linger was left as it is (loginctl disable-linger $USER if you enabled it for lscli)")
     if args.purge:
         from lscli.paths import config_path
+        why = purge_refusal(paths.root)
+        if why:
+            print(f"lscli uninstall --purge: refusing to delete {paths.root}: {why}", file=sys.stderr)
+            return EXIT_FAIL
         shutil.rmtree(paths.root, ignore_errors=True)
-        shutil.rmtree(config_path().parent, ignore_errors=True)
-        done.append(f"removed {paths.root} and {config_path().parent}")
+        cfg = config_path()
+        cfg.unlink(missing_ok=True)                    # the file only; its directory only when it is lscli's and empty
+        try:
+            if cfg.parent.name == "lscli":
+                cfg.parent.rmdir()
+        except OSError:
+            pass
+        done.append(f"removed {paths.root} and {cfg}")
     else:
         done.append(f"kept {paths.root} (lscli uninstall --purge removes it)")
     _out(args, {"done": done}, "\n".join(done))

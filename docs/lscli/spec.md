@@ -317,8 +317,8 @@ program first runs them.
 
 ### 4.6 Clock
 
-* The lock MHz is chosen **at install time**. The installer suggests about 85 % of the card's maximum SM clock,
-  validated against `nvidia-smi -q -d SUPPORTED_CLOCKS`. It writes the root-owned `/etc/lscli/clock.conf` and sets
+* The lock MHz is chosen **at install time**. The installer suggests about 85 % of the card's maximum SM clock
+  and accepts 300 MHz up to that maximum, with no leading zeros. It writes the root-owned `/etc/lscli/clock.conf` and sets
   `[clock] lock_mhz` to the same value.
 * With `lock_mhz > 0`, the daemon runs `sudo -n /usr/local/libexec/lscli-clock lock` before a GPU job and
   `sudo -n /usr/local/libexec/lscli-clock reset` after it, on preemption and on exit. The unit runs the reset in
