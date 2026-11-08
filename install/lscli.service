@@ -1,0 +1,19 @@
+# lscli daemon (docs/lscli/spec.md section 4). Installed by install/install.sh into ~/.config/systemd/user/.
+[Unit]
+Description=lscli: idle-time GEMM kernel selection
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/lscli/venv/bin/python -m lscli daemon run
+WorkingDirectory=%h/.local/share/lscli/src
+Restart=on-failure
+RestartSec=30
+Nice=19
+IOSchedulingClass=idle
+# never leave a job's process tree behind
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
