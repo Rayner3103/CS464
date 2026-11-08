@@ -67,6 +67,22 @@ def test_router_round_trip_can_skip_the_triton_half(tmp_path):
 
 
 @requires_cuda
+def test_a_reply_sent_together_with_the_request_is_not_lost(tmp_path):
+    """The daemon may write its answer before the worker asks (pipelined): the worker must still read it."""
+    p = _start("measure")
+    req = json.dumps(_request(tmp_path / "w.jsonl", router=True, reply_timeout_s=5)) + "\n"
+    p.stdin.write(req + json.dumps({"skip": True, "p": 0.0, "threshold": 0.02}) + "\n")
+    p.stdin.flush()
+    assert json.loads(p.stdout.readline())["op"] == "route"
+    res = json.loads(p.stdout.readline())
+    p.wait(60)
+    assert res["router"]["skipped"]
+    assert {c["family"] for c in res["candidates"]} == {"cublaslt"}
+    line = json.loads((tmp_path / "w.jsonl").read_text())
+    assert line["lt_rank"] == 0                         # the rejected ranker proposal was never timed: width 0
+
+
+@requires_cuda
 def test_router_without_an_answer_does_not_skip(tmp_path):
     p = _start("measure")
     p.stdin.write(json.dumps(_request(tmp_path / "w.jsonl", router=True, reply_timeout_s=0.5)) + "\n")

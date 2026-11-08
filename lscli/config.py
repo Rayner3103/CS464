@@ -14,7 +14,7 @@ from pathlib import Path
 DEFAULTS: dict[str, dict] = {
     "idle": {"window": "01:00-07:00", "gpu_idle_minutes": 10, "gpu_util_max": 5, "require_ac": True,
              "backoff_minutes": 10},
-    "search": {"k": 3, "k_frequent": 5, "frequent_calls": 1_000_000, "lt_n": 16, "lt_rank": 5, "half_life_days": 30},
+    "search": {"k": 3, "k_frequent": 5, "frequent_calls": 1_000_000, "lt_n": 16, "lt_rank": 5, "half_life_days": 30.0},
     "client": {"dispatch": True, "inline_search": True, "min_kernel_us": 50, "min_saving_us": 5},
     "clock": {"lock_mhz": 0},
     "train": {"enabled": True, "mode": "full"},
@@ -36,10 +36,12 @@ def _check(key: str, value):
         raise ConfigError(f"{key}: expected {want.__name__}, got {value!r}")
     if key in CHOICES and value not in CHOICES[key]:
         raise ConfigError(f"{key}: one of {', '.join(CHOICES[key])}, got {value!r}")
-    if key == "idle.window" and not _WINDOW.match(value):
+    if key == "idle.window" and not _WINDOW.fullmatch(value):
         raise ConfigError(f"idle.window: 'HH:MM-HH:MM' or '', got {value!r}")
     if isinstance(value, (int, float)) and not isinstance(value, bool) and value < 0:
         raise ConfigError(f"{key}: must be >= 0, got {value!r}")
+    if key == "idle.gpu_util_max" and value > 100:
+        raise ConfigError(f"{key}: a percentage, got {value!r}")
     return value
 
 
@@ -54,7 +56,8 @@ def validate(cfg: dict) -> dict:
             out[sec][name] = _check(f"{sec}.{name}", v)
     s = out["search"]
     if not 1 <= s["k"] <= s["k_frequent"]:
-        raise ConfigError("search: need 1 <= k <= k_frequent")
+        raise ConfigError(f"search: need 1 <= k <= k_frequent (k {s['k']}, k_frequent {s['k_frequent']}; "
+                          "raise k_frequent first)")
     return out
 
 
@@ -65,8 +68,11 @@ def load(path: Path | None = None) -> dict:
     if not path.exists():
         return copy.deepcopy(DEFAULTS)
     import tomllib
-    with open(path, "rb") as f:
-        return validate(tomllib.load(f))
+    try:
+        with open(path, "rb") as f:
+            return validate(tomllib.load(f))
+    except tomllib.TOMLDecodeError as e:
+        raise ConfigError(f"{path}: {e}") from None
 
 
 def parse_value(key: str, text: str):
@@ -76,6 +82,8 @@ def parse_value(key: str, text: str):
     sec, name = key.split(".", 1)
     want = type(DEFAULTS[sec][name])
     try:
+        if want is float:
+            return _check(key, float(text))
         if want is bool:
             if text.lower() not in ("true", "false"):
                 raise ValueError
@@ -97,14 +105,16 @@ def dumps(cfg: dict) -> str:
 
 
 def set_value(key: str, text: str, path: Path | None = None) -> dict:
-    """Set one key, validate the whole config, and replace the file atomically. Returns the new config."""
+    """Set one key, validate the whole config, and replace the file atomically (comments in the file are not kept: it
+    is rewritten from the validated values). Returns the new config."""
     import os
     import uuid
     from lscli.paths import config_path
     path = Path(path) if path else config_path()
+    value = parse_value(key, text)               # rejects unknown keys before anything is read or written
     cfg = load(path)
     sec, name = key.split(".", 1)
-    cfg[sec][name] = parse_value(key, text)
+    cfg[sec][name] = value
     cfg = validate(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex[:12]}")

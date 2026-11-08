@@ -11,7 +11,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from lscli.files import read_json, write_json
+from lscli.files import locked, read_json, write_json
 
 _PROBE = r"""
 import json, sys
@@ -56,22 +56,24 @@ def load(paths) -> dict:
 def register(paths, python: str | os.PathLike, info: dict | None = None) -> tuple[str, dict]:
     info = dict(info if info is not None else probe(python))
     eid = env_id(python)
-    envs = load(paths)
-    info["python"] = interpreter_path(python)
-    info["registered"] = envs.get(eid, {}).get("registered", time.time())
-    info["updated"] = time.time()
-    envs[eid] = info
-    write_json(paths.envs, envs)
+    with locked(paths.envs):                     # the CLI and the daemon both update envs.json
+        envs = load(paths)
+        info["python"] = interpreter_path(python)
+        info["registered"] = envs.get(eid, {}).get("registered", time.time())
+        info["updated"] = time.time()
+        envs[eid] = info
+        write_json(paths.envs, envs)
     return eid, info
 
 
 def unregister(paths, python_or_id: str) -> bool:
-    envs = load(paths)
-    eid = python_or_id if python_or_id in envs else env_id(python_or_id)
-    if eid not in envs:
-        return False
-    del envs[eid]
-    write_json(paths.envs, envs)
+    with locked(paths.envs):
+        envs = load(paths)
+        eid = python_or_id if python_or_id in envs else env_id(python_or_id)
+        if eid not in envs:
+            return False
+        del envs[eid]
+        write_json(paths.envs, envs)
     return True
 
 

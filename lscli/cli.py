@@ -14,7 +14,8 @@ import sys
 import time
 from pathlib import Path
 
-from lscli import __version__, config, control, envs, queue, usage
+from lscli import __version__, config, control, envs, usage
+from lscli import search_queue as queue
 from lscli.files import read_json
 from lscli.paths import Paths
 
@@ -60,7 +61,7 @@ def cmd_status(args, paths: Paths) -> int:
     lines.append(f"queue: {len(pend)} pending   envs: {doc['envs']}   profile: {len(prof['shapes'])} shapes "
                  f"(merged {_ago(merged)})")
     _out(args, doc, "\n".join(lines))
-    return EXIT_OK if alive else EXIT_NO_DAEMON
+    return EXIT_OK                                   # status needs no daemon: "not running" is an answer, not a failure
 
 
 # ------------------------------------------------------------------------------------------------------------ config
@@ -78,9 +79,11 @@ def cmd_config(args, paths: Paths) -> int:
     except config.ConfigError as e:
         print(f"lscli config: {e}", file=sys.stderr)
         return EXIT_FAIL
-    cur = read_json(paths.client, {}) or {}
-    config.write_client_json(paths.ensure(), cfg, models=(cur.get("env_extra") or {}).get("models"),
-                             gpu_uuid=cur.get("gpu_uuid"), model_stems=cur.get("models"))
+    from lscli.files import locked
+    with locked(paths.ensure().client):            # the daemon rewrites client.json too: keep its fields
+        cur = read_json(paths.client, {}) or {}
+        config.write_client_json(paths, cfg, models=(cur.get("env_extra") or {}).get("models"),
+                                 gpu_uuid=cur.get("gpu_uuid"), model_stems=cur.get("models"))
     control.request_reload(paths)
     _out(args, {args.key: config.get(cfg, args.key)}, f"{args.key} = {config.get(cfg, args.key)}")
     return EXIT_OK
@@ -133,8 +136,12 @@ def _parse_shapes(args) -> list[tuple[int, int, int]]:
 def cmd_prewarm(args, paths: Paths) -> int:
     try:
         shapes = _parse_shapes(args)
-        targets = envs.resolve(paths, args.env)
     except (ValueError, KeyError, OSError) as e:
+        print(f"lscli prewarm: {e}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        targets = envs.resolve(paths, args.env)
+    except KeyError as e:
         print(f"lscli prewarm: {e}", file=sys.stderr)
         return EXIT_FAIL
     if not shapes:
@@ -198,6 +205,9 @@ def cmd_cache(args, paths: Paths) -> int:
         print(f"lscli cache: {e}", file=sys.stderr)
         return EXIT_FAIL
     if args.action == "ls":
+        if args.stale and args.env is None and len(targets) != 1:
+            print("lscli cache ls --stale: tiers are relative to one env; pass --env ID", file=sys.stderr)
+            return EXIT_USAGE
         if args.env is None and len(targets) != 1:
             rows = _raw_entries(paths)      # no single env to rate tiers against: list the lines as stored
             doc = [{**{k: r[k] for k in ("M", "N", "K", "dtype")}, "key": r["choice"]["key"], "family": r["choice"].get("family"),
@@ -282,7 +292,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.home:
         os.environ["LSCLI_HOME"] = str(Path(args.home).expanduser().resolve())
-    return args.fn(args, Paths())
+    try:
+        return args.fn(args, Paths())
+    except config.ConfigError as e:                 # a broken config.toml: say so, no traceback
+        print(f"lscli: {e}", file=sys.stderr)
+        return EXIT_FAIL
 
 
 if __name__ == "__main__":

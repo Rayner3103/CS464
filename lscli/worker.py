@@ -35,23 +35,42 @@ def _channel():
 
 
 class _Proto:
-    def __init__(self, out, inp=None):
-        self.out, self.inp = out, inp if inp is not None else sys.stdin
+    """Line protocol over raw file descriptors. Input is read with os.read into our own buffer (never through
+    sys.stdin's TextIOWrapper, whose buffer select() cannot see), so a reply that arrived together with the request, or
+    early, is not lost, and a timeout is a real deadline even for a partial line."""
+
+    def __init__(self, out, in_fd: int = 0):
+        self.out, self.fd, self.buf = out, in_fd, b""
 
     def send(self, obj: dict) -> None:
         self.out.write(json.dumps(obj, default=str) + "\n")
         self.out.flush()
 
+    def readline(self, timeout_s: float | None = None) -> str | None:
+        """The next complete line (without the newline), or None on timeout / end of input."""
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        while b"\n" not in self.buf:
+            wait = None if deadline is None else deadline - time.monotonic()
+            if wait is not None and wait <= 0:
+                return None
+            r, _, _ = select.select([self.fd], [], [], wait)
+            if not r:
+                return None
+            chunk = os.read(self.fd, 65536)
+            if not chunk:
+                return None
+            self.buf += chunk
+        line, self.buf = self.buf.split(b"\n", 1)
+        return line.decode()
+
     def ask(self, obj: dict, timeout_s: float) -> dict | None:
         self.send(obj)
-        r, _, _ = select.select([self.inp], [], [], timeout_s)
-        if not r:
-            return None
-        line = self.inp.readline()
+        line = self.readline(timeout_s)
         try:
-            return json.loads(line) if line.strip() else None
+            ans = json.loads(line) if line and line.strip() else None
         except ValueError:
             return None
+        return ans if isinstance(ans, dict) else None
 
 
 class RouterProxy:
@@ -87,6 +106,11 @@ def environment(env_extra: dict | None = None) -> dict:
     return {**env, **extra}
 
 
+def torch_oom():
+    import torch
+    return torch.OutOfMemoryError
+
+
 def torch_time_us(M: int, N: int, K: int, dtype) -> float | None:
     """torch.matmul's short cold time for the shape (the same short protocol as the candidates)."""
     import torch
@@ -107,35 +131,46 @@ def torch_time_us(M: int, N: int, K: int, dtype) -> float | None:
 
 
 def measure_request(req: dict, proto: _Proto | None = None) -> dict:
-    """Run one request; returns the result document (without "op")."""
+    """Run one request; returns the result document (without "op"). The stored widths (lt_rank / lt_knn) are what was
+    actually timed here, not what was asked for: a proposal this library rejects is not in the entry's search."""
     from baselines.cublaslt_knn import cfg_tuple
-    from tune.online import backends_from_keys, choose, measure, propose_lt
+    from tune.online import ROUTER_CONFIRM, backends_from_keys, choose, measure, propose_lt
     M, N, K = int(req["M"]), int(req["N"]), int(req["K"])
     if req.get("dtype", "fp16") not in DTYPES:
         raise ValueError(f"dtype must be one of {DTYPES}")
     dtype = _torch_dtype(req.get("dtype", "fp16"))
     k, lt_n = int(req["k"]), int(req.get("lt_n", 0))
-    entries = [e for e in req.get("proposals", []) if e.get("family", "triton") != "cublaslt"]  # heuristic: our own
+    entries = [e for e in req.get("proposals", []) if e.get("family", "triton") == "triton"
+               or (lt_n > 0 and e.get("family") != "cublaslt")]   # heuristic: our own; no cuBLASLt at all when lt_n = 0
     back = backends_from_keys(entries, M, N, K, dtype, lt_n)
     triton = [b for b in back if b[0] == "triton"]
     heur, _ = propose_lt(M, N, K, dtype, lt_n)
     known = {cfg_tuple(b[2].cfg) for b in heur}
     lt = heur + [b for b in back if b[0] != "triton" and cfg_tuple(b[2].cfg) not in known]
     router = RouterProxy(proto, float(req.get("reply_timeout_s", 30))) if req.get("router") and proto else None
-    t_us = torch_time_us(M, N, K, dtype)
-    r = measure(M, N, K, dtype, lt, triton, lt_n=lt_n, router=router, confirm=int(req.get("confirm", 0)))
+    confirm = int(req.get("confirm", 0))
+    if router is not None:
+        confirm = max(confirm, ROUTER_CONFIRM)   # cuBLASLt-first timing order biases near-ties: always confirm (AGENTS.md)
+    r = measure(M, N, K, dtype, lt, triton, lt_n=lt_n, router=router, confirm=confirm)
     env = environment(req.get("env_extra"))
     if r.get("skipped"):
         return {"skipped": r["skipped"], "choice": None, "candidates": [], "written": False, "env": env}
+    try:
+        t_us = torch_time_us(M, N, K, dtype)     # after the search: a shape that does not fit was skipped above
+    except torch_oom() as e:
+        return {"skipped": f"oom_torch: {str(e).splitlines()[0][:150]}", "choice": None, "candidates": [],
+                "written": False, "env": env}
     choice = choose(r["candidates"], k)
     written = False
     if req.get("cache") and choice.get("key") is not None:
         from tune.winner_cache import WinnerCache
-        n_lt_rank = sum(1 for b in lt if b[0] == "cublaslt_rank")
+        timed = {c["config_key"] for c in r["candidates"]}
+        n_rank = sum(1 for b in lt if b[0] == "cublaslt_rank" and b[1] in timed)
+        n_knn = sum(1 for b in lt if b[0] == "cublaslt_knn" and b[1] in timed)
         WinnerCache(req["cache"], env=env).put(
-            M, N, K, req.get("dtype", "fp16"), k=k, lt_n=lt_n, lt_rank=int(req.get("lt_rank", n_lt_rank)),
-            lt_knn=int(req.get("lt_knn", 0)), choice=choice, candidates=r["candidates"], order=req.get("order"),
-            ranker=req.get("ranker"), extra={"torch_us": t_us, "lscli": True})
+            M, N, K, req.get("dtype", "fp16"), k=k, lt_n=lt_n, lt_rank=min(int(req.get("lt_rank", n_rank)), n_rank),
+            lt_knn=min(int(req.get("lt_knn", n_knn)), n_knn), choice=choice, candidates=r["candidates"],
+            order=req.get("order"), ranker=req.get("ranker"), extra={"torch_us": t_us, "lscli": True})
         written = True
     return {"choice": choice, "candidates": r["candidates"], "router": r.get("router"), "torch_us": t_us,
             "written": written, "env": env, "pool": [b[1] for b in triton + lt]}
@@ -174,8 +209,10 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.perf_counter()
     try:
         if args.cmd == "measure":
-            req = json.loads(sys.stdin.readline())
-            res = measure_request(req, proto)
+            line = proto.readline()
+            if line is None:
+                raise ValueError("no request on stdin")
+            res = measure_request(json.loads(line), proto)
         elif args.cmd == "env":
             res = {"env": environment(json.loads(args.env_extra)), "python": sys.executable}
         else:

@@ -8,7 +8,8 @@ import time
 
 import pytest
 
-from lscli import cli, config, control, envs, queue, usage
+from lscli import cli, config, control, envs, usage
+from lscli import search_queue as queue
 from lscli.files import append_jsonl, read_jsonl, write_json
 from lscli.paths import Paths
 
@@ -49,15 +50,20 @@ def test_config_defaults_set_and_validation(paths, tmp_path):
     assert config.load()["idle"]["window"] == "22:00-06:30"
     assert run("config", "search.k_frequent", "7") == 0 and config.load()["search"]["k_frequent"] == 7
     assert run("config", "idle.require_ac", "false") == 0 and config.load()["idle"]["require_ac"] is False
-    for key, bad in (("idle.window", "25:00-01:00"), ("search.k", "x"), ("search.k", "9"), ("nope.key", "1"),
-                     ("train.mode", "fast"), ("idle.require_ac", "yes"), ("clock.lock_mhz", "-5")):
+    # search.k = 9 fails because k_frequent is 7 (set above): k may not exceed k_frequent
+    for key, bad in (("idle.window", "25:00-01:00"), ("idle.window", "01:00-07:00\n"), ("search.k", "x"),
+                     ("search.k", "9"), ("nope.key", "1"), ("idle", "1"), ("train.mode", "fast"),
+                     ("idle.require_ac", "yes"), ("clock.lock_mhz", "-5"), ("idle.gpu_util_max", "101")):
         assert run("config", key, bad) == 1, (key, bad)
     doc = json.loads(paths.client.read_text())                       # client.json follows the config
     assert doc["env_extra"] == {"clock_lock": "unlocked"} and doc["search"]["k_frequent"] == 7
     assert json.loads(paths.control.read_text())["reload"] > 0       # the daemon is asked to reload
+    assert run("config", "search.half_life_days", "7.5") == 0 and config.load()["search"]["half_life_days"] == 7.5
     (tmp_path / "config.toml").write_text("[idle]\nbogus = 1\n")
     with pytest.raises(config.ConfigError):
         config.load()
+    (tmp_path / "config.toml").write_text("[idle\n")
+    assert run("profile") == 1                                       # a broken file is reported, not a traceback
 
 
 def test_clock_policy_is_part_of_the_winner_environment():
@@ -83,7 +89,7 @@ def test_env_registry(paths, tmp_path):
     assert envs.unregister(paths, str(py)) and list(envs.load(paths)) == [envs.env_id(link)]
 
 
-def test_env_probe_runs_the_interpreter():
+def test_env_probe_runs_the_interpreter():          # imports torch + triton in a subprocess (no GPU work)
     info = envs.probe(sys.executable)
     assert info["python"] == sys.executable and info["torch"] and info["triton"]
     with pytest.raises(RuntimeError):
@@ -112,13 +118,56 @@ def test_usage_merge_decays_reads_incrementally_and_keeps_live_logs(paths):
     assert usage.calls_now(prof, s, now + 60 * 86400) == pytest.approx(s["calls"] / 2)
 
 
+def test_a_crash_between_profile_write_and_log_delete_does_not_double_count(paths):
+    dead = paths.profile_dir / "999999998-1.jsonl"
+    append_jsonl(dead, [{"t": time.time(), "env_id": "e", "M": 8, "N": 8, "K": 8, "dtype": "fp16", "calls": 3}])
+    usage.merge(paths, half_life_days=30)
+    assert not dead.exists()                                        # a clean merge retires it
+    append_jsonl(dead, [{"t": time.time(), "env_id": "e", "M": 8, "N": 8, "K": 8, "dtype": "fp16", "calls": 3}])
+    prof = json.loads(paths.profile.read_text())
+    prof["offsets"][dead.name] = dead.stat().st_size                # as if merged, then crashed before the unlink
+    write_json(paths.profile, prof)
+    usage.merge(paths, half_life_days=30)
+    assert usage.load(paths)["shapes"][0]["calls_total"] == 3 and not dead.exists()
+    usage.merge(paths, half_life_days=30)
+    assert dead.name not in usage.load(paths)["offsets"]            # forgotten by the merge after the file is gone
+
+
+def test_a_dead_process_log_with_a_torn_tail_is_still_retired(paths):
+    dead = paths.profile_dir / "999999997-1.jsonl"
+    append_jsonl(dead, [{"t": time.time(), "env_id": "e", "M": 8, "N": 8, "K": 8, "dtype": "fp16", "calls": 2}])
+    with open(dead, "a") as f:
+        f.write('{"t": 1, "M": 8')
+    usage.merge(paths, half_life_days=30)
+    assert not dead.exists() and usage.load(paths)["shapes"][0]["calls_total"] == 2
+
+
+def test_usage_log_flush_from_another_thread_loses_nothing(paths):
+    import threading
+    log = usage.UsageLog(paths, "e")
+    stop = threading.Event()
+
+    def flusher():
+        while not stop.is_set():
+            log.flush()
+    t = threading.Thread(target=flusher)
+    t.start()
+    for i in range(20000):
+        log.add(8 + i % 50, 8, 8, "fp16", hit=True)
+    stop.set()
+    t.join()
+    log.flush()
+    rows, _ = read_jsonl(log.path)
+    assert sum(r["calls"] for r in rows) == 20000 and sum(r["hits"] for r in rows) == 20000
+
+
 def test_usage_logs_of_exited_processes_are_deleted_once_read(paths):
     dead = paths.profile_dir / "999999999-1.jsonl"
     append_jsonl(dead, [{"t": time.time(), "env_id": "e", "M": 8, "N": 8, "K": 8, "dtype": "fp16", "layout": "NN", "calls": 2}])
     prof = usage.merge(paths, half_life_days=30, write=False)    # a dry run touches nothing
     assert dead.exists() and not paths.profile.exists() and prof["shapes"][0]["calls_total"] == 2
     usage.merge(paths, half_life_days=30)
-    assert not dead.exists() and dead.name not in json.loads(paths.profile.read_text())["offsets"]
+    assert not dead.exists()
     assert usage.load(paths)["shapes"][0]["calls_total"] == 2
 
 
@@ -141,6 +190,15 @@ def test_queue_dedupes_keeps_most_urgent_reason_and_truncates_in_place(paths):
     assert queue.pending(paths)[0] == []
 
 
+def test_queue_survives_unknown_and_malformed_lines(paths):
+    append_jsonl(paths.queue, [{"op": "search", "M": 8, "N": 8, "K": 8, "dtype": "fp16", "env_id": "e", "reason": "future"},
+                               {"op": "other", "M": 1}, {"op": "search", "M": "x"}])
+    queue.request(paths, 9, 9, 9, "fp16", "e", "stale")
+    queue.request(paths, 8, 8, 8, "fp16", "e", "superseded")      # a known reason outranks an unknown one
+    pend, _ = queue.pending(paths)
+    assert [(r["M"], r["reason"]) for r in pend] == [(8, "superseded"), (9, "stale")]
+
+
 # ---------------------------------------------------------------------------------------------- control / status
 def test_pause_resume(paths):
     assert not control.paused(control.read_control(paths))
@@ -150,10 +208,12 @@ def test_pause_resume(paths):
     assert control.paused(control.read_control(paths), time.time() + 1e6)
     control.resume(paths)
     assert not control.paused(control.read_control(paths))
+    control.pause(paths, 0)                                         # zero seconds: not an indefinite pause
+    assert not control.paused(control.read_control(paths), time.time() + 0.001)
 
 
 def test_status_without_and_with_a_daemon(paths, capsys):
-    assert run("status") == cli.EXIT_NO_DAEMON and "not running" in capsys.readouterr().out
+    assert run("status") == 0 and "not running" in capsys.readouterr().out
     write_json(paths.state, {"pid": os.getpid(), "state": "waiting", "since": time.time(),
                              "gate": {"open": False, "reasons": ["outside window 01:00-07:00"]}})
     assert run("--json", "status") == 0
@@ -171,7 +231,7 @@ def test_prewarm_queues_for_every_env(paths, tmp_path, capsys):
     assert run("prewarm", "64x64x64", "128X64x32", "--shapes", str(shapes)) == 0
     pend, _ = queue.pending(paths)
     assert len(pend) == 6 and {r["reason"] for r in pend} == {"manual"}
-    assert run("prewarm", "64x64") == cli.EXIT_FAIL and run("prewarm", "99999x1x1") == cli.EXIT_FAIL
+    assert run("prewarm", "64x64") == cli.EXIT_USAGE and run("prewarm", "99999x1x1") == cli.EXIT_USAGE
     assert run("prewarm", "1x1x1", "--env", "nope") == cli.EXIT_FAIL
 
 

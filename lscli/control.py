@@ -30,7 +30,7 @@ def read_control(paths) -> dict:
 
 def pause(paths, seconds: float | None = None) -> dict:
     """Pause background work: for `seconds`, or until `resume` (None)."""
-    doc = {**read_control(paths), "paused": True, "paused_until": time.time() + seconds if seconds else None,
+    doc = {**read_control(paths), "paused": True, "paused_until": time.time() + seconds if seconds is not None else None,
            "updated": time.time()}
     write_json(paths.control, doc)
     return doc

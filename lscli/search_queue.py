@@ -21,6 +21,12 @@ def request(paths, M: int, N: int, K: int, dtype: str, env_id: str, reason: str)
     return row
 
 
+def _rank(r: dict) -> int:
+    """Priority of a request's reason; an unknown one (a newer lscli wrote it) ranks last instead of failing."""
+    reason = r.get("reason")
+    return REASONS.index(reason) if reason in REASONS else len(REASONS)
+
+
 def _offset(paths) -> int:
     try:
         return int(paths.queue_offset.read_text().strip() or 0)
@@ -41,24 +47,32 @@ def pending(paths) -> tuple[list[dict], int]:
     out: dict[tuple, dict] = {}
     for r in rows:
         try:
-            k = (int(r["M"]), int(r["N"]), int(r["K"]), r["dtype"], r["env_id"])
+            if r.get("op", "search") != "search":
+                continue
+            k = (int(r["M"]), int(r["N"]), int(r["K"]), str(r["dtype"]), str(r["env_id"]))
         except (KeyError, ValueError, TypeError):
             continue
         prev = out.get(k)
-        if prev is None or REASONS.index(r.get("reason", "miss")) < REASONS.index(prev.get("reason", "miss")):
+        if prev is None or _rank(r) < _rank(prev):
             out[k] = {**r, "t": prev["t"] if prev else r.get("t")}
     return sorted(out.values(), key=lambda r: r.get("t") or 0), end
 
 
 def consume(paths, end: int) -> None:
-    """Mark everything before `end` consumed; truncate the file when nothing was appended after it."""
+    """Mark everything before `end` consumed; truncate the file when nothing was appended after it. The offset is saved
+    BEFORE the truncation: a crash in between re-delivers requests (de-duplicated, then dropped as satisfied) instead
+    of skipping new ones."""
     paths.root.mkdir(parents=True, exist_ok=True)
+
+    def save(n: int) -> None:
+        tmp = paths.queue_offset.with_name("queue.offset.tmp")
+        tmp.write_text(str(n))
+        os.replace(tmp, paths.queue_offset)
     with open(paths.queue, "a+b") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         f.seek(0, os.SEEK_END)
         if f.tell() <= end:
+            save(0)
             f.truncate(0)
-            end = 0
-        tmp = paths.queue_offset.with_name("queue.offset.tmp")
-        tmp.write_text(str(end))
-        os.replace(tmp, paths.queue_offset)
+        else:
+            save(end)

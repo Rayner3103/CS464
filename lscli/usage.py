@@ -9,6 +9,7 @@ being written is read incrementally, and deletes the logs of processes that have
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -32,27 +33,29 @@ class UsageLog:
         self.calls: Counter = Counter()
         self.hits: Counter = Counter()
         self.fallbacks: Counter = Counter()
+        self._lock = threading.Lock()
 
     def add(self, M: int, N: int, K: int, dtype: str, layout: str = "NN", hit: bool | None = None) -> None:
         k = (M, N, K, dtype, layout)
-        self.calls[k] += 1
-        if hit is True:
-            self.hits[k] += 1
-        elif hit is False:
-            self.fallbacks[k] += 1
+        with self._lock:
+            self.calls[k] += 1
+            if hit is True:
+                self.hits[k] += 1
+            elif hit is False:
+                self.fallbacks[k] += 1
 
     def flush(self) -> int:
-        """Write the increments since the last flush; returns the number of shapes written."""
-        if not self.calls:
-            return 0
+        """Write the increments since the last flush (the counters are swapped under the lock, so calls made while
+        writing go to the next flush); returns the number of shapes written. Safe from another thread."""
+        with self._lock:
+            if not self.calls:
+                return 0
+            calls, hits, falls = self.calls, self.hits, self.fallbacks
+            self.calls, self.hits, self.fallbacks = Counter(), Counter(), Counter()
         t = time.time()
         rows = [{"t": t, "env_id": self.env_id, "M": k[0], "N": k[1], "K": k[2], "dtype": k[3], "layout": k[4],
-                 "calls": n, "hits": self.hits.get(k, 0), "fallbacks": self.fallbacks.get(k, 0)}
-                for k, n in self.calls.items()]
+                 "calls": n, "hits": hits.get(k, 0), "fallbacks": falls.get(k, 0)} for k, n in calls.items()]
         append_jsonl(self.path, rows)
-        self.calls.clear()
-        self.hits.clear()
-        self.fallbacks.clear()
         return len(rows)
 
 
@@ -79,9 +82,12 @@ def merge(paths, half_life_days: float, now: float | None = None, write: bool = 
     shapes = {_key(s): dict(s) for s in prof["shapes"]}
     for s in shapes.values():
         s["calls"] = decay(s["calls"], prof["updated"], now, half_life_days)
-    offsets = dict(prof.get("offsets", {}))
+    logs = sorted(Path(paths.profile_dir).glob("*.jsonl"))
+    # Offsets of logs that no longer exist were deleted after a previous merge recorded them: forget them now (keeping
+    # them until the file is gone means a crash between writing the profile and deleting the log never re-reads it).
+    offsets = {k: v for k, v in prof.get("offsets", {}).items() if k in {x.name for x in logs}}
     done = []
-    for log in sorted(Path(paths.profile_dir).glob("*.jsonl")):
+    for log in logs:
         rows, end = read_jsonl(log, offsets.get(log.name, 0))
         for r in rows:
             try:
@@ -100,12 +106,12 @@ def merge(paths, half_life_days: float, now: float | None = None, write: bool = 
             if r.get("env_id") and r["env_id"] not in s.setdefault("envs", []):
                 s["envs"].append(r["env_id"])
         offsets[log.name] = end
-        if not _pid_alive(log.name) and end >= log.stat().st_size:
-            done.append(log)
+        if not _pid_alive(log.name):
+            done.append(log)               # its writer exited: an unterminated tail is a torn line and never completes
     out = {"updated": now, "half_life_days": half_life_days, "offsets": offsets,
            "shapes": sorted(shapes.values(), key=lambda s: -s["calls"])}
     if write:
-        write_json(paths.profile, {**out, "offsets": {k: v for k, v in offsets.items() if k not in {d.name for d in done}}})
+        write_json(paths.profile, out)
         for d in done:
             d.unlink(missing_ok=True)
     return out

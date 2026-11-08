@@ -3,6 +3,7 @@ last line, tolerant JSONL reads, and atomic JSON replacement (temp file + rename
 `tune/records.py` and `tune/winner_cache.py`."""
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import os
@@ -69,3 +70,13 @@ def write_json(path: Path, obj) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def locked(path: Path):
+    """Exclusive lock on `<path>.lock` for a read-modify-write of `path` by several processes (CLI and daemon)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + ".lock"), "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
