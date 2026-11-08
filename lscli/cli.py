@@ -255,6 +255,104 @@ def cmd_cache(args, paths: Paths) -> int:
     return EXIT_FAIL if failed else EXIT_OK
 
 
+# ------------------------------------------------------------------------------------------------------------ enable-env
+PTH = "lscli.pth"
+PACKAGES = ("lscli", "tune", "kernels", "baselines", "analysis")
+_SITE = "import sysconfig; print(sysconfig.get_paths()['purelib'])"
+_FIND = ("import importlib.util, json, sys; out = {}\n"
+         "for n in sys.argv[1:]:\n"
+         "    s = importlib.util.find_spec(n)\n"
+         "    out[n] = (s.origin or (list(s.submodule_search_locations or []) or [None])[0]) if s else None\n"
+         "print(json.dumps(out))")
+
+
+def source_dir(paths: Paths) -> Path:
+    """The code a client env runs: the installed checkout ($LSCLI_HOME/src), else the tree this lscli runs from."""
+    return paths.src.resolve() if (paths.src / "lscli").is_dir() else Path(__file__).resolve().parent.parent
+
+
+def _py(python: str, *argv: str, timeout: float = 120) -> str:
+    r = subprocess.run([python, *argv], capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip()[-400:] or f"exit {r.returncode}")
+    return r.stdout.strip().splitlines()[-1]
+
+
+def _pth_text(src: Path) -> str:
+    return (f"{src}\n"
+            "import os; (os.environ.get('LSCLI_PATCH') == '1' and os.environ.get('LSCLI_DISABLE') != '1') "
+            "and __import__('lscli.boot')\n")
+
+
+def cmd_enable_env(args, paths: Paths) -> int:
+    import shutil
+    python = args.python or shutil.which("python3")
+    if not python or not Path(python).exists():
+        print(f"lscli enable-env: no interpreter {args.python or 'python3'}", file=sys.stderr)
+        return EXIT_FAIL
+    python = envs.interpreter_path(python)
+    try:
+        info = envs.probe(python)
+    except RuntimeError as e:
+        print(f"lscli enable-env: {e}", file=sys.stderr)
+        return EXIT_FAIL
+    if not info.get("torch") or not info.get("triton"):
+        print(f"lscli enable-env: {python} has no importable torch + triton "
+              f"({info.get('torch_error') or info.get('triton_error')})", file=sys.stderr)
+        return EXIT_FAIL
+    src = source_dir(paths)
+    try:
+        site = Path(_py(python, "-c", _SITE))
+        found = json.loads(_py(python, "-I", "-c", _FIND, *PACKAGES))   # -I: no cwd / PYTHONPATH / user site
+    except (RuntimeError, ValueError, OSError) as e:
+        print(f"lscli enable-env: cannot inspect {python}: {e}", file=sys.stderr)
+        return EXIT_FAIL
+    clash = {n: o for n, o in found.items() if o and not Path(o).resolve().is_relative_to(src)}
+    if clash:
+        print("lscli enable-env: the env already has packages named like lscli's ("
+              + ", ".join(f"{n} at {o}" for n, o in clash.items()) + "); refusing to shadow them", file=sys.stderr)
+        return EXIT_FAIL
+    missing = [m for m, mod in (("numpy", "numpy"), ("nvidia-ml-py", "pynvml"))
+               if json.loads(_py(python, "-I", "-c", _FIND, mod)).get(mod) is None]
+    if missing:
+        if args.no_deps:
+            print(f"lscli enable-env: {python} lacks {', '.join(missing)} (pip install them, or drop --no-deps)", file=sys.stderr)
+            return EXIT_FAIL
+        r = subprocess.run([python, "-m", "pip", "install", *missing])
+        if r.returncode != 0:
+            return EXIT_FAIL
+    site.mkdir(parents=True, exist_ok=True)
+    (site / PTH).write_text(_pth_text(src))
+    eid, rec = envs.register(paths.ensure(), python, info)
+    prof = usage.load(paths)
+    n = 0
+    for s in prof["shapes"]:                       # shapes other envs already ran: search them for this env too
+        if s.get("layout", "NN") == "NN":
+            queue.request(paths, s["M"], s["N"], s["K"], s["dtype"], eid, "miss")
+            n += 1
+    _out(args, {"env_id": eid, **rec, "pth": str(site / PTH), "queued": n},
+         f"enabled {python} (env {eid}, torch {rec.get('torch')}, triton {rec.get('triton')})\n"
+         f"  {site / PTH}\n  run programs with LSCLI_PATCH=1, or call lscli.enable() in them"
+         + (f"\n  queued {n} known shape(s) for this env" if n else ""))
+    return EXIT_OK
+
+
+def cmd_disable_env(args, paths: Paths) -> int:
+    python = envs.interpreter_path(args.python)
+    removed = False
+    try:
+        site = Path(_py(python, "-c", _SITE))
+        if (site / PTH).exists():
+            (site / PTH).unlink()
+            removed = True
+    except (RuntimeError, OSError) as e:
+        print(f"lscli disable-env: cannot inspect {python} ({e}); unregistering only", file=sys.stderr)
+    unreg = envs.unregister(paths, python)
+    _out(args, {"pth_removed": removed, "unregistered": unreg},
+         f"{'removed ' + PTH if removed else 'no ' + PTH}; {'unregistered' if unreg else 'was not registered'}")
+    return EXIT_OK if removed or unreg else EXIT_FAIL
+
+
 # ------------------------------------------------------------------------------------------------------------ main
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="lscli", description="learned-selector CLI (docs/lscli/spec.md)")
@@ -269,6 +367,13 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("value", nargs="?")
     c.set_defaults(fn=cmd_config)
     sub.add_parser("envs", help="registered interpreters").set_defaults(fn=cmd_envs)
+    e = sub.add_parser("enable-env", help="install the client hook into an interpreter's env and register it")
+    e.add_argument("python", nargs="?", help="interpreter (default: python3 on PATH)")
+    e.add_argument("--no-deps", action="store_true", help="fail instead of pip-installing numpy / nvidia-ml-py")
+    e.set_defaults(fn=cmd_enable_env)
+    d = sub.add_parser("disable-env", help="remove the client hook from an interpreter's env and unregister it")
+    d.add_argument("python")
+    d.set_defaults(fn=cmd_disable_env)
     p = sub.add_parser("profile", help="the usage record, hottest first")
     p.add_argument("--top", type=int, default=20)
     p.add_argument("--layout", choices=("NN", "NT"))
