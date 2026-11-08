@@ -7,13 +7,15 @@ cuBLASLt ranker and router, plus the MODELS.json that lscli.models reads. The co
       --hw-id rtx3080_sm86_68sms_10gb --out install/zero_shot.tar.xz
 
 Run from the repo root. The compression follows --out (.tar.xz or .tar.gz). The archive is reproducible (sorted members,
-fixed owner and mtime, no pack time in MODELS.json), so repacking the same models changes no committed byte. Each
+fixed owner and mtime, no pack time in MODELS.json, a gzip header with no time or name), so repacking the same models
+with the same Python / liblzma changes no committed byte (another liblzma may compress differently). Each
 rebuild that does change it adds its size (~11 MB) to git history. Prints the sha256 (for --models-sha256 when an
 archive is served from a URL instead).
 """
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import io
 import json
@@ -49,15 +51,23 @@ def pack(stems: dict[str, Path | None], hw_id: str, out: Path) -> str:
             f = Path(str(stem) + ext)
             if not f.exists():
                 raise FileNotFoundError(f)
+            if f"{stem.name}{ext}" in files:
+                raise ValueError(f"two models named {stem.name!r}: rename one (members are flat)")
             files[f"{stem.name}{ext}"] = f.read_bytes()
         doc["models"][kind] = {"stem": stem.name}
     if "triton" not in doc["models"]:
         raise ValueError("a zero-shot set needs a Triton ranker")
     files["MODELS.json"] = (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode()
-    kw = {"preset": 9} if _mode(out) == "w:xz" else {}
-    with tarfile.open(out, _mode(out), format=tarfile.PAX_FORMAT, **kw) as tar:
+    def add(tar):
         for name in sorted(files):
             tar.addfile(_info(name, len(files[name])), io.BytesIO(files[name]))
+    if _mode(out) == "w:xz":
+        with tarfile.open(out, "w:xz", format=tarfile.PAX_FORMAT, preset=9) as tar:
+            add(tar)
+    else:                                        # tarfile's w:gz writes the time and file name into the gzip header
+        with open(out, "wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz, \
+                tarfile.open(fileobj=gz, mode="w", format=tarfile.PAX_FORMAT) as tar:
+            add(tar)
     return hashlib.sha256(out.read_bytes()).hexdigest()
 
 
