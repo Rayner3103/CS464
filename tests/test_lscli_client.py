@@ -123,17 +123,105 @@ def test_soft_stale_entry_is_verified_once_then_dispatched_and_requeued(home):
 
 
 @requires_cuda
-def test_autograd_backward_uses_torch(home):
+@pytest.mark.parametrize("grads", [(True, True), (True, False), (False, True)])
+def test_autograd_backward_uses_torch(home, monkeypatch, grads):
+    _put(home, 1024, 512, 768)
+    client.enable()
+    ran = []
+    orig_apply = client._Mm.apply
+    monkeypatch.setattr(client._Mm, "apply", lambda *a: ran.append(1) or orig_apply(*a))
+    a = torch.randn(1024, 768, device="cuda", dtype=torch.float16, requires_grad=grads[0])
+    b = torch.randn(768, 512, device="cuda", dtype=torch.float16, requires_grad=grads[1])
+    w = torch.randn(1024, 512, device="cuda")
+    (torch.matmul(a, b).float() * w).sum().backward()
+    assert ran == [1]                                                          # the selected kernel really ran
+    got = [t.grad.clone() if t.requires_grad else None for t in (a, b)]
+    for t in (a, b):
+        t.grad = None
+    (client._ORIG["matmul"](a, b).float() * w).sum().backward()
+    for g, t in zip(got, (a, b)):
+        if t.requires_grad:
+            torch.testing.assert_close(g, t.grad)
+
+
+@requires_cuda
+def test_keyword_calls_keep_torch_semantics(home):
     _put(home, 1024, 1024, 1024)
     client.enable()
-    a = torch.randn(1024, 1024, device="cuda", dtype=torch.float16, requires_grad=True)
-    b = torch.randn(1024, 1024, device="cuda", dtype=torch.float16, requires_grad=True)
-    (torch.matmul(a, b).float().sum()).backward()
-    ga, gb = a.grad.clone(), b.grad.clone()
-    a.grad = b.grad = None
-    (client._ORIG["matmul"](a, b).float().sum()).backward()
-    torch.testing.assert_close(ga, a.grad)
-    torch.testing.assert_close(gb, b.grad)
+    import torch.nn.functional as F
+    a = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+    ref = client._ORIG["matmul"](a, a)
+    torch.testing.assert_close(torch.matmul(input=a, other=a), ref)
+    torch.testing.assert_close(torch.mm(input=a, mat2=a), ref)
+    torch.testing.assert_close(a.matmul(other=a), ref)
+    torch.testing.assert_close(a.mm(mat2=a), ref)
+    w = torch.randn(32, 1024, device="cuda", dtype=torch.float16)
+    torch.testing.assert_close(F.linear(input=a, weight=w), client._ORIG["linear"](a, w))
+    assert torch.matmul.__name__ == "matmul" and torch.matmul.__wrapped__ is client._ORIG["matmul"]
+
+
+@requires_cuda
+def test_transforms_autocast_and_other_devices_use_torch(home, monkeypatch):
+    _put(home, 1024, 1024, 1024)
+    client.enable()
+    from kernels.triton_matmul import TritonMatmul
+    calls = []
+    orig = TritonMatmul.make_runner
+    monkeypatch.setattr(TritonMatmul, "make_runner", lambda self, a, b, out=None: calls.append(1) or orig(self, a, b, out))
+    a = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+    b = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        assert torch.matmul(a, b).dtype == torch.bfloat16                       # torch's cast, not our fp16 kernel
+    g = torch.func.grad(lambda x: torch.matmul(x, b).float().sum())(a)
+    torch.testing.assert_close(g, torch.func.grad(lambda x: client._ORIG["matmul"](x, b).float().sum())(a))
+    _, t = torch.func.jvp(lambda x: torch.matmul(x, b), (a,), (torch.ones_like(a),))
+    torch.testing.assert_close(t, client._ORIG["matmul"](torch.ones_like(a), b))
+    torch.func.vmap(lambda x: torch.matmul(x, b))(a[None].expand(2, -1, -1).contiguous())
+    with monkeypatch.context() as m:
+        m.setattr(torch._C, "_cuda_getDevice", lambda: 1)                      # a model-parallel program elsewhere
+        torch.matmul(a, b)
+    assert calls == []
+    torch.matmul(a, b)
+    assert calls == [1]
+
+
+@requires_cuda
+def test_parameters_are_dispatched(home):
+    _put(home, 1024, 1024, 1024)
+    client.enable()
+    w = torch.nn.Parameter(torch.randn(1024, 1024, device="cuda", dtype=torch.float16), requires_grad=False)
+    x = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+    torch.testing.assert_close(x @ w, client._ORIG["matmul"](x, w), rtol=1e-2, atol=1e-1)
+    assert client._STATE.runs[(1024, 1024, 1024, "fp16")][0] is not None
+
+
+@requires_cuda
+def test_threads_while_the_table_changes(home):
+    import threading
+    _put(home, 1024, 1024, 1024)
+    client.enable()
+    a = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+    ref = client._ORIG["matmul"](a, a)
+    errors = []
+
+    def work():
+        try:
+            for i in range(50):
+                torch.testing.assert_close(torch.matmul(a, a), ref, rtol=1e-2, atol=1e-1)
+                torch.matmul(a[: 64 + i].contiguous(), a)
+        except Exception as e:                                                 # noqa: BLE001
+            errors.append(e)
+    ts = [threading.Thread(target=work) for _ in range(6)]
+    for t in ts:
+        t.start()
+    for i in range(10):
+        _put(home, 512 + i, 512, 512)                                         # the daemon writes meanwhile
+        client._STATE._wc_checked = 0.0
+        time.sleep(0.01)
+    for t in ts:
+        t.join()
+    torch.cuda.synchronize()
+    assert not errors and client._STATE.runs[(1024, 1024, 1024, "fp16")][0] is not None
 
 
 @requires_cuda
@@ -200,6 +288,16 @@ def test_fork_child_starts_a_fresh_log(home):
     assert doc == {"calls": 0, "same": False} and sum(parent_log.calls.values()) == 1
 
 
+def test_fork_replaces_a_held_lock(home):
+    client.enable()
+    with client._LOCK:                                   # another thread holds it at fork time
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0 if client._LOCK.acquire(timeout=1) else 1)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+
+
 @requires_cuda
 def test_overhead(home, capsys):
     """Host time per call vs the unpatched function (median of 10,000; spec 5.4)."""
@@ -209,27 +307,30 @@ def test_overhead(home, capsys):
     h = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
     orig = torch.matmul
 
-    def per_call(f, x, n=10000):
+    def per_call(f, x, n=10000, sync_every=200):
+        """Median host time per call. Syncs often enough that the launch queue never fills (a full queue makes the
+        host wait for the GPU, which would be measured as overhead)."""
         ts = []
         for _ in range(n):
             t = time.perf_counter_ns()
             f(x, x)
             ts.append(time.perf_counter_ns() - t)
-            if len(ts) % 200 == 0:
+            if len(ts) % sync_every == 0:
                 torch.cuda.synchronize()
         ts.sort()
         return ts[len(ts) // 2] / 1e3
-    base32 = per_call(orig, a32)
+    hn = torch.randn(64, 64, device="cuda", dtype=torch.float16).t()              # fp16, in scope until contiguity
+    base32, base_nc = per_call(orig, a32), per_call(orig, hn)
     client.enable()
-    patched32 = per_call(torch.matmul, a32)
+    patched32, patched_nc = per_call(torch.matmul, a32), per_call(torch.matmul, hn)
     be = client._STATE._decide((1024, 1024, 1024, "fp16"), torch.float16)[0]
-    direct = per_call(lambda x, y: be.make_runner(x, y)(), h, 2000)
-    patched_hit = per_call(torch.matmul, h, 2000)
+    direct = per_call(lambda x, y: be.make_runner(x, y)(), h, 2000, sync_every=10)
+    patched_hit = per_call(torch.matmul, h, 2000, sync_every=10)
     with capsys.disabled():
         print(f"\n[overhead] {platform.processor() or platform.machine()}: undispatched +{patched32 - base32:.2f} us "
-              f"(torch {base32:.2f} us); dispatched wrapper +{patched_hit - direct:.2f} us over the kernel's own launch "
-              f"({direct:.2f} us)")
-    assert patched32 - base32 <= 5.0
+              f"(torch {base32:.2f} us), +{patched_nc - base_nc:.2f} us for a late exit (non-contiguous fp16); "
+              f"dispatched wrapper +{patched_hit - direct:.2f} us over the kernel's own launch ({direct:.2f} us)")
+    assert patched32 - base32 <= 5.0 and patched_nc - base_nc <= 5.0
     assert patched_hit - direct <= 15.0
 
 
@@ -252,6 +353,9 @@ def test_enable_env_installs_the_hook(home, tmp_path, capsys):
     assert (site_dir / "lscli.pth").exists() and envs.env_id(py) in envs.load(home)
     code = "import torch, lscli.client as c; print(c.enabled())"
     env = {**os.environ, "LSCLI_HOME": str(home.root)}
+    lazy = "import sys; print('torch' in sys.modules)"                          # the hook never imports torch itself
+    assert subprocess.run([str(py), "-c", lazy], env={**env, "LSCLI_PATCH": "1"}, capture_output=True, text=True,
+                          cwd=tmp_path).stdout.strip() == "False"
     assert subprocess.run([str(py), "-c", code], env={**env, "LSCLI_PATCH": "1"}, capture_output=True, text=True,
                           cwd=tmp_path).stdout.strip() == "True"
     assert subprocess.run([str(py), "-c", code], env=env, capture_output=True, text=True,
