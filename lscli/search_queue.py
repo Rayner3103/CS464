@@ -76,3 +76,45 @@ def consume(paths, end: int) -> None:
             f.truncate(0)
         else:
             save(end)
+
+
+def retain(paths, keep) -> tuple[int, int]:
+    """Rewrite the queue keeping only the requests `keep(request)` still wants (de-duplicated, most urgent reason,
+    oldest time), in place under the appenders' lock, so one request that waits for a slow re-search never holds up
+    the others and the file never grows without bound. Returns (lines before, requests kept)."""
+    import json
+    paths.root.mkdir(parents=True, exist_ok=True)
+    with open(paths.queue, "a+b") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        data = f.read()
+        end = data.rfind(b"\n") + 1                     # an unterminated tail is being written: keep it as it is
+        rows = []
+        for line in data[:end].splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict):
+                rows.append(r)
+        save_offset = paths.queue_offset.with_name("queue.offset.tmp")
+        save_offset.write_text("0")
+        os.replace(save_offset, paths.queue_offset)
+        by_key: dict[tuple, dict] = {}
+        for r in rows:
+            try:
+                if r.get("op", "search") != "search":
+                    continue
+                k = (int(r["M"]), int(r["N"]), int(r["K"]), str(r["dtype"]), str(r["env_id"]))
+            except (KeyError, ValueError, TypeError):
+                continue
+            prev = by_key.get(k)
+            if prev is None or _rank(r) < _rank(prev):
+                by_key[k] = {**r, "t": min(prev["t"], r.get("t", prev["t"])) if prev else r.get("t")}
+        kept = [r for r in sorted(by_key.values(), key=lambda r: r.get("t") or 0) if keep(r)]
+        f.seek(0)
+        f.truncate(0)
+        f.write(b"".join((json.dumps(r, sort_keys=True) + "\n").encode() for r in kept) + data[end:])
+        f.flush()
+        os.fsync(f.fileno())
+    return len(rows), len(kept)
