@@ -14,7 +14,8 @@ implementation plan (branches, PRs, order of work) is [`plan.md`](plan.md). Anyt
 |---|---|
 | Linux with systemd (user session), one NVIDIA GPU (device 0) | macOS / Windows; multi-GPU (device 0 is used, a warning is printed) |
 | One user: a `systemd --user` service run by whoever installed it | A shared system service for several users |
-| fp16 and bf16, 2-D, contiguous row-major NN `torch.matmul` / `@` | NT / TN layouts (`F.linear`, `nn.Linear`): logged, never dispatched |
+| fp16, 2-D, contiguous row-major NN `torch.matmul` / `@` / `torch.mm`, M, N, K in [1, 16384] | NT / TN layouts (`F.linear`, `nn.Linear`): logged, never dispatched |
+| bf16: dispatched (every winner passes the correctness gate) but **unvalidated**: the rankers, the cuBLASLt ranker and the bundle were trained / built on fp16 only | Shapes outside [1, 16384]: torch |
 | Inference and training (backward runs on torch) | Dispatch inside `torch.compile` graphs or CUDA-graph capture |
 
 ## 2. Components
@@ -23,11 +24,14 @@ implementation plan (branches, PRs, order of work) is [`plan.md`](plan.md). Anyt
 |---|---|---|---|
 | **client** (`lscli` package: `lscli.enable()`, the patch) | the user's own Python env | torch, triton, numpy, nvidia-ml-py | counts shapes, dispatches cached winners, falls back to torch, queues misses |
 | **worker** (`python -m lscli.worker`) | the user's interpreter, started by the daemon | same as the client | compiles, validates and times one proposed pool (`tune.online.measure`), writes the winner |
-| **daemon** (`lscli daemon run`, unit `lscli.service`) | `~/.local/share/lscli/venv` (pinned versions) | the repo's `requirements.txt` | idle gate, scheduler, ranking (`propose_*`), training, model registry, cache compaction |
+| **daemon** (`lscli daemon run`, unit `lscli.service`) | `~/.local/share/lscli/venv` (pinned versions) | the repo's `requirements.txt` | idle gate, scheduler, Triton ranking and the router (CPU: LightGBM), training, model registry, cache compaction. The daemon process itself never creates a CUDA context |
+| **proposer** (`python -m lscli.propose`) | the daemon venv, started per search job | same as the daemon | the GPU-needing part of ranking: the learned cuBLASLt ranker's proposals (`propose_lt`), which build descriptors and call `cublasLtMatmulAlgoCheck` |
 | **CLI** (`lscli ...`) | the daemon venv (on `PATH` via `~/.local/bin/lscli`) | same as the daemon | user commands, section 6 |
 | **clock helper** (`/usr/local/libexec/lscli-clock`, optional) | root, via one sudoers rule | `nvidia-smi` | locks / resets the SM clock around idle jobs |
 
 The client and the daemon never import each other at run time; they communicate only through the files in section 3.
+Nothing leaves the machine: there is no telemetry, and the usage record (shapes, interpreter paths) stays in
+`$LSCLI_HOME`, which is created with mode 0700.
 
 ## 3. Files
 
@@ -42,10 +46,12 @@ $LSCLI_HOME/
   profile/<pid>-<t0>.jsonl   client usage logs, one file per process
   profile.json               merged, decayed usage record (daemon-written)
   queue.jsonl                search requests (clients and CLI append, daemon consumes)
+  queue.offset               how far the daemon has consumed queue.jsonl (daemon-written)
+  gpu.lock                   held (flock) by the daemon while one of its jobs uses the GPU
   envs.json                  registered client interpreters
   models/<hw_id>/            this GPU's models + MODELS.json
   models/zero_shot/          the 3080 models used until native ones exist
-  train/<hw_id>/             train_best run directory (resumable)
+  train/<hw_id>/<n>/         train_best run directories (n = 1 for the first training, +1 per retraining)
   state.json                 daemon status (daemon-written, read by `lscli status`)
   control.json               pause / resume requests (CLI-written)
   client.json                settings the client needs (daemon-written from config.toml)
@@ -73,10 +79,11 @@ half_life_days = 30         # decay of the usage record
 [client]
 dispatch = true             # false = count shapes only, never dispatch
 inline_search = true        # search inline on a miss of a frequent shape (section 5.3)
-min_saving_us = 5           # do not dispatch a winner that saves less than this per call vs torch
+min_kernel_us = 50          # never dispatch when torch's kernel is shorter than this (host launch cost dominates)
+min_saving_us = 5           # nor when the winner saves less than this per call vs torch (also needs >= 2 %)
 
 [clock]
-lock_mhz = 0                # 0 = measure at stock clocks; > 0 needs the clock helper
+lock_mhz = 0                # 0 = measure at stock clocks; > 0 must equal the helper's /etc/lscli/clock.conf (set at install)
 
 [train]
 enabled = true
@@ -91,14 +98,19 @@ mode = "full"               # "full" | "quick" (train_best.sh modes)
 ```
 `calls` etc. are increments since the previous flush. `layout` is `NN` (dispatchable) or `NT` (`F.linear`, logged only).
 
-### 3.3 `profile.json` (daemon-written; merged from the logs, which are then deleted)
+### 3.3 `profile.json` (daemon-written; merged from the logs)
 
 ```json
-{"updated": 1762560000.0, "half_life_days": 30,
- "shapes": [{"M": 4096, "N": 4096, "K": 4096, "dtype": "fp16", "layout": "NN", "calls": 1.3e6, "calls_total": 2.0e6,
+{"updated": 1762560000.0, "half_life_days": 30, "offsets": {"4242-1762559000.jsonl": 18234},
+ "shapes": [{"M": 4096, "N": 4096, "K": 4096, "dtype": "fp16", "layout": "NN", "calls": 1.3e6, "calls_total": 2000000,
+             "hits": 1900000, "fallbacks": 100000, "envs": ["3f2a91c0d4e5"],
              "first_seen": 1762000000.0, "last_seen": 1762560000.0}]}
 ```
-`calls` is the decayed count: each increment is weighted by `0.5 ** (age_days / half_life_days)`.
+`calls` is the decayed count as of `updated`: each increment is weighted by `0.5 ** (age_days / half_life_days)`.
+The merge reads each log from its saved offset (only complete lines), so a log still being written is read
+incrementally; a log is deleted only when its process (the pid in its name) has exited and it was read to the end.
+The client resets its counters in a forked child (`os.register_at_fork`), so a DataLoader worker does not
+double-count its parent's calls.
 
 ### 3.4 `queue.jsonl`
 
@@ -106,10 +118,12 @@ mode = "full"               # "full" | "quick" (train_best.sh modes)
 {"t": 1762560000.0, "op": "search", "M": 4096, "N": 4096, "K": 4096, "dtype": "fp16", "env_id": "3f2a91c0d4e5",
  "reason": "miss"}
 ```
-`reason` is one of `miss` (client fallback), `stale` (soft-stale entry served), `superseded` (new models), `manual`
-(`lscli prewarm`). Duplicates are allowed; the daemon de-duplicates on (shape, dtype, env_id) and drops requests a
-current cache entry already satisfies. The daemon records consumed offsets in `state.json` and rewrites the file when
-everything in it is consumed.
+`reason` is one of `manual` (`lscli prewarm`), `miss` (client fallback), `stale` (soft-stale entry served),
+`superseded` (new models), in that priority order. Duplicates are allowed: the daemon de-duplicates on (shape, dtype,
+env_id), keeping the most urgent reason, and drops requests a current cache entry already satisfies. It records how
+far it consumed in `queue.offset`. When everything is consumed it truncates the file **in place, under the same
+`flock` the appenders take** (the inode never changes, so no writer can append to an unlinked file), and resets the
+offset to 0.
 
 ### 3.5 `envs.json`
 
@@ -117,28 +131,34 @@ everything in it is consumed.
 {"3f2a91c0d4e5": {"python": "/home/u/miniconda3/envs/llm/bin/python", "prefix": "/home/u/miniconda3/envs/llm",
                   "torch": "2.13.0+cu130", "triton": "3.7.1", "cuda_runtime": "13.0", "registered": 1762560000.0}}
 ```
-`env_id` = first 12 hex of sha256 of the interpreter's real path. Written by `lscli enable-env`; versions are re-read at
-the start of every worker run (a changed env updates its record).
+`env_id` = first 12 hex of sha256 of the interpreter's real path. Written by `lscli enable-env`; the worker reports its
+versions with every result and the daemon updates the record when they changed.
 
 ### 3.6 Winner cache `winners.jsonl`
 
 The format of `tune/winner_cache.py` schema 2, at `$LSCLI_HOME/winners.jsonl`. Each entry's environment is the
-worker's: GPU, its torch / Triton / CUDA runtime / cuBLASLt, driver, VBIOS, kernel source hash, plus:
+worker's: GPU, its torch / Triton / CUDA runtime / cuBLASLt, driver, VBIOS, kernel source hash, plus the fields lscli
+adds (`env_extra`, written to `client.json` so the client and the worker declare the same values):
 
 * `clock_lock`: the daemon's measurement policy (`"unlocked"` or the MHz from `[clock] lock_mhz`), **not** the clock the
-  user's program runs at: entries timed under one policy are soft-stale under another;
-* `models`: `{"triton": <id>, "lt_rank": <id>, "router": <id>, "source": "native" | "zero_shot"}` from `MODELS.json`.
+  user's program runs at. Entries timed under one policy are soft-stale under another, for the client as well, because
+  the client declares the policy from `client.json`;
+* `models`: `{"triton": <id>, "lt_rank": <id>, "router": <id>, "source": "native" | "zero_shot"}` from `MODELS.json`
+  (an absent model is `null`).
+
+lscli entries also carry `torch_us` (torch.matmul's short cold time for the shape, measured by the worker in the same
+session) for the client's dispatch rule (section 5.3).
 
 Tiers (from `tune/winner_cache.py`):
 
 | Tier | When | Client | Daemon |
 |---|---|---|---|
-| current | all declared fields match | serve | nothing |
+| current | all declared fields match | serve | widen if needed (section 4.3) |
 | soft-stale | driver / torch / Triton / CUDA / cuBLASLt / VBIOS / clock policy / models differ, or the line predates a field | serve after one correctness check (`mark_verified`); a failed check is a miss | re-search (reason `stale` / `superseded`) |
 | hard-stale | other GPU, or a Triton winner whose kernel source changed | miss | re-search if the shape is still in the profile |
 
-`lscli cache compact` (and the daemon, daily) runs `WinnerCache.compact()`: an entry a current search replaced is
-dropped; soft-stale entries stay until re-searched.
+`lscli cache compact` (and the daemon, daily) runs `WinnerCache.compact()`: a line that a current search replaced is
+dropped unless its own search was wider (k, lt_n, lt_knn, lt_rank); soft-stale lines stay until re-searched.
 
 ### 3.7 `models/<hw_id>/MODELS.json`
 
@@ -151,6 +171,7 @@ dropped; soft-stale entries stay until re-searched.
  "activated": 1762560000.0}
 ```
 A model id is `<stem>:<first 12 hex of sha256>`. A new set becomes active by an atomic rename of the directory.
+`zero_shot/MODELS.json` has the same form with `"source": "zero_shot"` and the source GPU's `hw_id`.
 
 ### 3.8 `state.json` (daemon-written every 5 s)
 
@@ -168,80 +189,121 @@ A model id is `<stem>:<first 12 hex of sha256>`. A new set becomes active by an 
 
 ### 4.1 Idle gate (evaluated every 5 s)
 
-The gate is open when all of these hold:
+The gate **opens** when all of these hold:
 
-1. **GPU idle.** NVML lists no compute process on device 0 other than the daemon's own job processes, and the GPU
-   utilization stayed below `gpu_util_max` for `gpu_idle_minutes`. Graphics-only clients (the desktop compositor)
-   do not count as compute processes.
-2. **Window.** The local time is inside `[idle] window`.
+1. **GPU idle.** NVML lists no compute process on the daemon's GPU, and the GPU utilization stayed below
+   `gpu_util_max` for `gpu_idle_minutes`. Graphics-only clients (the desktop compositor) are not compute processes. An
+   idle process that holds a CUDA context (a Jupyter kernel, a paused training script) **is** one and keeps the gate
+   closed; `lscli status` and `lscli doctor` name it.
+2. **Window.** The local time is inside `[idle] window` (a window may wrap midnight).
 3. **Power.** With `require_ac`, no `/sys/class/power_supply/*` battery reports `Discharging`.
-4. **Not paused / no backoff.** `control.json` asks for no pause, and no preemption backoff is running.
+4. **Not paused, no backoff, no foreign pipeline run.** `control.json` asks for no pause, no preemption backoff is
+   running, and nobody else holds `src/pipeline/.lock` (a manual `train_best.sh` run).
+
+While one of the daemon's jobs runs, the gate **stays open** as long as conditions 2-4 hold and no compute process
+outside the job appears. Utilization is not checked then, because the job itself drives it up.
+
+A job's processes are the job's root process and all its descendants, found by walking `/proc/<pid>/task/*/children`
+each poll (sweep compile workers are spawned grandchildren). NVML reports host PIDs: processes in other PID namespaces
+(containers) may appear with PIDs that match nothing, and they count as foreign. This errs on the side of yielding.
 
 ### 4.2 Preemption
 
-While a job runs, a watcher polls NVML every second. If a compute process that is not one of the job's processes
-appears (or the gate closes for any other reason):
+While a job runs, a watcher polls every second. When the gate closes (section 4.1):
 
-1. The job's process group gets SIGTERM, then SIGKILL after 5 s. Orphaned compile workers are killed by PID.
-2. The clock is reset (if it was locked).
-3. The unit in flight is discarded: a search writes nothing; a training stage keeps only the shapes it completed
-   (train_best stages are resumable per shape).
+1. The job's process group gets SIGTERM, then SIGKILL after 5 s. Descendants that left the group (spawned compile
+   workers) are killed by PID from the last descendant walk.
+2. The clock is reset if it was locked.
+3. The unit in flight is discarded. A search writes nothing, because the worker writes its winner only as its last
+   step and is killed before that. A training stage keeps only the shapes it completed (train_best stages are
+   resumable per shape).
 4. `backoff_minutes` of backoff starts.
 
 No measurement taken while a foreign compute process existed is ever written.
 
 ### 4.3 Scheduler
 
-Jobs, highest priority first; within a class, by `calls × t_est` (decayed calls from `profile.json` × the roofline
-estimate of one call):
+One job at a time, holding `gpu.lock`. Jobs, highest priority first; within a class, ordered by `calls × t_est`
+(decayed calls from `profile.json` × the roofline estimate of one call):
 
-1. **search**: queued `miss` / `manual` requests, and every profile shape with no usable entry.
-2. **re-search**: soft-stale entries (`stale`).
-3. **train**: the next unfinished training stage (section 4.5), if training is enabled and needed.
-4. **re-search**: entries superseded by newly activated models (`superseded`).
-5. **maintenance**: profile merge, queue rewrite and cache compaction (daily; CPU only, gate not required).
+1. **search**: queued `manual` / `miss` requests, and every NN profile shape with no usable entry for an env that ran
+   it.
+2. **widen**: shapes whose decayed calls reached `frequent_calls` but whose entry was searched with `k < k_frequent`.
+3. **re-search**: soft-stale entries (`stale`).
+4. **train**: the next unfinished training stage (section 4.5), if training is enabled and needed.
+5. **re-search**: entries superseded by newly activated models (`superseded`).
+6. **maintenance**: profile merge, queue consumption and daily cache compaction. These are CPU only and need no gate.
 
-CPU-only training stages (`train_v1`, `train_v2`, `lt_fit`, `router_fit`) need the window and power conditions but
-not GPU idleness.
+The CPU-only training stages (`train_v2`, `lt_fit`, `router_fit`, `package`, `summary`) need the window, power and
+pause conditions, but not GPU idleness. Every other stage is a GPU stage.
 
 ### 4.4 One search
 
-For a (shape, dtype, env_id), the daemon:
+For a (shape, dtype, env_id):
 
-1. Ranks in its own venv: `propose_triton` (k = `k_frequent` when the shape's decayed calls are at least
-   `frequent_calls`, else `k`) and the model-dependent cuBLASLt proposals (`lt_rank`).
-2. Starts `<env python> -m lscli.worker measure` (protocol in section 7) with the proposal keys.
-3. The worker rebuilds the pool in the user's env (`backends_from_keys`; it queries cuBLASLt's heuristic itself),
-   measures it, and writes the winner to `winners.jsonl` with its own environment.
+1. **Triton proposals** (daemon process, CPU): `propose_triton` with k = `k_frequent` when the shape's decayed calls
+   are at least `frequent_calls`, else `k`.
+2. **cuBLASLt proposals** (`python -m lscli.propose`, daemon venv, a child of the job): the learned cuBLASLt ranker's
+   top `lt_rank` configs (`propose_lt(..., lt_n, lt_rank=...)`), as keys. They are built with the daemon venv's
+   cuBLASLt. The worker rebuilds them with its own library (`cublaslt_knn.from_key`) and drops any its library
+   rejects, so a user env with another cuBLASLt gets a subset, never a wrong kernel. Skipped when there is no
+   cuBLASLt ranker for this GPU.
+3. **Measurement**: `<env python> -m lscli.worker measure` (protocol in section 7) with all the proposal keys. The
+   worker queries its own library's heuristic top `lt_n`, rebuilds the pool (`backends_from_keys`), short-times
+   torch.matmul for the shape (`torch_us`), runs `tune.online.measure` (with the router round trip when a router is
+   active), and writes the winner to `winners.jsonl` with its own environment plus `env_extra`.
 
 The worker uses the user's normal `TRITON_CACHE_DIR`, so the kernels it compiles are already cached when the user's
 program first runs them.
 
 ### 4.5 Training
 
-* **Models in use.** Until `models/<hw_id>/MODELS.json` exists with every model, the daemon uses
-  `models/zero_shot/` (the 3080 rankers, foreign-GPU flags set) plus cuBLASLt's heuristic top `lt_n`. On a GPU of
-  another architecture the cuBLASLt ranker and router are refused, as in `select_kernel`.
-* **First training.** `pipeline/train_best.sh --resume train/<hw_id> --only <stage> --skip-validation
-  [--clock-lock MHZ | --clock-lock none --allow-unlocked]`, one stage per job, in the script's dependency order,
-  skipping the `validate_*` stages. When the last fit finishes, the new set is packaged into `models/<hw_id>/`,
-  activated, and every existing entry becomes `superseded` (soft-stale by `models`).
-* **Retraining after an environment change.** Only the affected stages re-run:
+* **Models in use.** Until `models/<hw_id>/MODELS.json` lists every model, the daemon uses `models/zero_shot/` (the
+  3080 rankers) plus cuBLASLt's heuristic top `lt_n`. The zero-shot cuBLASLt ranker and router are used only on a GPU
+  with the source's architecture (they are refused elsewhere, as in `select_kernel`). The zero-shot Triton rankers are
+  used on any GPU.
+* **First training.** The daemon runs `pipeline/train_best.sh --run-dir train/<hw_id>/1 --skip-install
+  --skip-validation [--clock-lock MHZ | --clock-lock none --allow-unlocked] --full|--quick --only <stage>`
+  (`--full` or `--quick` from `train.mode`; later stages use `--resume train/<hw_id>/1 --only <stage>`). That is one stage per job, in the script's order: `preflight`, `env`, `check`,
+  `roofline`, `tune_sweep`, `heldout_sweep`, `selectors`, `train_v1`, `tail_sweep`, `train_v2`, `lt_screen`,
+  `lt_fit`, `tune_stage2_cold`, `tune_stage2_graph`, `router_fit`, `bundle` (only when the daemon venv's Triton
+  matches a registered env), `package`, `summary`.
+  * `train_best.sh` runs from `src/`, which is a git clone (`preflight` checks the history) using the daemon venv's
+    `python` (`--skip-install`).
+  * It takes `src/pipeline/.lock` itself. The daemon does not hold that lock; its own jobs hold `gpu.lock`.
+  * When `package` finishes, `models/` of the run is copied into `models/<hw_id>/` and activated. Every existing
+    entry then becomes `superseded` (soft-stale by `models`).
+  * `heldout_sweep` only screens the held-out shapes that `selectors` / `tune topk` need. No fit sees them.
+* **Retraining after an environment change.** The daemon compares the active `trained_env` with the daemon venv's
+  environment once a day:
 
-| Change | Stages |
+| Change | Stages re-run |
 |---|---|
-| cuBLASLt version | `lt_screen`, `lt_fit`, `tune_stage2_cold`, `tune_stage2_graph`, `router_fit` |
-| Triton version or kernel source | `tune_sweep`, `tail_sweep`, `selectors`, `train_v1`, `train_v2`, `tune_stage2_*`, `router_fit`, `bundle` |
-| driver | `tune noise --rounds 1`; if the noise floor moved past 2 %, as for a cuBLASLt change, else nothing |
+| cuBLASLt version | `lt_screen`, `lt_fit`, `tune_stage2_cold`, `tune_stage2_graph`, `router_fit`, `package` |
+| Triton version or kernel source | `tune_sweep`, `heldout_sweep`, `selectors`, `train_v1`, `tail_sweep`, `train_v2`, `tune_stage2_cold`, `tune_stage2_graph`, `router_fit`, `bundle`, `package` |
+| driver only | none: every winner becomes soft-stale and is re-searched; `lscli train retrain` forces a full retraining |
 
-Retraining compares the active `trained_env` with the daemon venv's environment once a day.
+  A retraining runs in a **new** run directory `train/<hw_id>/<n+1>/`. The directory is seeded with hard links to the
+  previous run's outputs and stamps of the stages that are **not** re-run, so the stages that are re-run start empty.
+  Reusing the old directory would keep their old rows, because the stages resume per shape and `--only` skips
+  stamped stages.
 
 ### 4.6 Clock
 
-With `lock_mhz > 0` and the helper installed, the daemon runs `sudo -n /usr/local/libexec/lscli-clock lock` before a
-GPU job and `... reset` after it, on preemption, on exit, and from the unit's `ExecStopPost`. The helper reads the
-MHz from the root-owned `/etc/lscli/clock.conf`. It never takes a frequency argument, so the sudoers rule allows
-exactly two fixed command lines. Without the helper, `lock_mhz` must be 0.
+* The lock MHz is chosen **at install time**. The installer suggests about 85 % of the card's maximum SM clock,
+  validated against `nvidia-smi -q -d SUPPORTED_CLOCKS`. It writes the root-owned `/etc/lscli/clock.conf` and sets
+  `[clock] lock_mhz` to the same value.
+* With `lock_mhz > 0`, the daemon runs `sudo -n /usr/local/libexec/lscli-clock lock` before a GPU job and
+  `sudo -n /usr/local/libexec/lscli-clock reset` after it, on preemption and on exit. The unit runs the reset in
+  `ExecStartPre` and `ExecStopPost`, so a crash or SIGKILL is cleaned up at the next start.
+* The helper:
+  * is root-owned (0755) in root-owned directories;
+  * uses an absolute `/usr/bin/nvidia-smi` and a scrubbed environment;
+  * takes exactly one argument, `lock` or `reset`;
+  * reads the MHz only from `clock.conf` and re-validates it.
+* `/etc/sudoers.d/lscli` allows exactly those two command lines, for the installing user only, and is checked with
+  `visudo -c`.
+* Without the helper, `lock_mhz` must be 0.
 
 ## 5. Client
 
@@ -256,13 +318,17 @@ exactly two fixed command lines. Without the helper, `lock_mhz` must be 0.
 
 `torch.matmul(a, b)`, `a @ b` and `torch.mm(a, b)` are handled when all of these hold:
 
-* both are CUDA tensors on device 0;
+* both are CUDA tensors on the current device;
+* that device's UUID equals the daemon's GPU (`gpu_uuid` in `client.json`), so `CUDA_VISIBLE_DEVICES` cannot route a
+  winner to another card;
 * the dtype is fp16 or bf16, both operands have the same dtype, and both are 2-D;
+* M, N and K are in [1, 16384];
 * both are contiguous with 16-byte-aligned data pointers;
 * `out=` is not given;
 * the call is not inside `torch.compile` tracing or CUDA-graph capture.
 
-Under autograd the kernel runs inside an `autograd.Function` whose backward uses `torch.matmul`.
+The kernel runs inside an `autograd.Function` only when an operand requires grad. Its backward calls the **original**
+(unpatched) `torch.matmul`.
 
 Every other call goes to the original torch function untouched. `F.linear` is wrapped only to count its shape
 (`layout: "NT"`).
@@ -270,24 +336,40 @@ Every other call goes to the original torch function untouched. `F.linear` is wr
 ### 5.3 Per-call behaviour
 
 1. Count the shape (an in-process counter).
-2. Look the shape up in the winner table. The client loads `winners.jsonl` once, then re-checks its mtime at most
-   once per second and reloads on change.
-3. **Current entry:** run the winner's backend (built once per shape and kept).
-4. **Soft-stale entry:** the first time in this process, run the correctness check (once per environment, recorded
-   with `mark_verified`). On a pass, serve it and queue `stale` once; on a fail, treat it as a miss.
-5. **Miss:** if `inline_search` and the shape's decayed calls in `profile.json` are at least `frequent_calls`, run
-   `select_kernel(..., calls=calls, serve_stale=True)` inline, once per process (needs lightgbm in the user's env; if
-   it is missing, behave as below). Otherwise call torch and queue `miss` once per process.
-6. **No dispatch** of a winner whose `winner_us` is within `min_saving_us` of torch's time, where known (the
-   per-process dispatch overhead is larger than the gain).
+2. Look the shape up in the winner table.
+   * The client loads `winners.jsonl` once with the `env_extra` of `client.json`, re-checks its mtime at most once
+     per second and reloads on change.
+   * Any search width is accepted (`get(k=1, lt_n=0, allow_stale=True)`), because widening is the daemon's job
+     (section 4.3).
+3. **Current entry:** dispatch if the rule in step 6 allows it. The backend is built once per shape and kept.
+4. **Soft-stale entry:** the first time in this process, run the correctness check, once per environment, recorded
+   with `mark_verified`.
+   * On a pass, dispatch (step 6) and queue `stale` once.
+   * On a fail, treat it as a miss.
+5. **Miss:**
+   * **Search inline** when all of these hold: `inline_search` is on, the shape's decayed calls in `profile.json` are
+     at least `frequent_calls`, and lightgbm and the models in `client.json` can be loaded. The search is
+     `select_kernel(..., calls=calls, cache=<the lscli WinnerCache>, use_bundle=False, serve_stale=True)` and runs
+     once per process. `use_bundle=False` keeps a Triton cache manager out of the user's process.
+   * **Otherwise**, call torch and queue `miss` once per process.
+6. **Dispatch rule.** Dispatch only when the entry has `torch_us` and both conditions hold:
+   * `torch_us >= min_kernel_us`: under 50 µs the Python-side Triton launch costs as much as the kernel;
+   * `torch_us - winner_us >= max(min_saving_us, 0.02 · torch_us)`: the 2 % tie margin of the study.
+   Otherwise call torch, which is still counted as a hit: the selector chose torch.
 
-A dispatched call never raises a new exception type. On any error the client calls torch, disables dispatch for
-that shape for the rest of the process, and logs one warning.
+A dispatched call never raises a new exception type. On any error the client calls torch, disables dispatch for that
+shape for the rest of the process, and logs one warning.
 
 ### 5.4 Overhead budget
 
-The patched path for an undispatched call (wrong dtype, layout, device, ...) adds at most 2 µs; a dispatched hit adds
-at most 5 µs over the kernel launch. Measured by `tests/lscli/test_overhead.py`.
+`tests/lscli/test_overhead.py` measures the host time per call (the median over 10,000 calls, with the CPU model
+printed) against an unpatched `torch.matmul`:
+
+* **Undispatched call** (wrong dtype, layout, device, ...): at most +5 µs.
+* **Dispatched hit:** at most +15 µs.
+
+The budgets are reviewed once the test exists; dispatch is restricted to kernels of at least `min_kernel_us` for this
+reason.
 
 ## 6. CLI
 
@@ -306,7 +388,7 @@ at most 5 µs over the kernel launch. Measured by `tests/lscli/test_overhead.py`
 | `train` | `lscli train status` / `start` / `retrain [--stages S,...]` | Training progress; allow training now (window ignored, gate still required); force stages |
 | `config` | `lscli config [KEY [VALUE]]` | Show / get / set a config key (`idle.window`, ...) and tell the daemon to reload |
 | `logs` | `lscli logs [-f] [--job ID]` | Daemon or job log |
-| `doctor` | `lscli doctor` | Checks: GPU and driver, systemd user session and linger, unit state, clock helper, versions of each registered env, file permissions, models present |
+| `doctor` | `lscli doctor` | Checks: GPU and driver, systemd user session and linger, unit state, clock helper, versions of each registered env (and gcc + `Python.h`, which Triton's launcher needs), file permissions, models present, processes holding a CUDA context (they keep the gate closed) |
 | `daemon` | `lscli daemon run` (used by the unit) / `start` / `stop` / `restart` | Foreground loop / `systemctl --user` wrappers |
 | `uninstall` | `lscli uninstall [--purge] [--yes]` | Stop and remove the unit, reset clocks, remove the clock helper (sudo), `disable-env` every registered env, remove `~/.local/bin/lscli`; keep `$LSCLI_HOME` unless `--purge` |
 
@@ -318,23 +400,35 @@ system (no NVIDIA GPU, no systemd user session).
 `<python> -m lscli.worker measure` reads one JSON request from stdin:
 
 ```json
-{"M": 4096, "N": 4096, "K": 4096, "dtype": "fp16", "k": 3, "lt_n": 16, "confirm": 3, "router": true,
+{"M": 4096, "N": 4096, "K": 4096, "dtype": "fp16", "k": 3, "lt_n": 16, "lt_rank": 5, "confirm": 3, "router": true,
  "proposals": [{"family": "triton", "key": "bm128_bn128_bk32_w4_s3_g1_sk1", "setup_s": 0.0},
                {"family": "cublaslt_rank", "key": "r0_a21_t20_s8_sk1_r0_sw0_c0", "setup_s": 0.12}],
- "rank_s": 0.04, "cache": "/home/u/.local/share/lscli/winners.jsonl",
- "env_extra": {"clock_lock": "1755", "models": {"triton": "lgbm_rank_v2:0123456789ab", "source": "native"}},
- "order": "diverse", "ranker": "lgbm_rank_v2"}
+ "cache": "/home/u/.local/share/lscli/winners.jsonl",
+ "env_extra": {"clock_lock": "1755",
+               "models": {"triton": "lgbm_rank_v2:0123456789ab", "lt_rank": "lt_rank:3c4d5e6f7a8b",
+                          "router": "router:9a8b7c6d5e4f", "source": "native"}},
+ "order": "diverse", "ranker": "lgbm_rank_v2", "reply_timeout_s": 30}
 ```
 
-and writes JSON lines to stdout:
+It writes JSON lines to its **protocol channel**:
 
-* `{"op": "route", "t_lt_us": 41.2}` when `router` is true, after the cuBLASLt half is timed. The daemon answers
-  on stdin with `{"skip": false, "p": 0.31, "threshold": 0.02}`.
-* `{"op": "result", "choice": {...}, "candidates": [...], "router": {...}, "written": true}` as the last line.
+* `{"op": "route", "t_lt_us": 41.2}` when `router` is true, after the cuBLASLt half is timed. The daemon answers on
+  stdin with `{"skip": false, "p": 0.31, "threshold": 0.02}`. With no answer within `reply_timeout_s`, the worker
+  does not skip.
+* `{"op": "result", "choice": {...}, "candidates": [...], "router": {...}, "torch_us": 812.0, "written": true,
+  "env": {...}}` as the last line. `env` is the worker's environment, used to update `envs.json`.
 * `{"op": "error", "error": "..."}` for any failure (the exit status is non-zero too).
 
-The heuristic cuBLASLt candidates are not in `proposals`: the worker queries its own library's heuristic top `lt_n`.
-Proposals that the worker's library cannot build are dropped (`backends_from_keys`).
+The channel is the worker's original stdout. At start-up the worker duplicates fd 1 to a private descriptor, then
+points fd 1 and `sys.stdout` at stderr. A library print or warning therefore cannot corrupt the protocol.
+
+The daemon reads the channel line by line (never `communicate()`) while it can still write stdin, and it kills a
+worker that sends nothing for 10 minutes.
+
+Other subcommands, all with JSON on stdout:
+
+* `env` prints the interpreter's `environment()`;
+* `verify --cache PATH --env-extra JSON` runs the correctness check on every entry this env would serve.
 
 ## 8. Install
 
@@ -342,21 +436,34 @@ Proposals that the worker's library cannot build are dropped (`backends_from_key
 curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/<tag>/install/install.sh | sh
 ```
 
-1. **Preflight.** Linux; `systemctl --user` reachable; `nvidia-smi` works; Python ≥ 3.11 for the daemon venv
-   (`tomllib`); one GPU (more: warn, use device 0). Exit 4 if any of these fails.
-2. Download the repo at `<tag>` into `$LSCLI_HOME/src`. Create `venv/` and install the pinned `requirements.txt`
-   (torch from the cu130 index) and `src` in editable mode.
-3. Download the zero-shot models (GitHub release assets of `<tag>`; sha256 checked) into `models/zero_shot/`.
-   Unpack `kernels/bundle.tar.xz`.
+1. **Preflight.** Exit 4 if any of these fails:
+   * Linux;
+   * `systemctl --user` is reachable;
+   * `nvidia-smi` works;
+   * Python ≥ 3.11 for the daemon venv (`tomllib`);
+   * gcc and the Python headers are present (Triton builds its launcher with them);
+   * `git` is present;
+   * one GPU (with more: warn and use device 0).
+2. `git clone` the repo at `<tag>` into `$LSCLI_HOME/src`. It must be a clone, because `train_best.sh`'s `preflight`
+   checks the history. Create `venv/` and install the pinned `requirements.txt` (torch from the cu130 index) and
+   `src` in editable mode. `$LSCLI_HOME` is created with mode 0700.
+3. Download the zero-shot models (GitHub release assets of `<tag>`) into `models/zero_shot/`. Their sha256 sums are
+   **pinned in `install.sh`** itself, not fetched from the release. Unpack `kernels/bundle.tar.xz`.
 4. Write `~/.config/lscli/config.toml` if absent. Link `~/.local/bin/lscli`. Install and start `lscli.service`
    (`systemctl --user enable --now`). Run `loginctl enable-linger` when the user agrees (prompt; `--linger` /
    `--no-linger`).
-5. Clock helper: ask "install the clock helper (needs sudo)? [y/N]" (`--clock-helper` / `--no-clock-helper`). On
-   yes, install the helper, `/etc/lscli/clock.conf` and `/etc/sudoers.d/lscli` (validated with `visudo -c`). The lock
-   MHz is probed at the first open gate.
+5. Clock helper: ask "install the clock helper (needs sudo)? [y/N]" (`--clock-helper` / `--no-clock-helper`).
+   On yes:
+   * ask for the lock MHz (`--clock-mhz`, default about 85 % of the maximum SM clock, validated against the supported
+     clocks);
+   * install the helper, `/etc/lscli/clock.conf` and `/etc/sudoers.d/lscli` (checked with `visudo -c`);
+   * set `[clock] lock_mhz`.
 6. Print the next step: `lscli enable-env $(command -v python3)`.
 
 The installer is idempotent; re-running it upgrades `src/` and the venv and keeps the data.
+
+The window only matters while the machine is awake. lscli never wakes it from suspend, so a machine that sleeps at
+night trains in whatever window it is awake for. Without linger, the service stops at logout.
 
 ## 9. Known limitations (v1)
 
@@ -369,3 +476,7 @@ The installer is idempotent; re-running it upgrades `src/` and the venv and keep
   in idle time.
 * Zero-shot quality depends on the GPU: close to native on sm_86 (3090), Triton half useless on sm_75 (2060), where
   the cuBLASLt half carries the search.
+* The gate cannot tell an idle process that holds a CUDA context from a busy one: such a process keeps background
+  work from running at all.
+* The cuBLASLt ranker's proposals come from the daemon venv's cuBLASLt. A user env with another cuBLASLt build gets
+  only the subset its library accepts.
