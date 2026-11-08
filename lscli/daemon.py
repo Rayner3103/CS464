@@ -169,10 +169,10 @@ class Daemon:
         snap = self.snapshot()
         if callable(own):
             own = own()
+        locked = lock.exists() and gate.lock_held(lock, exclude=own or frozenset())   # our own train_best holds it
         return self.gate.reasons(snap=snap, now=self.clock(), local=self.local_now(), battery=self.battery(),
                                  paused=control.paused(control.read_control(self.paths), self.clock()),
-                                 backoff_until=self.backoff_until, pipeline_locked=lock.exists() and gate.lock_held(lock),
-                                 own=own)
+                                 backoff_until=self.backoff_until, pipeline_locked=locked, own=own)
 
     def write_state(self, **extra) -> None:
         pend, _ = queue.pending(self.paths)
@@ -234,39 +234,55 @@ class Daemon:
         tr = training.Training(self.paths, self.hw_id)
         ctl = control.read_control(self.paths)
         req = ctl.get("retrain")
-        if req and req.get("t") != tr.state.get("request_t"):
-            stages = [s for s in (req.get("stages") or training.STAGES) if s in training.STAGES]
-            change = {"first"} if not req.get("stages") else {"manual"}
-            tr.begin(change, stages if req.get("stages") else training.stages_for({"first"}, self._with_bundle()),
-                     self.daemon_env, "requested (lscli train retrain)")
-            tr.state["request_t"] = req.get("t")
-            tr.save()
-        elif not tr.active() and (tr.state.get("status") != "failed") and \
+        if req:
+            control.write_control(self.paths, {k: v for k, v in ctl.items() if k != "retrain"})   # consumed once
+            self._refresh_daemon_env()
+            if req.get("stages"):
+                if tr.state.get("status") != "done" or tr.run_dir is None:
+                    self.log.warning("retrain of %s refused: no finished training to start from", req["stages"])
+                else:
+                    tr.begin({"manual"}, list(req["stages"]), self.daemon_env, "requested: " + ", ".join(req["stages"]),
+                             request_t=req.get("t"))
+            else:
+                tr.begin({"first"}, training.stages_for({"first"}, self._with_bundle()), self.daemon_env,
+                         "requested (lscli train retrain)", request_t=req.get("t"))
+        elif not tr.active() and tr.state.get("status") != "failed" and \
                 self.clock() - self.last_train_check >= TRAIN_CHECK_S:
             self.last_train_check = self.clock()
+            self._refresh_daemon_env()                      # a Triton / cuBLASLt upgrade of the daemon venv shows here
             ch = training.changes(training.trained_env(self.paths, self.hw_id), self.daemon_env)
             if ch:
                 tr.begin(ch, training.stages_for(ch, self._with_bundle()), self.daemon_env,
                          "no models for this GPU" if "first" in ch else "changed: " + ", ".join(sorted(ch)))
         if not tr.active():
+            self._clear_train_now()                         # nothing to train: `train start` does not linger
             return None
         stage = tr.next_stage()
         if stage is None:                                    # every stage stamped: activate the new models
             try:
-                training.activate(self.paths, self.hw_id, tr.run_dir, {k: self.daemon_env.get(k) for k in
-                                                                       ("triton", "cublaslt", "driver", "kernel_src", "torch")})
+                env = tr.state.get("env") or self.daemon_env  # the environment the stages ran under
+                training.activate(self.paths, self.hw_id, tr.run_dir,
+                                  {k: env.get(k) for k in ("triton", "cublaslt", "driver", "kernel_src", "torch")})
                 tr.finish()
-                ctl = control.read_control(self.paths)
-                if ctl.get("train_now"):
-                    control.write_control(self.paths, {**ctl, "train_now": False})
                 self.log.info("training run %s done: models activated", tr.state["run"])
                 self.load_models()
-            except OSError as e:
-                self.log.error("activating run %s failed: %s", tr.state["run"], e)
+            except Exception as e:                          # never let a bad run break the loop
+                self.log.error("activating run %s failed: %s: %s", tr.state["run"], type(e).__name__, e)
                 tr.state["status"] = "failed"
                 tr.save()
+            self._clear_train_now()
             return None
         return stage
+
+    def _refresh_daemon_env(self) -> None:
+        doc = self._worker_env(self.python, {})
+        if doc:
+            self.daemon_env = doc
+
+    def _clear_train_now(self) -> None:
+        ctl = control.read_control(self.paths)
+        if ctl.get("train_now"):
+            control.write_control(self.paths, {**ctl, "train_now": False})
 
     def _with_bundle(self) -> bool:
         """Build the kernel bundle only when some registered env runs the daemon venv's Triton (else no hit)."""
@@ -289,7 +305,8 @@ class Daemon:
         if "bundle" in tr.state.get("stages", []):
             argv.append("--with-bundle")
         env = {**os.environ, "PATH": f"{Path(self.python).parent}{os.pathsep}{os.environ.get('PATH', '')}"}
-        job = jobs.Job(argv, cwd=src, env=env, log=self._job_log(f"train-{stage}"))
+        job = jobs.Job(argv, cwd=src, env=env, log=self._job_log(f"train-{stage}"), protocol=False)
+        t0 = time.monotonic()
         try:
             code = jobs.supervise(job, watch=lambda tree_fn: self._watch(tree_fn, stage))
         except jobs.Preempted:
@@ -299,8 +316,15 @@ class Daemon:
         finally:
             job.close()
         if code != 0 or stage not in tr.done():
+            # train_best's own idle-GPU check or lock can lose a race with a user process that appeared after our
+            # gate poll: a quick failure with the GPU now busy is a preemption, not a broken stage.
+            if time.monotonic() - t0 < 60 and any(r.startswith(GPU_REASONS[0]) for r in self.gate_reasons()):
+                raise jobs.Preempted()
             n = tr.record_failure(stage)
+            if tr.state.get("status") == "failed":
+                self._clear_train_now()
             raise jobs.JobError(f"train_best stage {stage} failed (exit {code}, attempt {n})")
+        tr.record_success(stage)
         self.log.info("training stage %s done (run %s)", stage, tr.state["run"])
 
     def tick(self) -> scheduler.Task | None:
