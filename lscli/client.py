@@ -271,14 +271,15 @@ class _Client:
                 or torch._C._cuda_isCurrentStreamCapturing() or _autocast_on() or _forward_ad_active()):
             return None
         key = (M, N, K, _DTYPES[a.dtype])
-        if time.monotonic() - self._wc_checked >= 1.0:
+        now = time.monotonic()
+        if now - self._wc_checked >= 1.0:
             self._cache()                                    # picks up winners the daemon wrote since
         hit_be = self.runs.get(key)
         if hit_be is None:
             hit_be = self._decide_once(key, a.dtype)
         be, hit = hit_be
         self.log.add(M, N, K, key[3], "NN", hit=hit)
-        if time.monotonic() - self._last_flush > FLUSH_S:
+        if now - self._last_flush > FLUSH_S:
             self.flush()
         return be
 

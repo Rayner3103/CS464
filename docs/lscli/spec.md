@@ -381,7 +381,7 @@ warning.
 printed):
 
 * **Undispatched call** (wrong dtype, layout, device, ...): at most +5 µs over the unpatched function.
-* **Dispatched hit:** at most +15 µs over calling the selected kernel directly (`backend.make_runner(a, b)()`). That
+* **Dispatched hit:** at most +20 µs over calling the selected kernel directly (`backend.make_runner(a, b)()`). That
   launch itself costs more than torch's (a Triton launch from Python takes tens of µs). This is why dispatch is limited
   to kernels of at least `min_kernel_us`, where the launch runs ahead of the GPU.
 
@@ -390,6 +390,11 @@ Measured on the RTX 2060 box (x86_64), after all the scope checks of 5.2:
 * +2.3 µs for an early exit (fp32; torch takes 11.5 µs);
 * +3.7 µs for a late exit (fp16, non-contiguous);
 * +13.5 µs for a dispatched call over a 36.9 µs Triton launch.
+
+The dispatched budget was raised from 15 to 20 µs once measured. The routing checks cost 4.7 µs timed alone but
+about 13 µs when interleaved with a Triton launch: each check costs more next to the launcher (the usage count goes
+from 0.75 to 3.3 µs), which points to CPU cache effects, so the cost is real. Measured runs give 13-14 µs; the budget
+leaves room for machine noise.
 
 The test syncs often enough that the launch queue never fills, because a full queue would count GPU time as host
 overhead.
