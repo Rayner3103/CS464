@@ -364,6 +364,77 @@ def cmd_disable_env(args, paths: Paths) -> int:
     return EXIT_OK if removed or unreg else EXIT_FAIL
 
 
+# ------------------------------------------------------------------------------------------------------------ daemon
+_UNIT = "lscli.service"
+
+
+def _systemctl(*argv: str) -> int:
+    try:
+        return subprocess.run(["systemctl", "--user", *argv]).returncode
+    except OSError as e:
+        print(f"lscli: systemctl unavailable ({e})", file=sys.stderr)
+        return EXIT_UNSUPPORTED
+
+
+def cmd_daemon(args, paths: Paths) -> int:
+    if args.action == "run":
+        from lscli.daemon import Daemon, setup_logging
+        st = control.read_state(paths)
+        if control.daemon_alive(st) and st.get("pid") != os.getpid():
+            print(f"lscli daemon: already running (pid {st['pid']})", file=sys.stderr)
+            return EXIT_FAIL
+        setup_logging(paths.ensure())
+        return Daemon(paths, args.config).run()
+    rc = _systemctl(args.action, _UNIT)
+    return EXIT_OK if rc == 0 else (rc if rc == EXIT_UNSUPPORTED else EXIT_FAIL)
+
+
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smhd])$")
+
+
+def cmd_pause(args, paths: Paths) -> int:
+    seconds = None
+    if args.duration:
+        m = _DURATION.match(args.duration)
+        if not m:
+            print("lscli pause: --for takes e.g. 90m, 2h, 1d", file=sys.stderr)
+            return EXIT_USAGE
+        seconds = float(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    doc = control.pause(paths.ensure(), seconds)
+    _out(args, doc, "paused" + (f" until {time.strftime('%Y-%m-%d %H:%M', time.localtime(doc['paused_until']))}"
+                                if doc.get("paused_until") else " until `lscli resume`")
+         + ("" if control.daemon_alive(control.read_state(paths)) else " (the daemon is not running)"))
+    return EXIT_OK
+
+
+def cmd_resume(args, paths: Paths) -> int:
+    control.resume(paths.ensure())
+    _out(args, {"paused": False}, "resumed")
+    return EXIT_OK
+
+
+def cmd_logs(args, paths: Paths) -> int:
+    if args.job:
+        logs = sorted((paths.logs / "jobs").glob(f"*{args.job}*.log"))
+        if not logs:
+            print(f"lscli logs: no job log matching {args.job!r}", file=sys.stderr)
+            return EXIT_FAIL
+        path = logs[-1]
+    else:
+        path = paths.logs / "daemon.log"
+        if not path.exists():
+            print("lscli logs: no daemon log yet", file=sys.stderr)
+            return EXIT_FAIL
+    if args.follow:
+        try:
+            return subprocess.run(["tail", "-n", str(args.lines), "-F", str(path)]).returncode
+        except KeyboardInterrupt:
+            return EXIT_OK
+    lines = path.read_text(errors="replace").splitlines()[-args.lines:]
+    print("\n".join(lines))
+    return EXIT_OK
+
+
 # ------------------------------------------------------------------------------------------------------------ main
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="lscli", description="learned-selector CLI (docs/lscli/spec.md)")
@@ -395,6 +466,18 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
     w.add_argument("--env", help="env id or interpreter path (default: every registered env)")
     w.set_defaults(fn=cmd_prewarm)
+    dm = sub.add_parser("daemon", help="run the daemon in the foreground, or start / stop / restart its unit")
+    dm.add_argument("action", choices=("run", "start", "stop", "restart"))
+    dm.set_defaults(fn=cmd_daemon)
+    pa = sub.add_parser("pause", help="stop starting background jobs (a running one is preempted)")
+    pa.add_argument("--for", dest="duration", help="e.g. 90m, 2h, 1d (default: until resume)")
+    pa.set_defaults(fn=cmd_pause)
+    sub.add_parser("resume", help="clear a pause").set_defaults(fn=cmd_resume)
+    lg = sub.add_parser("logs", help="daemon or job log")
+    lg.add_argument("-f", "--follow", action="store_true")
+    lg.add_argument("-n", "--lines", type=int, default=50)
+    lg.add_argument("--job", help="part of a job log name (logs/jobs/)")
+    lg.set_defaults(fn=cmd_logs)
     k = sub.add_parser("cache", help="inspect / verify / compact / clear the winner cache")
     k.add_argument("action", choices=("ls", "verify", "compact", "clear"))
     k.add_argument("--env", help="env id or interpreter path")
