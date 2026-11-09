@@ -4,6 +4,144 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-11-09: full training run on the RTX 3090 and its noise study — the pipeline transfers within sm_86, the 3080's 2% tie margin does not (the 3090 floor is 4-5% at >= 50 µs)
+
+**What ran.** `MODE=full sbatch remoteGPU/train_best.sh` on the RTX 3090 (`rtx3090_sm86_82sms_24gb`, 82 SMs, driver 590.48.01, torch 2.13.0+cu130, Triton 3.7.1, **clock unlocked**), everything fitted from this GPU's own data and nothing borrowed from the 3080. Run directory `pipeline/runs/rtx3090/train_best-full-slurm/` (harness `875ba36`, a second short session on `9add6b7`; clean). Its `SUMMARY.md` has the model table. Then `remoteGPU/noise.sh` (`python -m tune --clock-lock none noise --rounds 3 --repeats 50 --n-allocs 3`), session `noise-20261109-183128-5ac4`, harness `57b7a15`, clean, `data/rtx3090_sm86_82sms_24gb/noise.jsonl`.
+- Rows: tune stage 2 cold 11,032 (`20261108-182541-834666`) and graph 5,249; held-out stage 2 cold 3,251 (`20261108-201758-f2a3d4`, + 94 rows `20261109-002122-9c6930`) and graph 2,344 (`20261108-203309-c4a76c`, + 78 rows). **0 invalid** in all four; 2 / 21 / 0 / 0 not converged on the four files; power-capped 70% (tune cold) / 48% (tune graph) / 60% (held-out cold) / 50% (held-out graph). Edge correctness check: 1,183 candidates, 0 failures. The `*_lock1755_tune477*` file names are a leftover of the pipeline's naming: every row says `unlocked`.
+- Oracle: this GPU's own screens (`sweep_screen` 477 tune shapes, `sweep_screen_tail`, `sweep_screen_heldout` 86 shapes). The held-out set is the 3080's 86.
+- Roofline (unlocked, 1680-1950 MHz): **70.2 TFLOP/s** fp16 tensor, **844 GB/s** DRAM (3080: 59.7 / 687, locked 1755). Do not compare absolute times with the 3080's.
+- Not run: the router's held-out score (`analysis.router score`), a fresh-shape check, k-NN cuBLASLt proposals in the joint run (the validation pool is v2/v1 top-k + the heuristic top-16 + the learned cuBLASLt ranker's picks, which show up as `r*` keys in the log), a second noise session, a locked-clock re-run. `logs/validate_compare.log` contains a `StopIteration` traceback from `analysis/ranker_compare.py:74` (a chosen key not found in the stage-2 pick families); `ranker_compare.md` was written afterwards and is complete, but the cause was not investigated, and 19-21 of the 27 shared-shape joint picks have a stage-2 time (the "timed in the stage-2 session" column below).
+
+**Models fitted on the 3090** (vs the 3080's):
+
+| model | 3090 | 3080 |
+|---|---|---|
+| rank v1 | 477 tune shapes, pool 905, lambdarank / 127 leaves / 800 trees | 477 shapes (2026-10-19) |
+| rank v2 (shipped) | 627 shapes (+ `tail`), pool 1,249 | 477 + `tail` (2026-11-01) |
+| cuBLASLt ranker, tune grouped CV, closes the gap to the screen winner at top-5 / 10 / 16 | 56.8% / 68.0% / 77.6% (k-NN 8×2: 76.3%, 12 candidates; ranker + k-NN 8×2: 84-88%) | 69.4% / 78.3% / -% (k-NN 8×2: 71%) |
+| family router | out-of-fold AUC **0.803**, skip threshold **0.055** | 0.823, 0.02 |
+
+The cuBLASLt ranker is weaker here than on the 3080 and no better than k-NN at the same candidate count, the reverse of the 3080 ordering; the router's rule picks a looser threshold. Triton's screen oracle beats B3+ by more than the tie margin on 117 of 477 tune shapes (25%).
+
+**Held-out (86 shapes), Triton-only online search vs the screen oracle** (median / p95 / p99 (mean); `reports/k3`, `reports/k5` in the run directory, `reports/learned_topk.md`):
+
+| pick | 3090 v1 | 3090 v2 | 3080 v1 | 3080 v2 |
+|---|---|---|---|---|
+| online top-3 | 2.7% / 21.7% / 42.9% (5.7%) | 2.1% / 13.6% / 20.0% (4.1%) | 1.1% / 9.1% / 20.2% (2.6%) (`topki`) | not in this entry |
+| online top-5 | 2.8% / 17.2% / 23.3% (4.5%) | 2.0% / 14.1% / 20.0% (3.7%) | | |
+| best-of-3 (diverse) | 0.7% / 21.7% / 42.9% (4.5%) | 0.7% / 11.7% / 18.5% (2.8%) | 2.0% / 10.6% / 15.9% (3.4%) | 1.0% / 9.3% / 13.0% (2.1%) |
+| best-of-5 (diverse) | | | | 0.5% / 7.8% / 13.0% (1.7%) |
+| fixed 3080 B6 config | 45.2% / 584.7% / 994.2% (120.8%); 39 of 86 over 50% | | | |
+
+No pick is more than 50% off with either model (0 of 86; the fixed config: 39). The 3090's v1 tail is twice the 3080's (p99 43%), v2 halves it (20%) but stays above the 3080's 13% best-of-3.
+
+**Stage 2 joint search vs the baselines** (`ranker_compare.md`, joint oracle, same script as the 3080's `reports/ranker_compare.md`; v2 rows):
+
+| | 3090 | 3080 |
+|---|---|---|
+| top-3 Triton only: regret vs the session's Triton oracle | 0.9% / 10.3% / 14.8% (2.3%) | 0.2% / 4.6% / 9.6% (1.2%) |
+| top-3 Triton only vs B3+ median, faster / slower | 1.026, 25 / 36 | 1.016, 23 / 35 |
+| top-3 + LT16: vs B2 median, faster / slower | 0.901, 61 / 0 | 0.902, 49 / 0 |
+| top-3 + LT16: vs B3+ median, faster / slower | 0.994, 26 / 9 | 1.000, 23 / 14 |
+| top-3 + LT16: regret vs the joint oracle | 0.5% / 9.5% / 10.4% (2.0%) | 0.4% / 10.4% / 22.1% (2.7%) |
+| top-3 + LT16: first use | 0.88 s | 0.67 s |
+| picks cuBLASLt, all / >= 50 µs | 24% / 8% | 41% / 47% |
+
+v2 beats v1 paired on the Triton-only choice, 0.9822 [0.9679, 0.9951] (12 faster / 6 slower) and ties it in the joint pool (0.9975 [0.9927, 1.0025]). Regime sizes differ (3090: 61 shapes < 50 µs and 25 above; 3080: 56 and 30), so the per-regime rows are not paired. The 3090 joint search removes the Triton-only tail against the joint oracle (p99 102.4% → 10.4%; 3080 85.7% → 22.1%) and is never slower than B2.
+- **Triton ceiling on the 3090** (best Triton row of the session vs the searched cuBLASLt pool incl. the ranker's configs, 86 shapes): B3+ / Triton oracle geomean 0.965; within 90% on 76%. At >= 50 µs (26 shapes) the Triton oracle is ahead by more than 2% on 8 and behind on 13; **by the 3090's own floor (5%, below) it is ahead on 2 and behind on 10**. G4 does not pass on the 3090 either; the 3080's 0 of 86 > 5% is not contradicted (2 of 26 at >= 50 µs here).
+
+**Noise floor of the 3090** (one session, 3 rounds, `analysis.report.noise_analysis` on `noise.jsonl`; 30 shapes × torch and one Triton config × cold / hot; the raw-sample file was not copied, so only IQR spread is available). `range` = (max − min) / median over the 3 rounds. The 3080 columns are its two complete locked-1755 sessions (`noise-20261014-001639-lock1755`, `noise-20261014-141218-6985`):
+
+| | 3090 cold | 3090 hot | 3080 cold | 3080 hot |
+|---|---|---|---|---|
+| range p50 | 0.41% | 0.34% | 0.11-0.27% | 0.01-0.10% |
+| range p95, all | 4.29% | 2.91% | 3.6% | 1.9-2.2% |
+| range p95, >= 50 µs | **4.26%** | **3.93%** | 1.4-1.8% | 1.8-1.9% |
+| range p95, < 50 µs | 2.72% | 1.52% | 6.2-6.4% | 1.2-2.3% |
+| paired kernel-ratio range p95 / p99 | 4.6% / 5.6% | 3.3% / 5.7% | 4.2-5.7% / 9.8-14.9% | 2.5-3.3% / 3.0-3.5% |
+| within-run IQR / median p50 | 1.15% | 0.87% | 0.62-0.63% | 0.49-0.56% |
+| range max | 5.6% | 6.0% | 7.6-14.9% | 3.2-4.6% |
+
+At >= 50 µs (83 (shape, kernel, mode) groups, 24 shapes) 17% of the 3090's groups have a range over 2% (3080: 5%); p95 by kernel: Triton 4.4-4.7%, torch 3.0-3.5% (3080: 1.4-2.3% / 1.4-2.2%). The noisiest groups are the fixed Triton config on skinny memory-bound shapes: 1×5120×13824 (5.6-6.0%), 8192×64×8192 (4.4-5.1%), 32×8192×8192 (4.3%). Cold / hot L2 median ratio 1.005 (3080: 1.003). Clock wander explains little of it: the range correlates 0.2 with the clock spread within a group (spread 2.4% vs 0.3% on the locked 3080), so what produces the other part is not identified.
+- **Consequence.** The 3080's ε = 2% tie margin (≥ 50 µs) **does not apply to the 3090**; a provisional margin of **~5% at ≥ 50 µs** (about the paired p95/p99), single session, unlocked. At that margin the 3090's differences in the 0.5-3 point range against the 3080 (Triton-only p95 / p99, mean regret 4% vs 2%) are within noise of the oracle itself, and its "Triton wins by > 2%" count (8 of 26) falls to 2. The large effects stand: 61 / 0 against B2, the v1 → v2 tail difference (p99 43% → 20%), 0 of 86 picks over 50%.
+- **Caveats.** One session: "across-round" is within a job, no reboot or second day, so it is not the cross-session quantity of G1 (the 3080's 1.75% p95); the real 3090 floor can only be larger. The p95 is the top 4-5 of ~83 groups and p99 is one or two groups. The < 50 µs numbers use per-launch timing; no graph-amortized noise run exists.
+
+**What transfers across GPUs of the same architecture (3080 → 3090, both sm_86; 27 shared held-out shapes, each side scored against its own GPU's screen oracle, `cross_gpu_3090_retrained.md`).** The comparison has three arms on one set: the 3080's own models, the 3080's models used zero-shot on the 3090 (2026-11-03), and the 3090-retrained models (this run):
+
+| online top-3 (27 shapes) | 3080 v1 | 3080 v2 | 3090 zero-shot v1 | 3090 zero-shot v2 | 3090 retrained v1 | 3090 retrained v2 |
+|---|---|---|---|---|---|---|
+| regret median / p95 / p99 (mean) | 1.5 / 7.6 / 9.2 (2.6) | 0.8 / 6.9 / 10.2 (1.8) | 5.4 / 14.5 / 26.5 (6.1) | 0.9 / 14.1 / 14.4 (4.0) | 0.2 / 8.4 / 16.2 (2.3) | 0.9 / 11.9 / 15.2 (2.8) |
+| shapes over 5% | 6 | 2 | 14 | 10 | 4 | 6 |
+| mean vs 3080 v1, paired | | -0.8 [-1.8, 0.0] | **+3.5 [+1.1, +6.4]** | +1.4 [-0.7, +3.6] | -0.4 [-1.9, +1.4] | +0.1 [-1.5, +1.7] |
+| picks > 50% off | 0 | 0 | 0 | 0 | 0 | 0 |
+| family ceiling vs B3+, median / within 90% | 1.007 / 25 | 1.007 / 25 | 1.008 / 24 | 1.008 / 24 | 1.017 / 24 | 1.017 / 24 |
+
+- **Transfers as it is:** the design and the code path. The diversified top-k + short online search, v2's analytic features and the joint pool with cuBLASLt's list work unchanged on the 3090, with no pick over 50% off in any of the six arms and the same Triton ceiling (24-25 of 27 within 90% of B3+, mma.sync in all 527 compiled 3090 kernels). The joint search again ties B3+ (median 0.994) and is never slower than B2.
+- **Transfers with a cost, zero-shot:** the 3080's Triton rankers. v2 is within noise of the 3080 (+1.4 [-0.7, +3.6]), v1 is not (+3.5 [+1.1, +6.4], 14 shapes over 5%). Retraining on the 3090 closes v1's gap entirely (-0.4 [-1.9, +1.4]) but adds little for v2 on these 27 shapes (zero-shot +1.4 → retrained +0.1, mean 4.0 → 2.8%, shapes over 5% 10 → 6, no interval between the two arms computed and the 3090 floor is 4-5%): **the analytic-feature model is what generalises, and a retrain mainly repairs the model that overfits GPU-specific details.** The ordering v2 > v1 repeats on all 86 held-out shapes.
+- **Does not transfer, rebuilt per GPU (all but the bundle refuse another `hw_id`):** the cuBLASLt ranker (tile / algorithm ids, SM count; weaker on the 3090 at 68% vs 78% at top-10), the k-NN table, the router (AUC 0.803 vs 0.823, threshold 0.055 vs 0.02), the winner cache, the kernel bundle (it matches an sm_86 + Triton 3.7.1 key, so the 3080 bundle may serve the 3090, but this was not checked). Zero-shot use of the 3080's cuBLASLt ranker or router on the 3090 (`TUNE_*_FOREIGN`) was not run in this study.
+- **Does not transfer, measured per GPU:** the tie margin (2% on the locked 3080, ~5% on the unlocked 3090) and what the vendor library picks (cuBLASLt chosen on 47% of the 3080's >= 50 µs shapes, 8% of the 3090's), so the value of the Triton half is GPU-specific.
+- **Same-architecture is the easy case.** The 3080 → 2060 zero-shot failed (13 of 27 picks over 50% off) for a different reason (no `mma.sync` in Triton on sm_75). Whether the rankers cross to another tensor-core generation (Ada, Hopper) is untested.
+
+**Gates.** 3080: none changed. 3090: G1 provisional, tie margin 5% at >= 50 µs (single unlocked session); G2 holds (24 of 27 within 90% of B3+ on the shared shapes); G4 not passed (2 of 26 above 5% at >= 50 µs, 10 behind). **Next steps.** (1) A second 3090 noise job (another day, ideally after a reboot; `remoteGPU/noise.sh`) for a cross-session floor and, if the admins lock clocks, a locked run. (2) Re-score the 3090 stage 2 at the 5% margin. (3) The router's held-out score and a fresh-shape check on this GPU. (4) The cuBLASLt ranker zero-shot from the 3080 on the 3090 (`TUNE_LT_RANK_FOREIGN=1`) to separate "same-arch transfer" from "retrain needed" for that component. (5) Find the `StopIteration` in `ranker_compare` and the 3090 stage-2 untimed joint picks.
+
+Reproduce (CPU only; GPU parts were `sbatch remoteGPU/train_best.sh` and `sbatch remoteGPU/noise.sh`):
+```bash
+N9=pipeline/runs/rtx3090/train_best-full-slurm/data/rtx3090_sm86_82sms_24gb; D9=data/rtx3090_sm86_82sms_24gb; D3=data/rtx3080_sm86_68sms_10gb
+python -m analysis.cross_gpu --out reports/cross_gpu_3090_retrained.md \
+  --side 3080-v1 $D3 online_lgbm_rank_diverse.jsonl online_joint_diverse.jsonl results_lock1755_v2.jsonl results_lock1755_v2_graph.jsonl \
+  --side 3080-v2 $D3 online_joint_diverse_v2.jsonl online_joint_diverse_v2.jsonl results_lock1755_v2.jsonl results_lock1755_v2_graph.jsonl \
+  --side 3090-zs-v1 $D9 zero_shot_v1_as_is.jsonl zero_shot_v1_as_is.jsonl results_zero_shot.jsonl results_zero_shot_graph.jsonl \
+  --side 3090-zs-v2 $D9 zero_shot_v2_as_is.jsonl zero_shot_v2_as_is.jsonl results_zero_shot.jsonl results_zero_shot_graph.jsonl \
+  --side 3090-retrained-v1 $N9 zero_shot_v1_as_is.jsonl zero_shot_v1_as_is.jsonl results_zero_shot.jsonl results_zero_shot_graph.jsonl \
+  --side 3090-retrained-v2 $N9 zero_shot_v2_as_is.jsonl zero_shot_v2_as_is.jsonl results_zero_shot.jsonl results_zero_shot_graph.jsonl
+# noise tables: analysis.report.noise_analysis(Path(data_dir), Path(figs_dir)) on a copy of noise.jsonl (it writes noise_stats.csv next to figs_dir)
+```
+
+## Update 2026-11-08: zero-shot on the 2060 with full stage-2 coverage — the Triton-only result reproduces; the joint search lands on cuBLASLt's heuristic list (24 of 27) and the ranker no longer matters
+
+**What ran.** The next step of the 2026-11-02 (later) entry: `python -m analysis.zero_shot picks` and its stage-2 benchmarks on the RTX 2060 (`rtx2060_sm75_30sms_6gb`, `--clock-lock 1755`, driver 595.99.02), so every zero-shot Triton pick is timed in the same session as the baselines. Run directory `data/rtx2060/quick-20261029-095746-v4/` (copied here by hand; nothing was re-measured on this machine), report [`zero_shot_rtx2060/ranker_compare.md`](zero_shot_rtx2060/ranker_compare.md). The four zero-shot row files (v1 / v2 × `as_is` / `native`, k = 5, cuBLASLt top-16 in the pool, 27 shapes) are those of v3 (search sessions `20261102-113735-d051df`, `20261102-115635-e7d450`, `20261102-124121-809c54`; unchanged); only stage 2 is new.
+- Stage 2 cold `20261108-004603-dc1cf3`: 1036 rows, 27 shapes, **0 invalid**, 1% power-capped (15 rows). Graph `20261108-101016-53fee8`: 211 rows, the 6 shapes under 50 µs, 0 invalid, 0% power-capped. Lock 1755 on every row, harness `86f90b5`, clean.
+- The oracle of this report is the **joint oracle** (every Triton row timed in the session ∪ B3+), not the screen of the 2026-11-02 entry; the two are different yardsticks, so regrets are not comparable across the two entries.
+- `data/.../reports/zero_shot_data.md` inside the run directory was made by the scorer before the `slow`-row fix (13-21 of 27 shapes "unscored", no `regret > 50%` column); do not read it. It was not regenerated here.
+
+**Triton-only top-3** (regret vs the session's Triton oracle, median / p95 / p99 (mean); `ranker_compare.md`, last table). Reproduces the 2026-11-02 (later) finding with full coverage:
+
+| variant | all (n = 27) | >= 50 us (n = 21) | < 50 us (n = 6) |
+|---|---|---|---|
+| v1 as_is | 88.2% / 2753.6% / 3785.7% (408.9%) | 92.4% / 3656.5% / 3796.2% (514.1%) | 13.2% / 113.1% / 116.2% (40.8%) |
+| v1 native | 41.8% / 603.4% / 658.9% (156.7%) | 93.4% / 607.5% / 663.0% (198.7%) | 3.7% / 33.6% / 40.2% (9.8%) |
+| v2 as_is | 75.5% / 610.6% / 3224.3% (272.0%) | 88.2% / 674.6% / 3431.0% (333.8%) | 12.3% / 191.3% / 219.8% (55.9%) |
+| v2 native | 41.1% / 262.4% / 569.5% (81.2%) | 54.6% / 263.7% / 594.3% (95.3%) | 7.2% / 121.4% / 148.3% (31.7%) |
+
+(Earlier medians were 43-80%.) vs B3+ the Triton-only pick is slower on 24 of 27 shapes in every variant (median 2.9-3.6x, p10 1.26-1.38x); it is faster than B3+ on 2 shapes and ties on 1 (counts by the 2% / 5% margin).
+
+**Why Triton cannot win (best Triton row of the session vs B3+, per-shape check on the stage-2 rows).** Median 2.3x slower, within 5% of B3+ on 4 of 27 shapes; 4-7x slower on the large shapes (8192×4096×11008: 173 ms vs 28 ms). Triton beats the heuristic cuBLASLt pool (B3) by more than 2% only on 3×2×5, 105×6×9, 369×17×12 and 5×9730×30 (4 of 27, all tiny). Consistent with the FMA-only path on sm_75 (2026-11-02): the ranker is not the limiting part.
+
+**Joint search (Triton top-3 + cuBLASLt top-16)**, same table:
+
+| | all (n = 27) | >= 50 us (n = 21) | < 50 us (n = 6) |
+|---|---|---|---|
+| vs B2 median / p10 | 0.996-1.000 / 0.692 | 1.000 / 0.695 | 0.951 / 0.56 |
+| vs B3 median | 1.000 | 1.000 | 0.985 |
+| vs B3+ median / p10 | 1.014 / 0.988 | 1.045 / 1.000 | 0.985 / 0.59 |
+| regret vs joint oracle median / p95 / p99 (mean) | 1.4-2.2% / 49.9% / 61.6% (8.9-9.0%) | 4.5% / 57.1% / 61.9% (11.4-11.5%) | 0.0% / 0.2-1.7% / 0.3-2.2% (0.1-0.4%) |
+| picks cuBLASLt | 89% | 100% | 50% |
+
+vs B2: faster on 7 shapes, slower on 0. vs B3+ (counts as printed in `ranker_compare.md`): slower on 13 of 21 shapes at >= 50 us and faster on 0, faster on 2 and slower on 0 below 50 us; the "all" row prints 2 faster / 10 slower, which does not equal the sum of the two regimes (2 / 13). Not investigated; use the per-regime counts until the cause is found. First-use cost 10.5-15.9 s for top-3 + LT16 (top-1 + LT16: 1.6-6.6 s, top-5: 15.5-26.3 s; the 3080 is ~0.7 s), of which cuBLASLt adds ~0.4 s: the cost is compiling and short-timing slow FMA Triton kernels.
+- **The ranker does not matter on this GPU.** At >= 50 µs all twelve joint rows (4 variants × top-1 / 3 / 5) give the same regret and the same picks, because the search always ends on cuBLASLt. Top-5 only costs more (26.3 vs 15.9 s on v1 `as_is`) and picks the same winners; the variants differ only below 50 µs, where Triton is chosen on 50% of the 6 shapes.
+- **Where the 50-60% tail comes from.** It is cuBLASLt configs outside the heuristic list: B3 is slower than B3+ (the 20 s deep search) by 1.63x on 448×1088×4096, 1.57x on 448×1088×1024, 1.33x on 128×4096×11008 and 1.28x on 28×3030×4012 (median B3 / B3+ over the 27 shapes 1.02). The 3080's cuBLASLt k-NN table and learned ranker (2026-11-04) are 3080-only, so on the 2060 the pool is the heuristic top-16 alone (`baselines/cublaslt_knn.py`, `baselines/cublaslt_rank.py` refuse another `hw_id`).
+
+**What the joint search chooses** (stored `choice_lt` of the four zero-shot row files; for k Triton candidates the pool rank of a cuBLASLt entry is k + its heuristic rank):
+- cuBLASLt on 24 of 27 shapes in all four variants (top-1: 24-25), Triton on 3 (2-3 at top-1).
+- Of the 24 cuBLASLt picks, 12-13 are cuBLASLt's own first heuristic pick (the B2 kernel) and 11-12 are another entry of the top-16 (its #2 to #7, once #10). Every cuBLASLt pick comes from the heuristic list (no proposals on this GPU).
+- The winner among cuBLASLt entries is one short timing: differences within the 2% margin are arbitrary.
+
+**Conclusion.** On this GPU the practical selector is "time cuBLASLt's heuristic list and skip Triton", except possibly for the tiny shapes under 50 µs; it is B3 by construction (1.000), 1.4% behind B3+ (median), and the learned Triton ranker adds 10-20 s of first-use cost with no change in the choice at >= 50 µs. The zero-shot joint search was already at its pool's ceiling in the 2026-11-02 (later) entry; this run confirms it with the Triton picks timed. Still a confound: Triton has no tensor-core path on sm_75, so this does not separate "the 3080 ranker does not cross GPUs" from "no mma on this GPU" (the 3090 entry, 2026-11-03, points to the second).
+
+**Gates.** None changed. **Caveats.** n = 27 (p95 / p99 are the worst one or two shapes); the Triton oracle at >= 50 µs is itself made of slow FMA kernels, so the huge Triton-only regrets come from a few very slow picks: read the medians and the vs-B3+ counts; the "chooses" counts come from one short timing per candidate, not the stage-2 session; no `cross_gpu` re-run (the shared-shape table of 2026-11-02 (later) is unchanged). **Next steps.** (1) Retrain the cuBLASLt ranker for the 2060 (`pipeline/zero_shot.sh --lt-mode retrain`, `docs/zero_shot_runbook.md` 6b) to test whether it recovers the gap to B3+ on the four large-B3/B3+ shapes (inference, not tested). (2) Check the router guard from `8a7cec1` on this GPU: it should skip the Triton half and its 10-20 s. (3) A tensor-core GPU other than the 3080 / 3090 is no longer needed for the confound; the 3090 entry covers it.
+
+Reproduce (CPU only, rows already in the run directory): `python -m analysis.zero_shot score --data data/rtx2060/quick-20261029-095746-v4/data --report data/rtx2060/quick-20261029-095746-v4/reports --k 3` for the screen-scored table of the 2026-11-02 entry, and `python -m analysis.zero_shot picks` then `python -m analysis.ranker_compare` (commands printed by `picks`) for `zero_shot_rtx2060/ranker_compare.md`; the per-shape B3 / B3+ / best-Triton comparison and the chosen-family counts are a short script over `results_zero_shot.jsonl` and the `choice_lt` field of `zero_shot_<variant>.jsonl`.
+
 ## Update 2026-11-06: p99 in the remaining docs, reports and generators — noise floor, fresh shapes, cross-GPU, overview; the tail the tie margin does not cover
 
 **What.** The 2026-11-04 (audit) entry added p99 to the selector and joint-search scorers. This pass carries it to everything else that quoted a p95 without it. **Nothing was re-measured**: every number is a re-score or re-aggregation of stored rows (CPU only; no GPU job ran; GPU idle throughout). Where a generated file changed, its other cells are unchanged: with the p99 keys / columns stripped, `cross_gpu_summary.json`, the 3090 `zero_shot_*_summary.json` and `ranker_compare_summary.json`, the five `week1_summary_lock1755*.json` noise blocks and `results_overview.md` equal the committed versions cell for cell (checked by script). The one exception was the compiled-kernel count of `cross_gpu.md` (the local 3080 Triton cache has grown from 1,886 to 5,310 files since that report), which was put back to the committed value so that the diff is p99 only.
