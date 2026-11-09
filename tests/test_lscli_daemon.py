@@ -71,6 +71,36 @@ def test_lock_held_reads_proc_locks_and_never_takes_the_lock(tmp_path):
     assert fails == 0
 
 
+
+def test_lock_held_counts_the_jobs_own_flock_taken_by_a_flock_child(tmp_path):
+    """train_best.sh: `exec 9>.lock; flock -n 9`: /proc/locks names the `flock` child (gone at once), not the job; the
+    daemon preempted its own training stage as "another train_best.sh run holds pipeline/.lock"."""
+    p = tmp_path / ".lock"
+    p.touch()
+    ours = subprocess.Popen(["bash", "-c", 'exec 9>"$1"; flock -n 9 || exit 1; sleep 5', "_", str(p)])
+    try:
+        deadline = time.monotonic() + 3
+        while not gate.lock_held(p) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert gate.lock_held(p)                                         # a foreign run, seen from outside
+        assert not gate.lock_held(p, exclude={ours.pid})                 # the job's own run
+        assert not gate.lock_held(p, exclude=frozenset(gate.descendants(ours.pid)))
+    finally:
+        ours.kill()
+        ours.wait()
+    # a foreign holder while the job has the file open WITHOUT the lock (its own `flock -n` is about to fail): foreign
+    foreign = subprocess.Popen(["flock", str(p), "sleep", "5"])
+    loser = subprocess.Popen(["bash", "-c", 'exec 9>"$1"; sleep 5', "_", str(p)])
+    try:
+        deadline = time.monotonic() + 3
+        while not gate.lock_held(p) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert gate.lock_held(p, exclude={loser.pid})
+    finally:
+        for q in (foreign, loser):
+            q.kill()
+            q.wait()
+
 def _snap(pids=(), util=0):
     return gate.GpuSnapshot(list(pids), util, True, {p: "proc" for p in pids})
 

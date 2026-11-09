@@ -48,27 +48,61 @@ def on_battery(sys_root: str | os.PathLike = "/sys/class/power_supply") -> bool:
     return False
 
 
-def lock_held(path: str | os.PathLike, locks: str = "/proc/locks", exclude=frozenset()) -> bool:
+def lock_held(path: str | os.PathLike, locks: str = "/proc/locks", exclude=frozenset(), proc: str = "/proc") -> bool:
     """True when a process outside `exclude` holds a flock on `path` (train_best.sh's pipeline/.lock). Read from
     /proc/locks, never by trying the lock: a probe that took it, even for a microsecond, could make a concurrent
-    `flock -n` fail. `exclude` = the running job's tree: the daemon's own train_best run holds that lock."""
+    `flock -n` fail. `exclude` = the running job's tree: the daemon's own train_best run holds that lock.
+
+    The pid /proc/locks gives is the process that TOOK the lock, not the one holding it: train_best.sh does
+    `exec 9>.lock; flock -n 9`, so the pid is the short-lived `flock` child, already gone, never in the job's tree. A
+    lock is therefore also ours when a process in `exclude` holds it through one of its own fds (/proc/<pid>/fdinfo lists
+    a lock on the open file description that owns it)."""
     try:
         st = os.stat(path)
         text = Path(locks).read_text()
     except OSError:
         return False
     want = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+    ours = None
     for line in text.splitlines():
         parts = line.split()
         if len(parts) < 6 or parts[1] == "->":                 # "->" lines are waiters, not holders
             continue
         try:
             maj, mnr, ino = parts[5].split(":")
-            if (int(maj, 16), int(mnr, 16), int(ino)) == want and int(parts[4]) not in exclude:
-                return True
+            if (int(maj, 16), int(mnr, 16), int(ino)) != want or int(parts[4]) in exclude:
+                continue
         except ValueError:
             continue
+        if ours is None:
+            ours = _fd_locks(exclude, want, proc)
+        if tuple(parts[1:]) not in ours:
+            return True
     return False
+
+
+def _fd_locks(pids, want: tuple[int, int, int], proc: str = "/proc") -> set[tuple[str, ...]]:
+    """The locks on file `want` (major, minor, inode) that the processes `pids` hold through their own fds, as the
+    fields of their /proc/locks lines after the ordinal (/proc/<pid>/fdinfo/<fd>: `lock:\t1: FLOCK ADVISORY WRITE ...`)."""
+    out: set[tuple[str, ...]] = set()
+    for pid in pids:
+        fd_dir = Path(proc) / str(pid) / "fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                st = os.stat(fd_dir / fd)
+                if (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino) != want:
+                    continue
+                info = (Path(proc) / str(pid) / "fdinfo" / fd).read_text()
+            except OSError:
+                continue
+            for ln in info.splitlines():
+                if ln.startswith("lock:"):
+                    out.add(tuple(ln.split()[2:]))
+    return out
 
 
 def descendants(pid: int, proc: str = "/proc") -> set[int]:
