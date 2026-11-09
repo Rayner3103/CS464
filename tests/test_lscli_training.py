@@ -28,6 +28,7 @@ done
 # like train_best.sh: hold pipeline/.lock for the whole run, refuse a busy GPU in preflight, print a lot through tee
 exec 9>"$LSCLI_HOME/src/pipeline/.lock"
 flock -n 9 || { echo "another pipeline run holds pipeline/.lock" >&2; exit 7; }
+sleep "${FAKE_HOLD_S:-0}"                                       # a stage that outlasts the watcher's polls
 if [[ "$STAGE" == preflight && -f "$FAKE_BUSY" ]]; then echo "GPU busy" >&2; exit 8; fi
 head -c 200000 /dev/zero | tr '\0' 'x' | fold -w 100 | tee /dev/null
 if [[ "$STAGE" == "$FAKE_FAIL_STAGE" ]]; then exit 1; fi
@@ -225,8 +226,9 @@ def test_preflight_waits_for_an_idle_gpu(home, tmp_path):
 
 
 @needs_ranker
-def test_our_own_train_best_lock_does_not_preempt_it_but_a_manual_run_blocks_training(home):
+def test_our_own_train_best_lock_does_not_preempt_it_but_a_manual_run_blocks_training(home, monkeypatch):
     import subprocess
+    monkeypatch.setenv("FAKE_HOLD_S", "2.5")             # the watcher polls each second while the stage holds the lock
     lock = home.src / "pipeline" / ".lock"
     holder = subprocess.Popen(["flock", str(lock), "sleep", "4"])          # someone runs train_best.sh by hand
     time.sleep(0.3)
@@ -328,3 +330,29 @@ def test_a_lost_state_file_never_reuses_a_run_directory(home):
     (home.train / HW / "1" / "precious").write_text("30 h of sweeps")
     training.Training(home, HW).begin({"first"}, ["preflight"], ENV, "test")
     assert (home.train / HW / "1" / "precious").exists() and training.Training(home, HW).state["run"] == 2
+
+
+@pytest.mark.parametrize("resolves", [True, False])
+def test_train_best_re_resolves_an_empty_hw_id_left_by_a_killed_stage(tmp_path, resolves):
+    """The real pipeline/train_best.sh (stand-in `python` on PATH): a stage killed between creating and writing hw_id
+    (a daemon preemption) left it empty, and every later --resume died with "could not determine the hardware id"."""
+    import subprocess
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "python").write_text("#!/bin/sh\necho fakehw_sm00\n" if resolves else "#!/bin/sh\nexit 1\n")
+    (bin_ / "python").chmod(0o755)
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "mode").write_text("quick\n")
+    (run / "hw_id").write_text("")
+    r = subprocess.run(["bash", str(REPO / "pipeline" / "train_best.sh"), "--resume", str(run), "--skip-install",
+                        "--skip-validation", "--only", "env", "--clock-lock", "none", "--allow-unlocked"],
+                       cwd=REPO, env={**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}"},
+                       capture_output=True, text=True, timeout=120)
+    if resolves:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (run / "hw_id").read_text() == "fakehw_sm00\n" and (run / "stamps" / "env.done").exists()
+    else:
+        assert r.returncode != 0 and "could not determine the hardware id" in r.stdout + r.stderr
+        assert (run / "hw_id").read_text() == ""                       # never written empty by this run
+    assert (run / "mode").read_text() == "quick\n" and not list(run.glob("*.tmp.*"))
