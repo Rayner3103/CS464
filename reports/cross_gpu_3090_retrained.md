@@ -46,8 +46,8 @@ Paired bootstrap, online-3, 3090-retrained-v2 minus 3080-v1 (n = 27, 5,000 resam
 | 3080-v2 | 27 | 9 | 27 | 1.005 / 0.936 | 22/27 |
 | 3090-zs-v1 | 27 | 9 | 27 | 1.000 / 0.912 | 21/27 |
 | 3090-zs-v2 | 27 | 8 | 27 | 1.000 / 0.945 | 24/27 |
-| 3090-retrained-v1 | 27 | 4 | 21 | 1.018 / 0.960 | 20/21 |
-| 3090-retrained-v2 | 27 | 3 | 19 | 1.022 / 0.970 | 18/19 |
+| 3090-retrained-v1 | 27 | 10 | 27 | 1.014 / 0.957 | 25/27 |
+| 3090-retrained-v2 | 27 | 11 | 27 | 1.006 / 0.964 | 25/27 |
 
 A Triton pick that the stage-2 session did not time has no full-protocol time and is left out of the speed columns (see `timed in the stage-2 session`).
 

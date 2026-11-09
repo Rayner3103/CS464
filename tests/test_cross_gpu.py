@@ -63,11 +63,21 @@ def test_ptx_mma_share_counts_tensor_core_and_fma_only_kernels(tmp_path):
 
 
 def test_joint_summary_counts_cublaslt_wins_and_ignores_untimed_picks():
-    ref = {(1, 1, 1): {**_ref(100.0, 90.0, False), "src": {"tri": {}, "lth": {"h2_x": 105.0}, "ltd": {}}},
-           (2, 2, 2): {**_ref(100.0, 90.0, False), "src": {"tri": {}, "lth": {}, "ltd": {}}}}
-    cold = {s: {"tri": {}, "lth": {}, "ltd": {}} for s in ref}
+    ref = {(1, 1, 1): {**_ref(100.0, 90.0, False), "src": {"tri": {}, "lth": {"h2_x": 105.0}, "ltd": {}, "ltk": {}, "ltr": {}}},
+           (2, 2, 2): {**_ref(100.0, 90.0, False), "src": {"tri": {}, "lth": {}, "ltd": {}, "ltk": {}, "ltr": {}}}}
+    cold = {s: {"tri": {}, "lth": {}, "ltd": {}, "ltk": {}, "ltr": {}} for s in ref}
     rows = [{"M": 1, "N": 1, "K": 1, "lt_n": 16, "choice": {"3": {"key": "h2_x", "family": "cublaslt"}}},
             {"M": 2, "N": 2, "K": 2, "lt_n": 16, "choice": {"3": {"key": "bm16_untimed", "family": "triton"}}}]
     j = cg.joint_summary(rows, ref, cold, 3, set(ref))
     assert j["n"] == 2 and j["cublaslt"] == 1 and j["covered"] == 1 and abs(j["median"] - 100 / 105) < 1e-9
     assert cg.joint_summary([{"M": 1, "N": 1, "K": 1, "choice": {"3": {"key": "t"}}}], ref, cold, 3, set(ref)) is None
+
+
+def test_joint_summary_times_and_counts_learned_ranker_picks():
+    """A pick from the learned cuBLASLt ranker (family `cublaslt_rank`, key `r*`) is a cuBLASLt win and has a stage-2 time in the `ltr` table;
+    it used to be left out of both (the 3090's retrained arms showed 19-21 of 27 shapes timed)."""
+    ref = {(1, 1, 1): {**_ref(100.0, 90.0, False), "src": {"tri": {}, "lth": {}, "ltd": {}, "ltk": {}, "ltr": {"r0_x": 95.0}}}}
+    cold = {s: {"tri": {}, "lth": {}, "ltd": {}, "ltk": {}, "ltr": {}} for s in ref}
+    rows = [{"M": 1, "N": 1, "K": 1, "lt_n": 16, "choice": {"3": {"key": "r0_x", "family": "cublaslt_rank"}}}]
+    j = cg.joint_summary(rows, ref, cold, 3, set(ref))
+    assert j["cublaslt"] == 1 and j["covered"] == 1 and abs(j["median"] - 100 / 95) < 1e-9
