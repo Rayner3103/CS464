@@ -319,6 +319,44 @@ def test_without_models_the_daemon_searches_cuBLASLt_alone(home, tmp_path):
     assert d.tick() is None and queue.pending(home)[0] == []    # the k = 0 entry counts: nothing searched again
 
 
+def test_own_utilization_never_restarts_the_idle_clock():
+    g = gate.Gate({"idle": {**config.DEFAULTS["idle"], "gpu_idle_minutes": 10}})
+    g.observe(_snap(util=0), 0.0)
+    assert g.busy_until == 0.0
+    g.observe(_snap(util=90), 100.0, own={7})                 # our job's utilization while it runs
+    g.job_ended(200.0)
+    g.observe(_snap(util=90), 200.5, own=set())               # the final check after it: still its utilization
+    g.observe(_snap(util=90), 201.0)                          # the next tick, within the grace
+    assert g.busy_until == 0.0
+    g.observe(_snap(pids=(99,), util=90), 202.0, own=set())   # a foreign process is busy at any time
+    assert g.busy_until == 202.0
+    g.observe(_snap(util=90), 300.0)                          # after the grace: utilization with no job is busy
+    assert g.busy_until == 300.0
+
+
+@requires_cuda
+@pytest.mark.skipif(not Path(str(RANKER_2060) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
+def test_back_to_back_searches_keep_the_gate_open(home):
+    """The search's own GPU utilization, still reported when it ends, must not count as a busy GPU: the next search
+    starts on the next tick instead of after another gpu_idle_minutes."""
+    envs.register(home, sys.executable)
+    eid = envs.env_id(sys.executable)
+    hw = json.loads(subprocess.run([sys.executable, "-m", "lscli.worker", "env"], cwd=REPO, capture_output=True,
+                                   text=True).stdout.splitlines()[-1])["env"]["hw_id"]
+    _setup_models(home, hw)
+    for m in (512, 768):
+        queue.request(home, m, m, m, "fp16", eid, "miss")
+    box = {}
+    # NVML reports our job's utilization while it runs, including the final check right after the worker exits
+    d = box["d"] = _daemon(home, lambda: gate.GpuSnapshot([], 90 if box["d"].job_info else 0, True, {}))
+    d.cfg["idle"]["gpu_idle_minutes"] = 10
+    d.gate.busy_until = d.clock() - 3600                       # idle for an hour already
+    assert d.tick().kind == "search" and d.counters["searches"] == 1
+    assert d.gate_reasons() == []                              # the idle clock did not restart
+    assert d.gate.busy_until < d.clock() - 3000
+    assert d.tick().kind == "search" and d.counters["searches"] == 2
+
+
 def test_sigterm_ends_a_running_job_without_backoff(home, tmp_path):
     from lscli.daemon import Daemon
     d = Daemon(home, None, snapshot=lambda: gate.GpuSnapshot([], 0, True, {}), battery=lambda: False)
