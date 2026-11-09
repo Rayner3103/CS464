@@ -334,6 +334,39 @@ def test_own_utilization_never_restarts_the_idle_clock():
     assert g.busy_until == 300.0
 
 
+def test_the_final_check_after_a_search_does_not_restart_the_idle_clock(home, monkeypatch):
+    """CPU only: Daemon.search with the worker stubbed. NVML still reports the worker's utilization when the final gate
+    check runs; it must not count as a busy GPU, while a foreign process appearing then still voids the result."""
+    from lscli.daemon import Daemon
+    envs.register(home, sys.executable)
+    eid = envs.env_id(sys.executable)
+    pids = []
+    box = {}
+    d = box["d"] = Daemon(home, None, battery=lambda: False,
+                          snapshot=lambda: gate.GpuSnapshot(list(pids), 90 if box["d"].job_info else 0, True, {}))
+    d.start()
+    d.cfg["idle"]["gpu_idle_minutes"] = 10
+    put = {"M": 64, "N": 64, "K": 64, "dtype": "fp16", "k": 0, "lt_n": 16, "lt_rank": 0, "lt_knn": 0,
+           "choice": {"key": "h0_a1", "family": "cublaslt", "mode": "cold"}, "candidates": [], "ranker": None}
+
+    class FakeJob:
+        def __init__(self, *a, **k):
+            pass
+    monkeypatch.setattr(jobs, "Job", FakeJob)
+    monkeypatch.setattr(jobs, "converse", lambda *a, **k: {"choice": put["choice"], "env": {}, "put": put})
+    written = []
+    monkeypatch.setattr("lscli.worker.write_entry", lambda *a: written.append(a))
+    task = scheduler.Task("search", 64, 64, 64, env_id=eid, k=0)
+    d.gate.busy_until = d.clock() - 3600
+    d.job_info = {"kind": "search"}
+    d.search(task)
+    assert len(written) == 1 and d.gate.busy_until < d.clock() - 3000
+    pids.append(4242)                                         # a user process appears as the worker exits
+    with pytest.raises(jobs.Preempted):
+        d.search(task)
+    assert len(written) == 1
+
+
 @requires_cuda
 @pytest.mark.skipif(not Path(str(RANKER_2060) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
 def test_back_to_back_searches_keep_the_gate_open(home):

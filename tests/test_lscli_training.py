@@ -202,6 +202,20 @@ def test_cpu_stages_run_while_the_gpu_is_busy_and_gpu_stages_wait(home):
     assert json.loads(home.state.read_text())["state"] == "waiting"
 
 
+def test_a_quick_stage_failure_does_not_restart_the_idle_clock(home, monkeypatch):
+    """The quick-failure check after a stage (preempted or broken?) runs after the job's processes exit, when NVML can
+    still report their utilization: it must not count as a busy GPU."""
+    monkeypatch.setenv("FAKE_FAIL_STAGE", "check")
+    training.Training(home, HW).begin({"first"}, ["check"], ENV, "test")
+    box = {}
+    d = box["d"] = _daemon(home, snapshot=lambda: gate.GpuSnapshot([], 90 if box["d"].job_info else 0, True, {}))
+    d.cfg["idle"]["gpu_idle_minutes"] = 10
+    d.gate.busy_until = d.clock() - 3600
+    assert d.tick().stage == "check"
+    assert d.counters["failed"] == 1 and d.counters["preempted"] == 0     # a broken stage, not a preemption
+    assert d.gate.busy_until < d.clock() - 3000
+
+
 @needs_ranker
 def test_preflight_waits_for_an_idle_gpu(home, tmp_path):
     d = _daemon(home, snapshot=lambda: gate.GpuSnapshot([4242], 90, True, {4242: "user"}))

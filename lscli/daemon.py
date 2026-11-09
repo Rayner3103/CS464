@@ -316,6 +316,7 @@ class Daemon:
             raise
         finally:
             job.close()
+        self.gate.job_ended(self.clock())       # the check below must not count the stage's own utilization (as search)
         if code != 0 or stage not in tr.done():
             # train_best's own idle-GPU check or lock can lose a race with a user process that appeared after our
             # gate poll: a quick failure with the GPU now busy is a preemption, not a broken stage.
