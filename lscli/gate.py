@@ -56,7 +56,13 @@ def lock_held(path: str | os.PathLike, locks: str = "/proc/locks", exclude=froze
     The pid /proc/locks gives is the process that TOOK the lock, not the one holding it: train_best.sh does
     `exec 9>.lock; flock -n 9`, so the pid is the short-lived `flock` child, already gone, never in the job's tree. A
     lock is therefore also ours when a process in `exclude` holds it through one of its own fds (/proc/<pid>/fdinfo lists
-    a lock on the open file description that owns it)."""
+    a lock on the open file description that owns it). /proc/locks and the fds are read one after the other, so a job
+    that releases the lock and exits in between would look foreign: a foreign reading counts only when a second one
+    agrees."""
+    return _foreign_lock(path, locks, exclude, proc) and _foreign_lock(path, locks, exclude, proc)
+
+
+def _foreign_lock(path, locks: str, exclude, proc: str) -> bool:
     try:
         st = os.stat(path)
         text = Path(locks).read_text()
@@ -134,6 +140,17 @@ class GpuSnapshot:
     names: dict = field(default_factory=dict)
 
 
+def alive(pid: int, proc: str | os.PathLike = "/proc") -> bool:
+    """False once `pid` has exited (no /proc entry, or a zombie). NVML still lists a process while its CUDA context is
+    torn down; a job's short-lived child (a sweep compile worker) seen there and reaped before the job's tree is walked
+    looked foreign and preempted the job. A process that has exited uses no GPU, whoever it belonged to."""
+    try:
+        stat = Path(proc, str(pid), "stat").read_text()
+    except OSError:
+        return False
+    return stat[stat.rindex(")") + 2:][:1] != "Z"
+
+
 def gpu_snapshot(index: int = 0) -> GpuSnapshot:
     try:
         import pynvml
@@ -143,7 +160,7 @@ def gpu_snapshot(index: int = 0) -> GpuSnapshot:
         util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
     except Exception:
         return GpuSnapshot([], None, ok=False)
-    pids = [int(p.pid) for p in procs]
+    pids = [pid for pid in (int(p.pid) for p in procs) if alive(pid)]
     names = {}
     for p in pids:
         try:

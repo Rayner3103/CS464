@@ -77,7 +77,7 @@ def test_lock_held_counts_the_jobs_own_flock_taken_by_a_flock_child(tmp_path):
     daemon preempted its own training stage as "another train_best.sh run holds pipeline/.lock"."""
     p = tmp_path / ".lock"
     p.touch()
-    ours = subprocess.Popen(["bash", "-c", 'exec 9>"$1"; flock -n 9 || exit 1; sleep 5', "_", str(p)])
+    ours = subprocess.Popen(["bash", "-c", 'exec 9>"$1"; flock -n 9 || exit 1; exec sleep 5', "_", str(p)])
     try:
         deadline = time.monotonic() + 3
         while not gate.lock_held(p) and time.monotonic() < deadline:
@@ -88,9 +88,10 @@ def test_lock_held_counts_the_jobs_own_flock_taken_by_a_flock_child(tmp_path):
     finally:
         ours.kill()
         ours.wait()
+    assert not gate.lock_held(p)                                         # `exec sleep`: nothing orphaned keeps it
     # a foreign holder while the job has the file open WITHOUT the lock (its own `flock -n` is about to fail): foreign
     foreign = subprocess.Popen(["flock", str(p), "sleep", "5"])
-    loser = subprocess.Popen(["bash", "-c", 'exec 9>"$1"; sleep 5', "_", str(p)])
+    loser = subprocess.Popen(["bash", "-c", 'exec 9>"$1"; exec sleep 5', "_", str(p)])
     try:
         deadline = time.monotonic() + 3
         while not gate.lock_held(p) and time.monotonic() < deadline:
@@ -100,6 +101,21 @@ def test_lock_held_counts_the_jobs_own_flock_taken_by_a_flock_child(tmp_path):
         for q in (foreign, loser):
             q.kill()
             q.wait()
+
+
+def test_an_exited_process_is_not_a_compute_process(tmp_path):
+    """NVML lists a process while its CUDA context is torn down: a zombie (or a reaped pid) must not preempt a job."""
+    zombie = subprocess.Popen(["true"])
+    deadline = time.monotonic() + 3
+    while gate.alive(zombie.pid) and time.monotonic() < deadline:   # exited, not yet reaped: state Z
+        time.sleep(0.02)
+    assert not gate.alive(zombie.pid)
+    assert Path(f"/proc/{zombie.pid}").exists()                      # still there, only dead
+    zombie.wait()
+    assert not gate.alive(zombie.pid) and gate.alive(os.getpid())
+    (tmp_path / "7").mkdir()
+    (tmp_path / "7" / "stat").write_text("7 (a) b) S 1 7 7 0")          # comm may hold ") "
+    assert gate.alive(7, proc=tmp_path) and not gate.alive(8, proc=tmp_path)
 
 def _snap(pids=(), util=0):
     return gate.GpuSnapshot(list(pids), util, True, {p: "proc" for p in pids})
