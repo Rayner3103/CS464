@@ -49,7 +49,7 @@ flowchart TD
 
 *Each dot is a shape (log axes). Orange is held-out region (the bands), pink is held-out random, blue is tune. The grid-like rows are the LLM layer sizes.*
 
-Counts: **477** tune shapes (+150 tail for ranker v2), **86** held-out shapes (30 take ≥ 50 µs, 56 take less), and 27 of those 86 were also used on the RTX 2060.
+Counts: **477** tune shapes (+150 tail for ranker v2), **86** held-out shapes (30 take ≥ 50 µs, 56 take less), and 27 of those 86 were also used on the RTX 2060 and the RTX 3090 (the shared set of [chapter 5](05_transferability.md)).
 
 ## 4.3 Why we trust the test
 
@@ -58,4 +58,4 @@ Counts: **477** tune shapes (+150 tail for ranker v2), **86** held-out shapes (3
 - Results are always reported as **median, mean, and the worst 5%**, and separately for jobs that are short (< 50 µs) or long, because the average hides the tail.
 
 ---
-Previous: [3. Model training](03_model_training.md) · Back to [README](README.md)
+Previous: [3. Model training](03_model_training.md) · Next: [5. Transferability](05_transferability.md) · Back to [README](README.md)

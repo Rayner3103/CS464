@@ -353,6 +353,139 @@ def fig_cross_gpu():
     save(fig, "03_cross_gpu.png")
 
 
+# ------------------------------------------------------------------------------------------------ 05 transferability
+def fig_transfer_quality():
+    """Same 27 held-out shapes on three GPUs: regret of the online top-3 pick, and picks that are > 50% off."""
+    # HAND-COPIED from reports/cross_gpu.md and reports/cross_gpu_3090_retrained.md ("Selection quality", online-3,
+    # regret vs each GPU's own screen oracle, 27 shared held-out shapes) and the "regret > 50%" row.
+    # (label, GPU colour, trained on that GPU?, median %, p95 %, picks > 50% off)
+    arms = [
+        ("RTX 3080, v1 (home)", BLUE, True, 1.5, 7.6, 0),
+        ("RTX 3080, v2 (home)", BLUE, True, 0.8, 6.9, 0),
+        ("RTX 3090, v1, 3080 model unchanged", AQUA, False, 5.4, 14.5, 0),
+        ("RTX 3090, v2, 3080 model unchanged", AQUA, False, 0.9, 14.1, 0),
+        ("RTX 3090, v1, retrained on the 3090", AQUA, True, 0.2, 8.4, 0),
+        ("RTX 3090, v2, retrained on the 3090", AQUA, True, 0.9, 11.9, 0),
+        ("RTX 2060, retrained on the 2060", ORANGE, True, 0.7, 7.5, 0),
+        ("RTX 2060, v1, 3080 model unchanged", ORANGE, False, 79.8, 658.0, 16),
+        ("RTX 2060, v2, 3080 model unchanged", ORANGE, False, 58.4, 635.8, 13),
+    ]
+    fig, axs = plt.subplots(1, 3, figsize=(13, 4.6), sharey=True, gridspec_kw={"width_ratios": [1, 1, 0.8]})
+    y = np.arange(len(arms))[::-1]
+    for ax, idx, ttl in [(axs[0], 3, "Typical shape (median)"), (axs[1], 4, "Unlucky shapes (95th percentile)")]:
+        for yi, a in zip(y, arms):
+            ax.barh(yi, a[idx], color=a[1], height=0.62, hatch=None if a[2] else "//", edgecolor=BG if a[2] else "white", linewidth=0)
+            ax.text(a[idx] * 1.12, yi, f"{a[idx]:.1f}%", va="center", fontsize=8.5)
+        ax.set_xscale("log")
+        ax.set_xlim(0.1, 3000)
+        ax.set_title(ttl, fontsize=10)
+        ax.set_xlabel("extra time vs best config (log scale)")
+    axs[0].set_yticks(y, [a[0] for a in arms], fontsize=8.5)
+    ax = axs[2]
+    for yi, a in zip(y, arms):
+        ax.barh(yi, a[5], color=a[1], height=0.62, hatch=None if a[2] else "//", edgecolor=BG if a[2] else "white", linewidth=0)
+        ax.text(a[5] + 0.4, yi, str(a[5]), va="center", fontsize=9)
+    ax.set_xlim(0, 20)
+    ax.set_title("Picks more than 50% off (of 27)", fontsize=10)
+    ax.set_xlabel("number of shapes")
+    from matplotlib.patches import Patch
+    fig.legend(handles=[Patch(facecolor=GREY, label="model trained on that GPU"),
+                        Patch(facecolor=GREY, hatch="//", edgecolor="white", label="3080 model, zero-shot")],
+               loc="upper center", bbox_to_anchor=(0.5, 0.01), ncol=2, fontsize=9)
+    fig.suptitle("Zero-shot works on the 3090 and fails on the 2060 (27 shared unseen shapes, online top-3 pick)", x=0.01, ha="left",
+                 fontweight="bold", fontsize=11)
+    save(fig, "05_transfer_quality.png")
+
+
+def fig_transfer_ceiling():
+    """Why the joint search is a safety net: how good Triton can be on each GPU, and who wins the joint race."""
+    # HAND-COPIED from reports/cross_gpu.md ("Family ceiling", 3080 v2 / 3090 zero-shot v2 / 2060 rows, median) and
+    # "Joint search" (picks cuBLASLt, of 27 shapes; 3080 v2, 3090 zero-shot v2 as_is, 2060 zero-shot v2 as_is).
+    names = ["RTX 3080", "RTX 3090", "RTX 2060"]
+    cols = [BLUE, AQUA, ORANGE]
+    ceil = [1.007, 1.008, 0.440]
+    lt = [9, 8, 24]
+    fig, axs = plt.subplots(1, 2, figsize=(9.6, 3.8))
+    ax = axs[0]
+    ax.bar(names, ceil, 0.5, color=cols)
+    for i, v in enumerate(ceil):
+        ax.text(i, v + 0.025, f"{v:.2f}×", ha="center", fontsize=10)
+    ax.axhline(1, color=INK, lw=1.2)
+    ax.set_ylim(0, 1.25)
+    ax.set_ylabel("best Triton config per shape,\nspeed vs searched cuBLASLt (B3+)")
+    ax.set_title("How good can our Triton kernels get?", fontsize=10)
+    ax = axs[1]
+    ax.bar(names, lt, 0.5, color=cols)
+    for i, v in enumerate(lt):
+        ax.text(i, v + 0.5, f"{v} of 27", ha="center", fontsize=10)
+    ax.set_ylim(0, 30)
+    ax.set_ylabel("shapes where the joint race\nends on a cuBLASLt kernel")
+    ax.set_title("Who wins the Triton + cuBLASLt race?", fontsize=10)
+    save(fig, "05_transfer_ceiling.png")
+
+
+def fig_noise_3090():
+    """Noise floor of the measuring stick on the two GPUs (>= 50 us kernels)."""
+    # HAND-COPIED from reports/week1.md 2026-11-09 "Noise floor of the 3090": range p95 over 3 rounds, >= 50 us.
+    # 3080: its two complete locked-1755 sessions (cold 1.4-1.8%, hot 1.8-1.9%); 3090: one unlocked session (cold 4.26%, hot 3.93%).
+    fig, ax = plt.subplots(figsize=(6.4, 3.8))
+    x = np.arange(2)
+    a3080 = [(1.4, 1.8), (1.8, 1.9)]
+    for k, (lo, hi) in enumerate(a3080):
+        ax.bar(k - 0.2, lo, 0.18, color=BLUE)
+        ax.bar(k, hi, 0.18, color=BLUE, alpha=0.6)
+        ax.text(k - 0.2, lo + 0.08, f"{lo}", ha="center", fontsize=8.5)
+        ax.text(k, hi + 0.08, f"{hi}", ha="center", fontsize=8.5)
+    ax.bar(x + 0.22, [4.26, 3.93], 0.18, color=AQUA)
+    for k, v in enumerate([4.26, 3.93]):
+        ax.text(k + 0.22, v + 0.08, f"{v}", ha="center", fontsize=8.5)
+    ax.axhline(2, color=INK2, ls=":", lw=1)
+    ax.text(-0.48, 2.2, "2% tie margin (3080)", ha="left", fontsize=8.5, color=INK2)
+    ax.set_xticks(x, ["cold L2", "hot L2"])
+    ax.set_xlim(-0.5, 1.6)
+    ax.set_ylim(0, 6.4)
+    ax.set_ylabel("run-to-run spread, unlucky 5% (%)")
+    ax.set_title("The 3090's measuring stick is about 2× wider\n(kernels of 50 µs or more)", fontsize=10)
+    from matplotlib.patches import Patch
+    ax.legend(handles=[Patch(color=BLUE, label="3080, session 1 (locked clock)"), Patch(color=BLUE, alpha=0.6, label="3080, session 2"),
+                       Patch(color=AQUA, label="3090 (clock not locked)")], fontsize=8.5, loc="upper left")
+    save(fig, "05_noise_3090.png")
+
+
+# ------------------------------------------------------------------------------------------------ 06 shipping
+def fig_bundle():
+    """First-use cost with and without the prebuilt kernels, and how small the shipped archive is."""
+    # HAND-COPIED from docs/kernel_bundle.md "What was built and measured" (10 held-out shapes, rank v2, k = 3 + cuBLASLt top-16,
+    # empty Triton cache, one process per shape): wall per shape and Triton compile + validate.
+    fig, axs = plt.subplots(1, 2, figsize=(11, 3.8), gridspec_kw={"width_ratios": [1, 1.25]})
+    ax = axs[0]
+    names = ["compile every\ncandidate\n(no bundle)", "load prebuilt\nkernels\n(bundle)"]
+    comp, rest = [0.480, 0.005], [0.618 - 0.480, 0.150 - 0.005]
+    ax.bar(names, comp, 0.5, color=ORANGE, label="compile + check Triton candidates")
+    ax.bar(names, rest, 0.5, bottom=comp, color=BLUE, label="rank, time the race, cuBLASLt")
+    for i, t in enumerate([0.618, 0.150]):
+        ax.text(i, t + 0.015, f"{t:.2f} s", ha="center", fontsize=10)
+    ax.set_ylim(0, 0.75)
+    ax.set_ylabel("time to pick a kernel for a new shape")
+    ax.set_title("First use is about 4× faster", fontsize=10)
+    ax.legend(fontsize=8.5, loc="upper right")
+    ax = axs[1]
+    # HAND-COPIED from docs/kernel_bundle.md "Shipping size" (MiB)
+    lab = ["unpacked on disk", "cubin + json files", "plain tar | xz", "zstd -19", "our archive\n(committed)"]
+    val = [986, 799, 51, 25, 19.2]
+    cols = [GREY, GREY, GREY, GREY, BLUE]
+    y = np.arange(len(lab))[::-1]
+    ax.barh(y, val, color=cols, height=0.6)
+    for yi, v in zip(y, val):
+        ax.text(v * 1.1, yi, f"{v:g} MiB", va="center", fontsize=9)
+    ax.set_xscale("log")
+    ax.set_xlim(8, 4000)
+    ax.set_yticks(y, lab, fontsize=9)
+    ax.set_xlabel("size of the 21,187 compiled kernels (log scale)")
+    ax.set_title("…and fits in one 19 MiB file", fontsize=10)
+    save(fig, "06_bundle.png")
+
+
 # ------------------------------------------------------------------------------------------------ 04 shapes
 def fig_shapes():
     suites = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "tail"]
@@ -399,7 +532,8 @@ def fig_shapes():
 
 def main():
     for f in (fig_config_spread, fig_baseline_bars, fig_square_tflops, fig_b6, fig_noise, fig_selectors, fig_portfolio,
-              fig_topk, fig_v1_v2, fig_joint, fig_cross_gpu, fig_shapes):
+              fig_topk, fig_v1_v2, fig_joint, fig_cross_gpu, fig_transfer_quality, fig_transfer_ceiling, fig_noise_3090,
+              fig_bundle, fig_shapes):
         try:
             f()
         except Exception as e:  # keep going; report which figure failed
