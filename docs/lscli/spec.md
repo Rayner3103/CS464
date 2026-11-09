@@ -206,7 +206,10 @@ The gate **opens** when all of these hold:
    running, and nobody else holds `src/pipeline/.lock` (a manual `train_best.sh` run).
 
 While one of the daemon's jobs runs, the gate **stays open** as long as conditions 2-4 hold and no compute process
-outside the job appears. Utilization is not checked then, because the job itself drives it up.
+outside the job appears. Utilization is not checked then, because the job itself drives it up. For 5 s after a job
+ends (a grace that starts before a search's final check), utilization is still not counted: NVML still reports the
+job's own. Otherwise every job would restart the idle clock and the daemon would run one search per
+`gpu_idle_minutes` instead of back to back. A compute process still counts during the grace.
 
 A job's processes are the job's root process and all its descendants, found by walking `/proc/<pid>/task/*/children`
 each poll (sweep compile workers are spawned grandchildren). NVML reports host PIDs: processes in other PID namespaces
