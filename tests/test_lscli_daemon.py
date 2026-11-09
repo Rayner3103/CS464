@@ -113,9 +113,16 @@ def test_an_exited_process_is_not_a_compute_process(tmp_path):
     assert Path(f"/proc/{zombie.pid}").exists()                      # still there, only dead
     zombie.wait()
     assert not gate.alive(zombie.pid) and gate.alive(os.getpid())
-    (tmp_path / "7").mkdir()
-    (tmp_path / "7" / "stat").write_text("7 (a) b) S 1 7 7 0")          # comm may hold ") "
-    assert gate.alive(7, proc=tmp_path) and not gate.alive(8, proc=tmp_path)
+    for pid, stat, argv, statm in ((7, "7 (a) b) S 1 7 7 0", b"python\0-c\0", "9 8 7 0 0 5 0"),   # comm may hold ") "
+                                   (11, "11 (python) S 1 11 11 0", b"", "9 8 7 0 0 5 0"),     # live, argv blanked
+                                   (9, "9 (python) R 1 9 9 0", b"", "0 0 0 0 0 0 0"),       # exiting: no mm, not yet Z
+                                   (10, "10 (python) Z 1 10 10 0", b"", "0 0 0 0 0 0 0")):
+        (tmp_path / str(pid)).mkdir()
+        (tmp_path / str(pid) / "stat").write_text(stat)
+        (tmp_path / str(pid) / "cmdline").write_bytes(argv)
+        (tmp_path / str(pid) / "statm").write_text(statm)
+    assert gate.alive(7, proc=tmp_path) and gate.alive(11, proc=tmp_path)
+    assert not any(gate.alive(p, proc=tmp_path) for p in (8, 9, 10))
 
 def _snap(pids=(), util=0):
     return gate.GpuSnapshot(list(pids), util, True, {p: "proc" for p in pids})

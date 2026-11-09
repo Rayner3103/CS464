@@ -341,6 +341,8 @@ def test_train_best_re_resolves_an_empty_hw_id_left_by_a_killed_stage(tmp_path, 
     bin_.mkdir()
     (bin_ / "python").write_text("#!/bin/sh\necho fakehw_sm00\n" if resolves else "#!/bin/sh\nexit 1\n")
     (bin_ / "python").chmod(0o755)
+    (bin_ / "nvidia-smi").write_text("#!/bin/sh\n")                      # no compute process: the pytest process itself
+    (bin_ / "nvidia-smi").chmod(0o755)                                   # may hold a CUDA context from earlier tests
     run = tmp_path / "run"
     run.mkdir()
     (run / "mode").write_text("quick\n")
