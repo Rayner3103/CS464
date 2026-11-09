@@ -141,14 +141,22 @@ class GpuSnapshot:
 
 
 def alive(pid: int, proc: str | os.PathLike = "/proc") -> bool:
-    """False once `pid` has exited (no /proc entry, or a zombie). NVML still lists a process while its CUDA context is
-    torn down; a job's short-lived child (a sweep compile worker) seen there and reaped before the job's tree is walked
-    looked foreign and preempted the job. A process that has exited uses no GPU, whoever it belonged to."""
+    """False once `pid` is exiting or has exited: no /proc entry, a zombie / dead state, or no memory left (empty cmdline
+    and an all-zero statm: the kernel drops a process's memory as it starts to exit, before it is a zombie; a live
+    process that blanked its argv still has memory). NVML still lists a process while its CUDA context is torn down: a
+    job's short-lived child (a sweep compile worker) seen there and reaped before the job's tree was walked looked
+    foreign and preempted the job. A process on its way out uses no GPU, whoever it belonged to. Assumes the daemon sees
+    the host's pids (a per-user service, not a container): a pid it cannot see counts as exited."""
+    d = Path(proc, str(pid))
     try:
-        stat = Path(proc, str(pid), "stat").read_text()
-    except OSError:
+        stat = (d / "stat").read_text()
+        if stat[stat.rindex(")") + 2:][:1] in ("Z", "X", "x"):
+            return False
+        if (d / "cmdline").read_bytes().strip(b"\0"):
+            return True
+        return any(v != "0" for v in (d / "statm").read_text().split())
+    except (OSError, ValueError):
         return False
-    return stat[stat.rindex(")") + 2:][:1] != "Z"
 
 
 def gpu_snapshot(index: int = 0) -> GpuSnapshot:
