@@ -132,6 +132,10 @@ def descendants(pid: int, proc: str = "/proc") -> set[int]:
     return out
 
 
+def _always_alive(pid: int) -> bool:          # a snapshot built by hand (tests): every listed pid runs
+    return True
+
+
 @dataclass
 class GpuSnapshot:
     pids: list[int]                 # compute processes on the GPU (NVML, host PIDs)
@@ -141,7 +145,7 @@ class GpuSnapshot:
     # Asked again when the gate decides, i.e. AFTER the job's tree was walked: a job child that NVML listed and that
     # exited between the snapshot and the walk is in neither, and must not look foreign. The sweep's compile pool
     # (max_tasks_per_child=1) replaces a worker every chunk, so this race preempted tune_sweep within seconds, every time.
-    alive: object = field(default=lambda pid: True, repr=False, compare=False)
+    alive: object = field(default=_always_alive, repr=False, compare=False)
 
 
 def alive(pid: int, proc: str | os.PathLike = "/proc") -> bool:
