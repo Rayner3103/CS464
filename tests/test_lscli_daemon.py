@@ -124,6 +124,23 @@ def test_an_exited_process_is_not_a_compute_process(tmp_path):
     assert gate.alive(7, proc=tmp_path) and gate.alive(11, proc=tmp_path)
     assert not any(gate.alive(p, proc=tmp_path) for p in (8, 9, 10))
 
+
+def test_a_job_child_that_exits_between_the_snapshot_and_the_tree_walk_is_not_foreign(tmp_path):
+    """The sweep's compile pool replaces a worker every chunk: a worker NVML listed (alive then) that exits before the
+    job's tree is walked is in neither. Liveness is asked again after the walk (the daemon walks `own` first)."""
+    from lscli.daemon import Daemon
+    paths = Paths(tmp_path / "home").ensure()
+    state = {"alive": True}
+    snap = gate.GpuSnapshot([777], 90, True, {777: "spawn_main"}, alive=lambda pid: state["alive"])
+    d = Daemon(paths, None, snapshot=lambda: snap, battery=lambda: False)
+
+    def walk():                                          # the worker is reaped while the tree is walked
+        state["alive"] = False
+        return {1}
+    assert not any(r.startswith("compute process") for r in d.gate_reasons(own=walk))
+    state["alive"] = True                                # still running after the walk and not in the tree: foreign
+    assert any(r.startswith("compute process 777") for r in d.gate_reasons(own=lambda: {1}))
+
 def _snap(pids=(), util=0):
     return gate.GpuSnapshot(list(pids), util, True, {p: "proc" for p in pids})
 

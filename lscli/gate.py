@@ -138,6 +138,10 @@ class GpuSnapshot:
     util: int | None                # percent, None when NVML cannot tell
     ok: bool = True                 # False: NVML unavailable (the gate stays closed)
     names: dict = field(default_factory=dict)
+    # Asked again when the gate decides, i.e. AFTER the job's tree was walked: a job child that NVML listed and that
+    # exited between the snapshot and the walk is in neither, and must not look foreign. The sweep's compile pool
+    # (max_tasks_per_child=1) replaces a worker every chunk, so this race preempted tune_sweep within seconds, every time.
+    alive: object = field(default=lambda pid: True, repr=False, compare=False)
 
 
 def alive(pid: int, proc: str | os.PathLike = "/proc") -> bool:
@@ -175,7 +179,7 @@ def gpu_snapshot(index: int = 0) -> GpuSnapshot:
             names[p] = Path(f"/proc/{p}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()[:120]
         except OSError:
             names[p] = "?"
-    return GpuSnapshot(pids, util, True, names)
+    return GpuSnapshot(pids, util, True, names, alive=alive)
 
 
 def gpu_identity(index: int = 0) -> dict:
@@ -206,7 +210,7 @@ class Gate:
 
     def observe(self, snap: GpuSnapshot, now: float, own: set[int] = frozenset()) -> list[int]:
         """Update the idle clock; returns the foreign compute PIDs."""
-        foreign = [p for p in snap.pids if p not in own]
+        foreign = [p for p in snap.pids if p not in own and snap.alive(p)]   # after `own` was walked
         util_busy = (not own and now >= self.grace_until and snap.util is not None
                      and snap.util >= self.cfg["idle"]["gpu_util_max"])
         busy = not snap.ok or bool(foreign) or util_busy
