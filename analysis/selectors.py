@@ -269,7 +269,7 @@ def picks(data: Path, knn_ks=(1, 3, 5, 10)) -> dict:
                                    gpu["sm_count"]]).encode()).hexdigest()
     cache = Path(data) / "selector_knnc_fit.json"
     cdoc = json.loads(cache.read_text()) if cache.exists() else {}
-    if cdoc.get("tag") != tag:
+    if cdoc.get("tag") != tag or "p99" not in cdoc.get("grid", [{}])[0]:  # a fit cached before p99 was reported is stale
         cdoc = {"tag": tag, "grid": fit_candidate(Fc, R, ok_tune, loo)}
         cache.write_text(json.dumps(cdoc))
     cgrid = cdoc["grid"]
@@ -390,11 +390,11 @@ def build(data: Path, report: Path, results: str = "results_lock1755_selectors3.
           "pruning rules for its target shape. `b6` = best single config on the tune screen "
           f"(`{P['b6']}`); `rule` = `analysis.selectors.rule_config`. Regret = t / oracle - 1.\n",
           "## Screen: regret vs the held-out per-shape best (full pruned space)\n",
-          "| selector | in-sample (tune, grouped LOO) median / p95 | " + " | ".join(f"held-out {g} median / p95" for g in groups)
+          "| selector | in-sample (tune, grouped LOO) median / p95 / p99 | " + " | ".join(f"held-out {g} median / p95 / p99" for g in groups)
           + " | held-out mean | picks the oracle |", "|---|---|" + "---|" * len(groups) + "---|---|"]
     for n in names:
-        md.append(f"| {n} | {pct(in_sample[n]['p50'])} / {pct(in_sample[n]['p95'])} | "
-                  + " | ".join(f"{pct(screen[n][g]['p50'])} / {pct(screen[n][g]['p95'])}" for g in groups)
+        md.append(f"| {n} | {pct(in_sample[n]['p50'])} / {pct(in_sample[n]['p95'])} / {pct(in_sample[n]['p99'])} | "
+                  + " | ".join(f"{pct(screen[n][g]['p50'])} / {pct(screen[n][g]['p95'])} / {pct(screen[n][g]['p99'])}" for g in groups)
                   + f" | {pct(screen[n]['all']['mean'])} | {pct(agree[n])} |")
     md.append("\nIn-sample uses grouped leave-one-out for the neighbour selectors (no tune shape sharing two of M, N, K "
               "with the target is a neighbour); the rule was written looking at these tune "
@@ -405,23 +405,23 @@ def build(data: Path, report: Path, results: str = "results_lock1755_selectors3.
     md.append(f"Grid: fill weight {FEATURE_GRID['fill']}, align weight {FEATURE_GRID['align']}, k {FEATURE_GRID['k']} "
               "(dims weight 1). Chosen by the lowest capped mean regret under grouped leave-one-out on the tune shapes, "
               f"before scoring any held-out shape. **knnf: {fdesc(P['fits']['knnf'])}. nn1f: {fdesc(P['fits']['nn1f'])}.**\n")
-    md.append("| fill | align | k | in-sample mean | median | p95 |")
-    md.append("|---|---|---|---|---|---|")
+    md.append("| fill | align | k | in-sample mean | median | p95 | p99 |")
+    md.append("|---|---|---|---|---|---|---|")
     for g in P["grid"][:8]:
         md.append(f"| {g['weights']['fill']} | {g['weights']['align']} | {g['k']} | {pct(g['mean'])} | {pct(g['p50'])} | "
-                  f"{pct(g['p95'])} |")
+                  f"{pct(g['p95'])} | {pct(g.get('p99', float('nan')))} |")
     base = [g for g in P["grid"] if g["weights"] == {"fill": 0, "align": 0} and g["k"] in (1, 5)]
     for g in sorted(base, key=lambda g: g["k"]):
-        md.append(f"| 0 | 0 | {g['k']} | {pct(g['mean'])} | {pct(g['p50'])} | {pct(g['p95'])} |")
+        md.append(f"| 0 | 0 | {g['k']} | {pct(g['mean'])} | {pct(g['p50'])} | {pct(g['p95'])} | {pct(g.get('p99', float('nan')))} |")
     md.append("\nThe last rows are the dims-only baselines (nn1, knn5) for comparison.\n")
     cf = P["fits"]["knnc"]
     md.append(f"Per-candidate k-NN (knnc), grid dims weight {CAND_GRID['dims']} x k {CAND_GRID['k']} (candidate features "
               f"{', '.join(CAND_FEATURES)} share weight 1), same selection rule. **knnc: dims weight {cf['dims_weight']}, "
               f"k = {cf['k']}.**\n")
-    md.append("| dims weight | k | in-sample mean | median | p95 |")
-    md.append("|---|---|---|---|---|")
+    md.append("| dims weight | k | in-sample mean | median | p95 | p99 |")
+    md.append("|---|---|---|---|---|---|")
     for g in P["cgrid"]:
-        md.append(f"| {g['dims_weight']} | {g['k']} | {pct(g['mean'])} | {pct(g['p50'])} | {pct(g['p95'])} |")
+        md.append(f"| {g['dims_weight']} | {g['k']} | {pct(g['mean'])} | {pct(g['p50'])} | {pct(g['p95'])} | {pct(g.get('p99', float('nan')))} |")
     md.append("")
     worst = {}
     for n in ("nn1", "knn5", "rule", "knnf", "knnc"):
@@ -463,12 +463,12 @@ def build(data: Path, report: Path, results: str = "results_lock1755_selectors3.
         md.append(f"{desc}. Per shape: the screen's top-8 tiles, every selector pick, B1, B3 (cuBLASLt heuristic top-16) "
                   f"and B3+ (B3 plus the deep cuBLASLt search), all in one session. {res['n_shapes']} shapes, "
                   f"{res['n_rows']} rows, {res['n_invalid_rows']} invalid. Oracle = fastest Triton row.\n")
-        md.append("Regret vs the per-shape Triton oracle, median / p95:\n")
+        md.append("Regret vs the per-shape Triton oracle, median / p95 / p99:\n")
         md.append("| selector | " + " | ".join(f"{g} (n={int(m.sum())})" for g, m in g2.items()) + " |")
         md.append("|---|" + "---|" * len(g2))
         for n in SELECTORS:
             md.append(f"| {n} | " + " | ".join(
-                f"{pct(res['regret'][n][g]['p50'])} / {pct(res['regret'][n][g]['p95'])}" if res['regret'][n][g]['n'] else "-"
+                f"{pct(res['regret'][n][g]['p50'])} / {pct(res['regret'][n][g]['p95'])} / {pct(res['regret'][n][g]['p99'])}" if res['regret'][n][g]['n'] else "-"
                 for g in g2) + " |")
         md.append("\nSpeedup vs B3+ (t_B3+ / t_pick; > 1 = the pick is faster), median [p10, p90], and shapes "
                   "ahead by > 5% / within 2% / behind by > 5%:\n")

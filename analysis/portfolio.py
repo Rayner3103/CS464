@@ -79,7 +79,7 @@ def curve(R: np.ndarray, order: list[int]) -> list[dict]:
         cur = np.minimum(cur, R[:, j])
         out.append({"size": n, "mean": float(np.minimum(cur, REGRET_CAP).mean() - 1),
                     "p50": float(np.percentile(cur, 50) - 1), "p95": float(np.percentile(cur, 95) - 1),
-                    "max": float(cur.max() - 1)})
+                    "p99": float(np.percentile(cur, 99) - 1), "max": float(cur.max() - 1)})
     return out
 
 
@@ -154,11 +154,11 @@ def build(data: Path, report: Path, eps_list=(0.02, 0.03, 0.05)) -> tuple[Path, 
           f"B6 = `{keys[b6]}`. Regret of B6 vs oracle: median {100 * (np.median(b6_r) - 1):.1f}%, "
           f"p90 {100 * (np.percentile(b6_r, 90) - 1):.1f}%, max {100 * (min(b6_r.max(), REGRET_CAP) - 1):.1f}%.\n",
           "## G5: portfolio size vs regret (greedy on mean regret)\n",
-          "| size | mean | p50 | p95 | max |", "|---|---|---|---|---|"]
+          "| size | mean | p50 | p95 | p99 | max |", "|---|---|---|---|---|---|"]
     for c in cv:
         if c["size"] in (1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 25, 30, 40, 50, 60, 80, 100):
             md.append(f"| {c['size']} | {100 * c['mean']:.2f}% | {100 * c['p50']:.2f}% | {100 * c['p95']:.2f}% | "
-                      f"{100 * min(c['max'], REGRET_CAP - 1):.1f}% |")
+                      f"{100 * c['p99']:.2f}% | {100 * min(c['max'], REGRET_CAP - 1):.1f}% |")
     md.append(f"\n**Smallest greedy portfolio with p95 regret < 5%: {g5 if g5 else '> ' + str(len(cv))}** "
               f"(G5 asks for <= ~50).\n")
     md.append("Set cover (every shape has a member within eps of its oracle): "
@@ -203,7 +203,7 @@ def _stats(r: np.ndarray) -> dict:
     if not len(r):
         return {"n": 0}
     return {"n": int(len(r)), "mean": float(np.minimum(r, REGRET_CAP).mean() - 1), "p50": float(np.percentile(r, 50) - 1),
-            "p95": float(np.percentile(r, 95) - 1), "max": float(r.max() - 1), "frac_le_5pct": float((r <= 1.05).mean())}
+            "p95": float(np.percentile(r, 95) - 1), "p99": float(np.percentile(r, 99) - 1), "max": float(r.max() - 1), "frac_le_5pct": float((r <= 1.05).mean())}
 
 
 def stage2_regret(rows: list[dict], portfolio: list[str], sizes) -> tuple[list[dict], dict[int, np.ndarray]]:
@@ -303,15 +303,21 @@ def build_heldout(data: Path, report: Path, sizes=(1, 5, 10, 16, 20, 25, 29, 30,
     for r in rows:
         md.append(f"| {r['size']} | {pct(r['in_sample']['mean'])} | "
                   + " | ".join(pct(r[f'heldout[{g}]']['mean']) if r[f'heldout[{g}]']['n'] else "-" for g in groups) + " |")
+    md.append("\nSame table, p99 regret (on 86 held-out shapes this is essentially the worst shape):\n")
+    md.append("| size | in-sample | in-sample >= 50 us | " + " | ".join(f"held-out {g}" for g in groups) + " |")
+    md.append("|---|---|---|" + "---|" * len(groups))
+    for r in rows:
+        md.append(f"| {r['size']} | {pct(r['in_sample']['p99'])} | {pct(r['in_sample_ge50']['p99'])} | "
+                  + " | ".join(pct(r[f'heldout[{g}]']['p99']) if r[f'heldout[{g}]']['n'] else "-" for g in groups) + " |")
     md.append(f"\n**Smallest tune-order prefix with held-out p95 < 5%: {g5_h if g5_h else '> ' + str(len(cv_h))}** "
               f"(in-sample: {g5_in}; a greedy portfolio re-fit on the held-out shapes themselves would need {g5_refit}).\n")
     md.append(f"B6 (`{keys[b6]}`) on held-out shapes: median regret {pct(np.median(b6_h) - 1)}, "
               f"p90 {pct(np.percentile(b6_h, 90) - 1)} (G3 out of sample).\n")
     md.append("Tune-fitted set covers on held-out shapes:\n")
-    md.append("| eps | size | held-out p95 | held-out max | shapes within 5% | >= 50 us p95 |")
-    md.append("|---|---|---|---|---|---|")
+    md.append("| eps | size | held-out p95 | held-out p99 | held-out max | shapes within 5% | >= 50 us p95 |")
+    md.append("|---|---|---|---|---|---|---|")
     for eps, c in cover_rows.items():
-        md.append(f"| {pct(float(eps))} | {c['size']} | {pct(c['p95'])} | {pct(c['max'])} | {pct(c['frac_le_5pct'])} | "
+        md.append(f"| {pct(float(eps))} | {c['size']} | {pct(c['p95'])} | {pct(c['p99'])} | {pct(c['max'])} | {pct(c['frac_le_5pct'])} | "
                   f"{pct(c['ge50']['p95']) if c['ge50']['n'] else '-'} |")
     md.append(f"\n## Worst held-out shapes for the {g5_size}-config portfolio\n")
     md.append("| shape | suite / split | oracle us | oracle config | portfolio us | portfolio config | regret |")
@@ -342,10 +348,10 @@ def build_heldout(data: Path, report: Path, sizes=(1, 5, 10, 16, 20, 25, 29, 30,
                   f"for that shape plus the first {s2_sizes[-1]} portfolio members. Oracle = fastest of those. "
                   f"{len(meta)} shapes, {summary['stage2']['n_invalid_rows']} invalid rows. "
                   "Sub-50 us cold times carry ~1 us event-tick quantization.\n")
-        md.append("| size | " + " | ".join(f"{g} p95 / mean" for g in g2) + " |")
+        md.append("| size | " + " | ".join(f"{g} p95 / p99 / mean" for g in g2) + " |")
         md.append("|---|" + "---|" * len(g2))
         for n in s2_sizes:
-            md.append(f"| {n} | " + " | ".join(f"{pct(_stats(reg[n][m])['p95'])} / {pct(_stats(reg[n][m])['mean'])}"
+            md.append(f"| {n} | " + " | ".join(f"{pct(_stats(reg[n][m])['p95'])} / {pct(_stats(reg[n][m])['p99'])} / {pct(_stats(reg[n][m])['mean'])}"
                                                if m.any() else "-" for m in g2.values()) + " |")
         n = s2_sizes[-1]
         worst2 = np.argsort(-reg[n])[:8]

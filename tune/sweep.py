@@ -12,6 +12,17 @@ SMALL_US, since CUDA events tick in ~1.02 us steps). Rankings within a few % are
 Isolation: each shape runs in its own subprocess, which appends one line per config to a partial file. If it dies
 (a config faulted the CUDA context), the parent marks the config after the last written line as crashed and restarts
 from there. Compilation runs first in parallel worker processes (`warmup`, no launch) to fill Triton's disk cache.
+
+Memory: every compile worker is a spawned process with its own torch + CUDA context (~0.85 GiB host RAM right after
+start, ~360 MiB VRAM). Triton keeps every kernel a process compiles in its JIT cache, so a worker's RSS also grows by
+~0.6 MiB per config (measured on an RTX 3080 compiling a 1062-config share of 2000^3: 0.87 GiB after 40 configs, 1.49 GiB
+after 1062). A long-lived worker therefore outgrows any per-worker budget: on a 16 GB / 6 GB machine ten of them
+(~1.4 GiB each by the end of a shape) made the kernel OOM killer take down the desktop session mid-sweep. So each chunk
+runs in a fresh process (`max_tasks_per_child=1`, CHUNK_CONFIGS configs per chunk), which bounds a worker at ~1.0 GiB;
+`workers_for` sizes the pool from free host RAM and free VRAM, once per shape; and `prewarm` halves the pool and
+retries the unfinished chunks if a worker is killed (whatever it did not compile is JIT-compiled lazily by the screen
+process, only slower). A shape whose tensors do not fit in free VRAM is recorded as skipped (with the reason), not
+retried as a series of "crashed configs".
 """
 from __future__ import annotations
 
@@ -19,6 +30,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -64,6 +76,60 @@ def shape_configs(M: int, N: int, K: int):
     return first + rest, dropped
 
 
+# Per compile worker, measured on an RTX 3080 with an empty Triton cache: RSS starts at ~0.85 GiB (torch + CUDA context) and
+# grows ~0.6 MiB per compiled config (the JIT cache keeps every kernel), so a chunk of CHUNK_CONFIGS configs peaks at
+# ~1.0 GiB; ptxas children and sampling gaps are covered by rounding up. VRAM ~363 MiB. The reserves leave room for the
+# parent, the OS and a desktop.
+DEFAULT_WORKERS = 10
+CHUNK_CONFIGS = 200  # configs per compile task; each task runs in a fresh process, which bounds the worker's RSS growth
+WORKER_HOST_GIB, WORKER_VRAM_MIB = 1.25, 450.0
+HOST_RESERVE_GIB, VRAM_RESERVE_MIB = 3.0, 768.0
+EXIT_OOM = 4  # the screen process could not fit this shape's tensors in VRAM
+
+
+def host_available_gib() -> float | None:
+    """MemAvailable from /proc/meminfo in GiB (None off Linux)."""
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return None
+
+
+def gpu_free_mib(device: int = 0) -> float | None:
+    """Free VRAM in MiB from NVML, which does not create a CUDA context in this process (None if NVML is unavailable)."""
+    from tune.env import _nvml_handle, _safe
+    import pynvml
+    h = _nvml_handle(device)
+    info = _safe(pynvml.nvmlDeviceGetMemoryInfo, h) if h else None
+    return info.free / 2**20 if info else None
+
+
+def workers_for(requested: int, cpus: int, host_gib: float | None, vram_mib: float | None) -> tuple[int, str]:
+    """Compile workers to start: `requested` (<= 0 means DEFAULT_WORKERS) capped by CPUs, free host RAM and free VRAM
+    (unknown limits are not applied). Always at least 1. Returns (workers, why it was reduced or '')."""
+    want = requested if requested > 0 else DEFAULT_WORKERS
+    caps = {"cpus": cpus}
+    if host_gib is not None:
+        caps["host RAM"] = int((host_gib - HOST_RESERVE_GIB) / WORKER_HOST_GIB)
+    if vram_mib is not None:
+        caps["VRAM"] = int((vram_mib - VRAM_RESERVE_MIB) / WORKER_VRAM_MIB)
+    limit = min(caps.values())
+    n = max(1, min(want, limit))
+    if n >= want:
+        return n, ""
+    by = min(caps, key=caps.get)
+    return n, f"{want} -> {n} workers, limited by {by} (free host RAM {host_gib and f'{host_gib:.1f} GiB'}, free VRAM {vram_mib and f'{vram_mib:.0f} MiB'})"
+
+
+def shape_vram_bytes(M: int, N: int, K: int, elem_bytes: int = 2) -> int:
+    """Peak VRAM of screening one shape: fp16 A, B and output, the fp32 copies of A and B and the fp32 reference
+    (`correctness.reference`), the largest split-K workspace the pruning allows (512 MiB) and the 64 MiB L2 flush buffer."""
+    return elem_bytes * (M * K + K * N + M * N) + 4 * (M * K + K * N) + 4 * M * N + 512 * 2**20 + 64 * 2**20
+
+
 def _warm_worker(args):
     """Compile (no launch) a chunk of configs for one shape's specialization. Runs in a spawned process."""
     keys, M, N, K = args
@@ -87,15 +153,45 @@ def _warm_worker(args):
     return out
 
 
-def prewarm(cfgs, M: int, N: int, K: int, workers: int) -> dict:
+def _compile_pool(chunks: dict[int, tuple], workers: int) -> dict[int, dict]:
+    """Run the chunks in a spawn pool. Returns the finished ones: all of them, unless a worker died (the kernel's OOM
+    killer breaks the whole pool) or raised (e.g. no memory left for its CUDA context)."""
     import multiprocessing as mp
-    from concurrent.futures import ProcessPoolExecutor
+    from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
+    done: dict[int, dict] = {}
+    try:
+        with ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), max_tasks_per_child=1) as ex:
+            futs = {ex.submit(_warm_worker, c): i for i, c in chunks.items()}
+            for f in as_completed(futs):
+                try:
+                    done[futs[f]] = f.result()
+                except BrokenExecutor:
+                    break
+                except Exception:
+                    continue
+    except BrokenExecutor:
+        pass
+    return done
+
+
+def prewarm(cfgs, M: int, N: int, K: int, workers: int, pool=_compile_pool, log=print) -> dict:
+    """Compile every config of a shape in `workers` processes. If workers die, halve the pool and redo only the unfinished
+    chunks; with one worker left that still fails, return what finished (the screen process compiles the rest lazily)."""
     dicts = [c.to_dict() for c in cfgs]
-    chunks = [(dicts[i::workers * 4], M, N, K) for i in range(workers * 4)]
+    n_chunks = max(workers * 4, -(-len(dicts) // CHUNK_CONFIGS))  # small chunks: a worker's RSS grows with what it compiled
+    pending = {i: (dicts[i::n_chunks], M, N, K) for i in range(n_chunks)}
     res: dict = {}
-    with ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn")) as ex:
-        for d in ex.map(_warm_worker, chunks):
+    while pending:
+        for i, d in pool(pending, workers).items():
             res.update(d)
+            del pending[i]
+        if not pending:
+            break
+        if workers == 1:
+            log(f"  compile workers keep dying ({len(pending)} chunks unfinished); the screen will compile those lazily")
+            break
+        workers = max(1, workers // 2)
+        log(f"  a compile worker died (out of memory?); retrying {len(pending)} unfinished chunks with {workers} workers")
     return res
 
 
@@ -199,12 +295,24 @@ def run_shape_isolated(M: int, N: int, K: int, sweep_dir: Path, workers: int, dt
     final = screen_path(sweep_dir, M, N, K, dtype)
     if final.exists():
         d = json.loads(final.read_text())
-        if d.get("screen_version") == SCREEN_VERSION:
+        if d.get("screen_version") == SCREEN_VERSION and not d.get("skipped"):  # a skipped shape is retried
             return d
     sweep_dir.mkdir(parents=True, exist_ok=True)
     partial = final.with_suffix(".partial.jsonl")
     cfgs, dropped = shape_configs(M, N, K)
     order = [c.key() for c in cfgs]
+
+    def skipped(reason: str) -> dict:
+        log(f"  skipping {M}x{N}x{K}: {reason}")
+        d = {"screen_version": SCREEN_VERSION, "M": M, "N": N, "K": K, "dtype": dtype, "n_configs": len(order),
+             "pruned_by_rule": dropped, "n_done": 0, "complete": False, "skipped": reason, "compile_wall_s": 0.0,
+             "screen_wall_s": 0.0, "screen_samples": SCREEN_SAMPLES, "slow_factor": SLOW_FACTOR, "rows": []}
+        final.write_text(json.dumps(d))
+        return d
+
+    free, need = gpu_free_mib(), shape_vram_bytes(M, N, K) / 2**20
+    if free is not None and need > 0.95 * free:
+        return skipped(f"needs ~{need:.0f} MiB of VRAM, {free:.0f} MiB free")
     t0 = time.perf_counter()
     compile_info = prewarm(cfgs, M, N, K, workers)
     t_compile = time.perf_counter() - t0
@@ -216,11 +324,15 @@ def run_shape_isolated(M: int, N: int, K: int, sweep_dir: Path, workers: int, dt
         done = [r["key"] for r in read_partial(partial)]
         if p.returncode == 0:
             break
+        if p.returncode == EXIT_OOM:
+            return skipped("out of VRAM allocating the inputs / fp32 reference")
         if p.returncode == EXIT_POISONED:
             log(f"  screen process restarted after a context-killing config ({done[-1] if done else '?'})")
             continue
         nxt = next((k for k in order if k not in set(done) and k not in set(crashed)), None)
         err = (p.stderr.strip().splitlines() or ["?"])[-1][:200]
+        if p.returncode == -signal.SIGKILL:
+            err = f"killed by SIGKILL, likely the host OOM killer; {err}"
         log(f"  screen process died ({err}); marking {nxt} as crashed and resuming")
         if nxt is None:
             break
@@ -282,10 +394,16 @@ def run_sweep(shapes: list[dict], out_dir: Path, *, workers: int, session_id: st
     from tune.env import write_env
     sweep_dir = out_dir / screen_dir
     env = write_env(out_dir, session_id=session_id, kind="sweep")
+    requested, last = workers, None
     t0 = time.perf_counter()
     manifest = {"session_id": env["session_id"], "screen_version": SCREEN_VERSION, "shapes": []}
     for i, s in enumerate(shapes):
         M, N, K = s["M"], s["N"], s["K"]
+        # Free memory is re-read before every shape: the desktop and other jobs come and go during a multi-hour sweep.
+        workers, why = workers_for(requested, os.cpu_count() or 1, host_available_gib(), gpu_free_mib())
+        if (workers, why) != last:
+            log(f"compile workers: {workers}" + (f" ({why})" if why else ""))
+            last = (workers, why)
         d = run_shape_isolated(M, N, K, sweep_dir, workers, log=log)
         ok = [r for r in d["rows"] if r["status"] == "ok"]
         best = min((r["us"] for r in ok), default=None)
@@ -313,7 +431,11 @@ def _main():
     pin_cpu()
     p = Path(a.partial)
     done = {r["key"] for r in read_partial(p)}
-    screen_shape(a.M, a.N, a.K, p, done | set(filter(None, a.crashed.split(","))), a.dtype)
+    import torch
+    try:
+        screen_shape(a.M, a.N, a.K, p, done | set(filter(None, a.crashed.split(","))), a.dtype)
+    except torch.OutOfMemoryError:
+        sys.exit(EXIT_OOM)
 
 
 if __name__ == "__main__":

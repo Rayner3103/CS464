@@ -7,3 +7,5 @@ pyarrow==25.0.1
 matplotlib==3.11.1
 nvidia-ml-py==13.615.71
 pytest==9.1.1
+scikit-learn==1.9.1    # learned selectors (analysis/learned.py)
+lightgbm==4.7.0

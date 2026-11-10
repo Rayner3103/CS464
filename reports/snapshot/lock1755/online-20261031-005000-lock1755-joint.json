@@ -1,0 +1,126 @@
+{
+  "timestamp": "2026-10-31T00:50:00.214716+08:00",
+  "hw_id": "rtx3080_sm86_68sms_10gb",
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 3080",
+    "uuid": "2964f942-1a83-acbd-122c-6801005b4028",
+    "compute_capability": "8.6",
+    "sm_count": 68,
+    "total_memory_bytes": 10348789760,
+    "l2_cache_bytes": 5242880,
+    "memory_bus_width_bits": 320,
+    "memory_clock_khz": 9501000,
+    "regs_per_sm": 65536,
+    "smem_per_block_optin_bytes": 101376,
+    "smem_per_sm_bytes": 102400,
+    "max_threads_per_sm": 1536
+  },
+  "driver": "595.99.02",
+  "cuda_driver_api": 13020,
+  "versions": {
+    "python": "3.12.12",
+    "torch": "2.13.0+cu130",
+    "torch_cuda": "13.0",
+    "cudnn": 92000,
+    "triton": "3.7.1",
+    "numpy": "2.5.2"
+  },
+  "torch_flags": {
+    "matmul_allow_tf32": false,
+    "matmul_allow_fp16_reduced_precision_reduction": true
+  },
+  "clocks": {
+    "max_sm_mhz": 2100,
+    "max_mem_mhz": 9501
+  },
+  "clock_lock": {
+    "declared": "1755",
+    "probe": "likely_locked",
+    "idle_clock_mhz": 1755,
+    "idle_reasons": 0,
+    "load_clock_mhz_min": 1755,
+    "load_clock_mhz_max": 1755,
+    "load_reasons": 0,
+    "max_sm_mhz": 2100,
+    "inferred_lock_mhz": 1755,
+    "state": "locked",
+    "lock_mhz": "1755",
+    "declared_matches_probe": true
+  },
+  "power_limit_w": 340.0,
+  "persistence_mode": 0,
+  "ecc_mode": null,
+  "display_active": 1,
+  "telemetry_at_capture": {
+    "clock_mhz": 1755,
+    "mem_clock_mhz": 9251,
+    "temp_c": 62,
+    "power_w": 123.483,
+    "throttle_reasons": 0
+  },
+  "gpu_processes": [
+    {
+      "kind": "compute",
+      "pid": 867333,
+      "used_mem_mb": 218.0
+    },
+    {
+      "kind": "graphics",
+      "pid": 5071,
+      "used_mem_mb": 196.9609375
+    },
+    {
+      "kind": "graphics",
+      "pid": 5816,
+      "used_mem_mb": 59.8125
+    },
+    {
+      "kind": "graphics",
+      "pid": 9060,
+      "used_mem_mb": 106.6875
+    },
+    {
+      "kind": "graphics",
+      "pid": 14190,
+      "used_mem_mb": 24.375
+    }
+  ],
+  "spec_peaks": {
+    "fp16_f32acc_flop_per_clk_per_sm": 512,
+    "spec_boost_mhz": 1710,
+    "max_sm_mhz": 2100,
+    "fp16_f32acc_tflops_at_boost": 59.53536,
+    "fp16_f32acc_tflops_at_max_clock": 73.1136,
+    "dram_gbps_spec": 760.08
+  },
+  "host": {
+    "hostname": "raynerubuntu-B550M-Pro4",
+    "cpu": "AMD Ryzen 5 5600 6-Core Processor",
+    "os": "Linux-7.0.0-38-generic-x86_64-with-glibc2.39",
+    "cpu_affinity": [
+      11
+    ]
+  },
+  "harness_git": {
+    "commit": "e9f39062add0861332c2d8431d3860abe9746c94",
+    "branch": "learned-selectors",
+    "dirty": false
+  },
+  "session_id": "20261031-005000-437cca",
+  "kind": "online",
+  "argv": [
+    "/home/raynerubuntu/Documents/repos/CS464/tune/__main__.py",
+    "--clock-lock",
+    "1755",
+    "online",
+    "--shapes-file",
+    "data/rtx3080_sm86_68sms_10gb/sweep_screen_heldout/subset.json",
+    "--k",
+    "5",
+    "--order",
+    "diverse",
+    "--lt-n",
+    "16",
+    "--fresh-cache"
+  ]
+}
