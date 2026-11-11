@@ -37,6 +37,7 @@ import torch
 from tune.correctness import placed_inputs, reference, validate
 from tune.env import provenance, write_env
 from tune.records import RecordWriter
+from tune.winner_cache import PROPOSAL_FAMILIES   # cuBLASLt candidates that are not the heuristic's
 
 # How many Triton candidates to compile and time. The ranker cannot know how often a shape will be launched, so the
 # call-count signal comes from the caller (KPolicy). k = 3 is the default (~0.5 s first use, ~0.6 s joint with cuBLASLt);
@@ -81,7 +82,6 @@ def shape_k(shape: dict, k: int, policy: KPolicy | None) -> int:
     return policy.k_for(shape.get("calls"), shape.get("frequent")) if policy else k
 
 
-PROPOSAL_FAMILIES = ("cublaslt_knn", "cublaslt_rank")   # cuBLASLt candidates that are not the heuristic's
 ROUTER_CONFIRM = 3   # the router times cuBLASLt first; re-timing the top 3 in reverse order cancels the resulting position bias
 RANK_DEFAULT = 5   # learned cuBLASLt ranker picks per search (held-out: top-5 = top-10 = top-16 in the online choice; reports/week1.md 2026-11-04)
 KNN_DEFAULT = 8   # nearest tune shapes for the cuBLASLt proposals: chosen on a tune-only leave-one-out scan (reports/week1.md 2026-11-04)
@@ -205,30 +205,36 @@ def proposal_keys(backends: list[tuple]) -> list[dict]:
     return [{"family": f, "key": key, "setup_s": s} for f, key, _, s in backends]
 
 
-def backends_from_keys(entries: list[dict], M: int, N: int, K: int, dtype=torch.float16, lt_n: int = 0) -> list[tuple]:
-    """Rebuild (family, key, backend, setup_s) tuples from `proposal_keys` output in THIS process. Triton keys are parsed
-    (`tune.sweep.parse_key`); k-NN / ranker cuBLASLt keys are rebuilt with `cublaslt_knn.from_key`; heuristic keys
-    (`h<rank>_...`) are looked up in this process's own heuristic top max(lt_n, 1), because the heuristic list belongs to
-    the cuBLASLt library loaded here. A key this process cannot build (the library no longer returns or accepts it) is
-    dropped, so the measured pool is the subset that exists here; the caller sees it in the returned keys."""
-    from tune.sweep import parse_key
+def _heuristic_width(keys: list[str]) -> int:
+    """How many heuristic candidates must be asked for to find every `h<rank>_...` key in `keys` (highest rank + 1)."""
+    import re
+    ranks = [int(m.group(1)) for m in (re.match(r"h(\d+)_", k) for k in keys) if m]
+    return max(ranks) + 1 if ranks else len(keys)
+
+
+def backends_from_keys(entries: list[dict], M: int, N: int, K: int, dtype=torch.float16, lt_n: int | None = None) -> list[tuple]:
+    """Rebuild (family, key, backend, setup_s) tuples from `proposal_keys` output in THIS process, each through
+    `tune.winner_cache.backend_for` (the one place that turns a key into a backend): Triton keys are parsed, k-NN / ranker
+    cuBLASLt keys are rebuilt with `cublaslt_knn.from_key`, heuristic keys (`h<rank>_...`) are looked up in this process's
+    own heuristic list, because that list belongs to the cuBLASLt library loaded here. The list is queried once, for
+    `lt_n` candidates; lt_n=None (default) asks for as many as the entries name (highest rank + 1), so a caller that
+    forwards a top-16 proposal gets all 16 back without repeating the width. A key this process cannot build (malformed,
+    or the library no longer returns or accepts it) is dropped, so the measured pool is the subset that exists here; the
+    caller sees it in the returned keys."""
+    from tune.winner_cache import backend_for
+    heur_keys = [e["key"] for e in entries if e.get("family", "triton") not in ("triton", *PROPOSAL_FAMILIES)]
     out, heur = [], None
     for e in entries:
         fam, key, s = e.get("family", "triton"), e["key"], float(e.get("setup_s", 0.0))
-        if fam == "triton":
-            from kernels.triton_matmul import TritonMatmul
-            out.append((fam, key, TritonMatmul(parse_key(key)), s))
-        elif fam in PROPOSAL_FAMILIES:
-            from baselines.cublaslt_knn import from_key
-            b = from_key(key, M, N, K, dtype)
-            if b is not None:
-                out.append((fam, key, b, s))
-        else:
-            if heur is None:
-                from baselines.cublaslt import candidates as lt_candidates
-                heur = {c.key: c for c in lt_candidates(M, N, K, dtype, max(lt_n, 1))}
-            if key in heur:
-                out.append((fam, key, heur[key], s))
+        if fam != "triton" and fam not in PROPOSAL_FAMILIES and heur is None:
+            from baselines.cublaslt import candidates as lt_candidates
+            heur = lt_candidates(M, N, K, dtype, max(lt_n, 1) if lt_n is not None else _heuristic_width(heur_keys))
+        try:
+            b = backend_for({"key": key, "family": fam}, M, N, K, dtype, heuristics=heur)
+        except ValueError:                                   # a malformed key: unbuildable here, like a rejected one
+            b = None
+        if b is not None:
+            out.append((fam, key, b, s))
     return out
 
 
@@ -240,7 +246,9 @@ def measure(M: int, N: int, K: int, dtype, lt_backends: list[tuple], triton, *, 
     `lt_backends` = `propose_lt(...)[0]`; `triton` = the Triton proposals, either a list of tuples or a zero-argument
     callable returning (tuples, rank_s) that is only called when the Triton half is not skipped (so a router-skipped shape
     pays no ranking). `router` (anything with `skip_triton(M, N, K, t_lt_us) -> (skip, p)` and `.threshold`) and `confirm`
-    behave as documented in `search_shape`. `inputs` = `_inputs(...)` when the caller already allocated them. Returns
+    behave as documented in `search_shape`. `inputs` = `_inputs(...)` when the caller already allocated them. Every
+    cuBLASLt candidate's row carries its `family` (so `choose` never takes it for a Triton config); `lt_n` > 0 only adds
+    the field to the Triton rows too, as `search_shape` always wrote it for a joint search. Returns
     {"rank_s", "candidates", "router"?} (lt_setup_s / lt_knn / lt_rank are added by the caller, who knows them)."""
     from tune.timing import benchmark
     if inputs is None:
@@ -258,7 +266,7 @@ def measure(M: int, N: int, K: int, dtype, lt_backends: list[tuple], triton, *, 
             torch.cuda.synchronize()
             x = {"config_key": key, "valid": chk.valid, "failure_reason": chk.failure_reason,
                  "compile_s": time.perf_counter() - t + extra_s}
-            if lt_n > 0:
+            if lt_n > 0 or family != "triton":       # Triton-only rows stay as they were written before cuBLASLt joined
                 x["family"] = family
             if chk.valid:
                 t = time.perf_counter()

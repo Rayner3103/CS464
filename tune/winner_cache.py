@@ -55,6 +55,7 @@ READS = (1, 2)                     # schema 1 lines (4-field environment) are re
 HARD_FIELDS = ("hw_id",)           # another GPU: the measurement says nothing here
 TRITON_HARD_FIELDS = ("kernel_src",)  # the Triton kernel's code changed: a Triton key now names a different kernel
 _RESERVED = ("stale", "verified")  # annotations `get` adds to the rows it returns; never stored
+PROPOSAL_FAMILIES = ("cublaslt_knn", "cublaslt_rank")   # cuBLASLt candidates rebuilt from their key alone (`backend_for`)
 
 
 def kernel_src_hash() -> str:
@@ -307,10 +308,12 @@ class WinnerCache:
         return {"before": len(lines), "after": len(out)}
 
 
-def backend_for(choice: dict, M: int, N: int, K: int, dtype=None, lt_n: int = 16):
+def backend_for(choice: dict, M: int, N: int, K: int, dtype=None, lt_n: int = 16, heuristics: list | None = None):
     """The runnable backend a choice names (`.make_runner(a, b)`), or None when it no longer exists (a cuBLASLt key the
     library does not return any more): the caller then searches again. `choice` is `select_kernel(...)["choice"]` or a
-    stored entry's `["choice"]`; `lt_n` bounds the cuBLASLt heuristic list rebuilt to find the named candidate."""
+    stored entry's `["choice"]`; `lt_n` bounds the cuBLASLt heuristic list rebuilt to find the named candidate, unless the
+    caller passes that list (`heuristics`, e.g. `tune.online.backends_from_keys`, which rebuilds many keys of one shape).
+    A malformed Triton key raises ValueError (`tune.sweep.parse_key`)."""
     import torch
     dtype = dtype or torch.float16
     if choice.get("key") is None:
@@ -319,8 +322,10 @@ def backend_for(choice: dict, M: int, N: int, K: int, dtype=None, lt_n: int = 16
         from kernels.triton_matmul import TritonMatmul
         from tune.sweep import parse_key
         return TritonMatmul(parse_key(choice["key"]))
-    if choice.get("family") in ("cublaslt_knn", "cublaslt_rank"):
+    if choice.get("family") in PROPOSAL_FAMILIES:
         from baselines.cublaslt_knn import from_key
         return from_key(choice["key"], M, N, K, dtype)
-    from baselines.cublaslt import candidates as lt_candidates
-    return next((c for c in lt_candidates(M, N, K, dtype, max(lt_n, 1)) if c.key == choice["key"]), None)
+    if heuristics is None:
+        from baselines.cublaslt import candidates as lt_candidates
+        heuristics = lt_candidates(M, N, K, dtype, max(lt_n, 1))
+    return next((c for c in heuristics if c.key == choice["key"]), None)
