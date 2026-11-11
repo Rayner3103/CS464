@@ -29,10 +29,21 @@ A cuBLASLt winner is stored as its key (`h<rank>_a<algo>_t<tile>_...`); `select_
 key that no longer exists as a miss (`backend_for` returns None), so a stale entry costs one re-search, never a wrong
 kernel. `backend_for(sel["choice"], M, N, K)` turns a choice (cached or fresh) into a runnable backend.
 
-The file only grows until `compact()` rewrites it (atomically, under the same lock the writers take): for each shape and
-GPU, a line that a later current-environment search re-searched is dropped, otherwise the last line per distinct
-environment is kept, so soft-stale entries stay until they are re-searched. Lines of other GPUs are kept (the card may
-come back).
+The file only grows until `compact()` rewrites it (atomically, under the same lock the writers take). What it may drop
+is decided by who else can still be reading the line:
+
+  * always: a line that a later line of the SAME environment (every field equal) replaced. That search superseded it
+    for every reader, whatever its own environment: a reader keeps only the last line per tier anyway.
+  * only inside the compactor's own `env_id` scope: a line that is stale here, was written before this environment's
+    current line for the shape, and whose search was not wider than it. `env_id` is an optional field of the
+    environment naming the one interpreter the entry belongs to (lscli sets it per registered Python environment;
+    `environment(env_id=...)`). Inside a scope the environment only changes over time (an upgrade), so a re-searched
+    line has no reader left. Without an `env_id`, several interpreters may share the file (two virtualenvs with
+    different torch builds on one GPU): a line that is stale for the compactor may be another one's current entry, so
+    nothing but exact duplicates is dropped and the file keeps one line per shape per environment it has seen.
+
+Lines of other GPUs and of other `env_id`s are never dropped (the card may come back; the other interpreter compacts its
+own scope).
 
 LIMITATIONS: entries are per machine (nothing is shared across GPUs); the cache never expires by age; a winner is the
 fastest of a short online timing (10 cold samples, one placement), so its ranking against near-ties is only as good as
@@ -74,9 +85,10 @@ def clock_lock_declared(value: str | None = None) -> str | None:
     return "unlocked" if v in ("none", "off", "0", "unlocked") else v
 
 
-def environment(*, models: dict | None = None, clock_lock: str | None = None) -> dict:
+def environment(*, models: dict | None = None, clock_lock: str | None = None, env_id: str | None = None) -> dict:
     """What a timed winner depends on besides the shape. `models` (ids of the rankers / router that proposed the
-    candidates) and `clock_lock` (a policy to declare instead of `TUNE_CLOCK_LOCK`) come from the caller."""
+    candidates), `clock_lock` (a policy to declare instead of `TUNE_CLOCK_LOCK`) and `env_id` (a name for this
+    interpreter when several share the file; it scopes `compact`) come from the caller."""
     import torch
     import triton
     from baselines.cublaslt import library_info
@@ -90,6 +102,8 @@ def environment(*, models: dict | None = None, clock_lock: str | None = None) ->
            "kernel_src": kernel_src_hash(), "clock_lock": clock_lock_declared(clock_lock)}
     if models is not None:
         env["models"] = models
+    if env_id is not None:
+        env["env_id"] = env_id
     return env
 
 
@@ -107,6 +121,14 @@ def tier(row: dict, env: dict) -> tuple[str, list[str]]:
     if any(f in row_env and (f in HARD_FIELDS or (f in TRITON_HARD_FIELDS and family == "triton")) for f in fields):
         return "hard", fields
     return ("soft" if fields else "current"), fields
+
+
+WIDTH = ("k", "lt_n", "lt_knn", "lt_rank")
+
+
+def _wider(a: dict, b: dict) -> bool:
+    """Entry `a` came from a search wider than `b`'s in some dimension: `get` can serve `a` where `b` is a miss."""
+    return any(a.get(w, 0) > b.get(w, 0) for w in WIDTH)
 
 
 def _row_id(r: dict, line: str) -> str:
@@ -258,13 +280,15 @@ class WinnerCache:
         self._verified.add(entry["id"])
 
     def compact(self) -> dict:
-        """Rewrite the file without the lines a re-search made obsolete; returns {"before", "after"} line counts.
+        """Rewrite the file without the lines no reader can be served any more; returns {"before", "after"} line counts.
 
-        Per (shape, dtype, GPU): the last line per distinct environment is a candidate. When a line is current in this
-        environment, the last current line stays and an older candidate stays only if its search was wider in some
-        dimension (k, lt_n, lt_knn, lt_rank), because `get(allow_stale=True)` can still serve it for a wider request;
-        otherwise every candidate stays (soft-stale entries are kept until re-searched). Verification lines stay while
-        their entry does. Unreadable lines are dropped. Atomic (temp file + rename) under the writers' lock; a
+        Per (shape, dtype, GPU, env_id): the last line per distinct environment is a candidate, every earlier line of the
+        same environment is dropped. The candidates all stay, except in this cache's own scope (the group's `env_id` is
+        this environment's, and not None): there a candidate that is not current here is dropped when a current line was
+        written after it and its search was not wider in some dimension (k, lt_n, lt_knn, lt_rank; `get(allow_stale=True)`
+        can still serve a wider one). A line written after the current one stays even when it is stale here: it comes
+        from a newer state of the interpreter than the environment this compactor was built with. Verification lines stay
+        while their entry does. Unreadable lines are dropped. Atomic (temp file + rename) under the writers' lock; a
         compactor that waited for the lock while another one replaced the file re-opens the new file."""
         if not self.path.exists():
             return {"before": 0, "after": 0}
@@ -276,21 +300,21 @@ class WinnerCache:
                 (verified if r.get("kind") == "verified" else entries).append((r, line))
             groups: dict[tuple, list] = {}
             for i, (r, line) in enumerate(entries):
-                groups.setdefault((r["M"], r["N"], r["K"], r["dtype"], (r.get("env") or {}).get("hw_id")), []).append(i)
-            width = ("k", "lt_n", "lt_knn", "lt_rank")
+                e = r.get("env") or {}
+                groups.setdefault((r["M"], r["N"], r["K"], r["dtype"], e.get("hw_id"), e.get("env_id")), []).append(i)
+            scope = self.env.get("env_id")
             keep: set[int] = set()
-            for idx in groups.values():
+            for gkey, idx in groups.items():
                 last: dict[str, int] = {}
                 for i in idx:
                     last[json.dumps(entries[i][0].get("env"), sort_keys=True)] = i
-                cur = [i for i in idx if tier(entries[i][0], self.env)[0] == "current"]
-                if not cur:
-                    keep.update(last.values())
+                cand = sorted(last.values())
+                current = {i for i in cand if tier(entries[i][0], self.env)[0] == "current"}
+                if scope is None or gkey[-1] != scope or not current:
+                    keep.update(cand)
                     continue
-                c = entries[cur[-1]][0]
-                keep.add(cur[-1])
-                keep.update(i for i in last.values() if i != cur[-1] and tier(entries[i][0], self.env)[0] != "current"
-                            and any(entries[i][0].get(w, 0) > c.get(w, 0) for w in width))
+                newest = max(current)                          # the line `get` serves here
+                keep.update(i for i in cand if i in current or i > newest or _wider(entries[i][0], entries[newest][0]))
             kept_ids = {_row_id(entries[i][0], entries[i][1]) for i in keep}
             out = [entries[i][1] for i in sorted(keep)] + [line for r, line in verified if r.get("id") in kept_ids]
             tmp = self.path.with_name(f"{self.path.name}.tmp-{uuid.uuid4().hex[:12]}")
