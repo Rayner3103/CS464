@@ -161,7 +161,8 @@ class WinnerCache:
 
     @staticmethod
     def _parse(lines: list[str]):
-        """(row, line) for every readable line of a known schema; a torn last line from a crash is skipped."""
+        """(row, line) for every readable line of a known schema; a torn last line from a crash, or a line whose key
+        fields are missing or of the wrong type (a damaged file), is skipped."""
         for line in lines:
             try:
                 r = json.loads(line)
@@ -169,14 +170,15 @@ class WinnerCache:
                 continue
             if not isinstance(r, dict) or r.get("schema") not in READS:
                 continue
-            if r.get("kind") == "verified" or all(x in r for x in ("M", "N", "K", "dtype", "k", "lt_n")):
-                yield r, line                 # an entry missing its key fields is unusable: skipped like a torn line
+            if r.get("kind") == "verified" or (all(isinstance(r.get(x), int) for x in ("M", "N", "K", "k", "lt_n"))
+                                               and isinstance(r.get("dtype"), str)):
+                yield r, line                 # an entry without usable key fields is skipped like a torn line
 
     def reload(self) -> None:
         """(Re)read the file; hard-stale lines (another GPU, changed kernel source) and unreadable lines are skipped."""
         self._rows, self._verified = {}, set()
         try:
-            lines = self.path.read_text().splitlines()
+            lines = self.path.read_text(errors="replace").splitlines()   # damaged bytes spoil their line, not the file
         except OSError:
             return
         for r, line in self._parse(lines):
@@ -231,7 +233,7 @@ class WinnerCache:
         (the handle would point at the old, unlinked file). Returns the open, locked file; closing it releases the lock."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         for _ in range(20):
-            f = open(self.path, mode)
+            f = open(self.path, mode, **({} if "b" in mode else {"errors": "replace"}))
             fcntl.flock(f, fcntl.LOCK_EX)
             try:
                 if os.fstat(f.fileno()).st_ino == os.stat(self.path).st_ino:

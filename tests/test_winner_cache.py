@@ -113,6 +113,33 @@ def test_a_broken_cache_never_breaks_selection(tmp_path, fake_search):
     assert sel["choice"]["key"] == KEY and not sel["cached"]
 
 
+def test_a_cache_that_cannot_be_built_never_breaks_selection(tmp_path, fake_search, monkeypatch):
+    """`cache=True` builds the default cache inside select_kernel: reading the environment (NVML, the kernel source, the
+    library versions) can fail, and that is a cache problem like any other."""
+    monkeypatch.setenv("TUNE_WINNER_CACHE", str(tmp_path / "w.jsonl"))
+
+    def boom(**k):
+        raise FileNotFoundError("kernels/triton_matmul.py")
+    monkeypatch.setattr("tune.winner_cache.environment", boom)
+    with pytest.warns(UserWarning, match="winner cache unavailable"):
+        sel = online.select_kernel(None, 64, 64, 64, cache=True, use_bundle=False, lt_n=0)
+    assert sel["choice"]["key"] == KEY and not sel["cached"] and not (tmp_path / "w.jsonl").exists()
+
+
+def test_damaged_bytes_and_wrong_types_cost_their_line_not_the_cache(tmp_path, fake_search, monkeypatch):
+    p = tmp_path / "w.jsonl"
+    WinnerCache(p, env=ENV).put(64, 64, 64, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})
+    good = p.read_bytes()
+    bad_type = json.dumps({"schema": 2, "env": ENV, "M": "x", "N": 8, "K": 8, "dtype": "fp16", "k": 3, "lt_n": 0}).encode()
+    p.write_bytes(b"\xff\xfe\x00 not utf-8\n" + bad_type + b"\n" + good)
+    wc = WinnerCache(p, env=ENV)                                                    # used to raise UnicodeDecodeError
+    assert len(wc) == 1 and wc.get(64, 64, 64, "fp16", k=3)["choice"]["key"] == KEY
+    monkeypatch.setenv("TUNE_WINNER_CACHE", str(p))
+    monkeypatch.setattr("tune.winner_cache.environment", lambda **k: dict(ENV))
+    assert online.select_kernel(None, 64, 64, 64, cache=True, use_bundle=False, lt_n=0)["cached"]
+    assert wc.compact() == {"before": 3, "after": 1} and p.read_bytes() == good    # compaction drops the unreadable lines
+
+
 def test_stale_cublaslt_winner_is_a_miss(tmp_path, fake_search, monkeypatch):
     wc = WinnerCache(tmp_path / "w.jsonl", env=ENV)
     wc.put(64, 64, 64, "fp16", k=3, lt_n=4, lt_knn=online.KNN_DEFAULT,

@@ -398,7 +398,11 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
         from kernels import bundle
         info = bundle.install()
         bundle_serves = bool(info.get("installed") and info.get("matches"))
-    wc = _winner_cache(cache)
+    try:
+        wc = _winner_cache(cache)
+    except Exception as e:                          # e.g. the environment cannot be read: select without a cache
+        warnings.warn(f"winner cache unavailable ({type(e).__name__}: {e}); searching without it")
+        wc = None
     if lt_n and lt_rank:
         from baselines.cublaslt_rank import ranker as _lt_ranker
         if _lt_ranker() is None:
