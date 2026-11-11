@@ -347,7 +347,11 @@ def test_current_entry_wins_over_a_wider_stale_one_only_when_wide_enough(tmp_pat
     wc.put(8, 8, 8, "fp16", k=3, lt_n=16, choice={"key": KEY, "family": "triton"})
     assert wc.get(8, 8, 8, "fp16", k=3, lt_n=16, allow_stale=True)["choice"]["key"] == KEY
     assert wc.get(8, 8, 8, "fp16", k=5, lt_n=16, allow_stale=True)["choice"]["key"] == "old"
-    assert wc.get(8, 8, 8, "fp16", k=5, lt_n=16) is None and wc.stale_entries() == []
+    assert wc.get(8, 8, 8, "fp16", k=5, lt_n=16) is None
+    # the stale entry is still served (for k = 5), so it is still listed for a re-search ...
+    assert [(e["choice"]["key"], e["k"], e["stale"]) for e in wc.stale_entries()] == [("old", 5, ["driver"])]
+    wc.put(8, 8, 8, "fp16", k=5, lt_n=16, choice={"key": KEY, "family": "triton"})
+    assert wc.stale_entries() == [] and wc.get(8, 8, 8, "fp16", k=5, lt_n=16, allow_stale=True)["stale"] == []   # ... until redone
 
 
 def test_mark_verified_persists_for_the_same_environment_only(tmp_path):

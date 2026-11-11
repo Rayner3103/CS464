@@ -257,8 +257,11 @@ class WinnerCache:
         return None
 
     def stale_entries(self) -> list[dict]:
-        """The soft-stale entries of shapes with no current entry: what an idle-time re-search should redo."""
-        return [self._out(v["soft"]) for v in self._rows.values() if "soft" in v and "current" not in v]
+        """The soft-stale entries `get(allow_stale=True)` can still return: those of shapes with no current entry, and
+        those whose search was wider than the shape's current entry (served for the wider request). What an idle-time
+        re-search should redo; a list that left the second kind out would let them be served for ever."""
+        return [self._out(v["soft"]) for v in self._rows.values()
+                if "soft" in v and ("current" not in v or _wider(v["soft"], v["current"]))]
 
     def _locked(self, mode: str):
         """Open the file and take the exclusive lock, re-opening when `compact` replaced it while this process waited
