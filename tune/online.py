@@ -387,7 +387,10 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
       * `cache`: the per-shape winner cache (`tune/winner_cache.py`). True = the default file for this GPU (None / False /
         `TUNE_WINNER_CACHE=off` = off; or pass a `WinnerCache`). A stored winner from a search at least as wide as this
         one is returned with no ranking, compiling or timing: {"reason": "cached", "cached": True, "candidates": []}. A
-        miss searches and stores the winner. Cache problems are warned about and never fail the selection.
+        miss searches and stores the winner. Cache problems are warned about and never fail the selection. The default
+        cache declares the model set this search draws on (`model_ids(ranker)`), so winners found with a ranker,
+        cuBLASLt ranker or router that was since retrained are soft-stale: searched again once. A `WinnerCache` you
+        pass keeps the environment you built it with (lscli declares its own model ids).
         `serve_stale=True` also returns a soft-stale entry (timed under another driver / torch / Triton / cuBLASLt / clock /
         model set on this GPU; `tune/winner_cache.py`): it is run once through the correctness gate in this environment
         (recorded, so later processes skip it; a failure is a miss), then served with reason "cached_stale" and `stale` =
@@ -399,7 +402,7 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
         info = bundle.install()
         bundle_serves = bool(info.get("installed") and info.get("matches"))
     try:
-        wc = _winner_cache(cache)
+        wc = _winner_cache(cache, ranker)
     except Exception as e:                          # e.g. the environment cannot be read: select without a cache
         warnings.warn(f"winner cache unavailable ({type(e).__name__}: {e}); searching without it")
         wc = None
@@ -449,13 +452,27 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
     return {**out, "choice": choice, "candidates": r["candidates"]}
 
 
-def _winner_cache(cache):
-    """`cache` argument of `select_kernel` -> a WinnerCache or None."""
+def model_ids(ranker) -> dict:
+    """Ids (`tune.winner_cache.model_id`) of the models a search on this machine takes its candidates from: the Triton
+    ranker given to `select_kernel` (`Ranker.load` remembers its stem) and the cuBLASLt ranker and family router files a
+    search here would load. All three are declared whether or not one call uses them (the router is off when the bundle
+    serves the kernels), so every call of a process setup shares its entries. None where there is no saved model (no
+    ranker, one built in memory, no file for this GPU)."""
+    from baselines.cublaslt_rank import default_stem as lt_rank_stem
+    from tune.router import default_stem as router_stem
+    from tune.winner_cache import model_id
+    return {"triton": model_id(getattr(ranker, "stem", None)), "lt_rank": model_id(lt_rank_stem()),
+            "router": model_id(router_stem())}
+
+
+def _winner_cache(cache, ranker=None):
+    """`cache` argument of `select_kernel` -> a WinnerCache or None. True = the default file, with this search's model
+    ids in its environment."""
     if cache is None or cache is False:
         return None
     if cache is True:
-        from tune.winner_cache import WinnerCache
-        return WinnerCache.default()
+        from tune.winner_cache import WinnerCache, default_enabled
+        return WinnerCache.default(models=model_ids(ranker)) if default_enabled() else None
     return cache
 
 

@@ -7,7 +7,9 @@ searched shape (the same crash-safe style as `tune/records.py`: one fsync'd line
 
 Key = shape + dtype; each line also carries the environment it was timed in (`environment()`): GPU id, Triton, torch,
 CUDA runtime, cuBLASLt build, driver, VBIOS, a hash of the Triton kernel's source, the declared clock-lock state, and,
-when the caller passes them, the ids of the models that proposed the candidates. Comparing a line's environment with
+when the caller passes them, the ids of the models that proposed the candidates (`model_id`; `select_kernel`'s default
+cache passes the ids of the Triton ranker it was given and of this GPU's cuBLASLt ranker and router files, so a
+retrained model makes the old winners soft-stale). Comparing a line's environment with
 the current one sorts it into one of three tiers (schema 2):
 
   * current: every field the current environment declares matches. Served.
@@ -75,6 +77,30 @@ def kernel_src_hash() -> str:
     return hashlib.sha256(src.read_bytes()).hexdigest()[:16]
 
 
+_MODEL_IDS: dict[tuple, str] = {}
+
+
+def model_id(stem: str | os.PathLike | None) -> str | None:
+    """Identity of a saved model (`<stem>.txt` + `<stem>.json`: the Triton ranker, the cuBLASLt ranker, the router):
+    `<stem name>:<12 hex of the sha256 of both files>`, the form lscli uses for its model sets. None without a stem or
+    when a file is missing. A retrained model gets another id under the same file name. Hashed once per process and file
+    state (path, size, mtime): the Triton ranker is ~36 MB."""
+    if not stem:
+        return None
+    files = [Path(str(stem) + ext) for ext in (".txt", ".json")]
+    try:
+        stats = [f.stat() for f in files]
+    except OSError:
+        return None
+    key = tuple((str(f), st.st_size, st.st_mtime_ns) for f, st in zip(files, stats))
+    if key not in _MODEL_IDS:
+        h = hashlib.sha256()
+        for f in files:
+            h.update(f.read_bytes())
+        _MODEL_IDS[key] = f"{Path(stem).name}:{h.hexdigest()[:12]}"
+    return _MODEL_IDS[key]
+
+
 def clock_lock_declared(value: str | None = None) -> str | None:
     """The declared SM clock policy (`TUNE_CLOCK_LOCK` / `--clock-lock`) normalized: "unlocked", a MHz string, or None
     when nothing was declared (then the clock is not part of the comparison)."""
@@ -135,6 +161,11 @@ def _row_id(r: dict, line: str) -> str:
     return r.get("id") or hashlib.sha1(line.encode()).hexdigest()[:16]
 
 
+def default_enabled() -> bool:
+    """False when `TUNE_WINNER_CACHE=off`."""
+    return os.environ.get(ENV_PATH, "").lower() != "off"
+
+
 def default_path() -> Path:
     from tune.env import default_data_dir
     return Path(os.environ.get(ENV_PATH) or default_data_dir() / "winner_cache.jsonl")
@@ -149,11 +180,12 @@ class WinnerCache:
         self.reload()
 
     @classmethod
-    def default(cls) -> "WinnerCache | None":
-        """The cache at its standard place, or None when `TUNE_WINNER_CACHE=off`."""
-        if os.environ.get(ENV_PATH, "").lower() == "off":
+    def default(cls, models: dict | None = None) -> "WinnerCache | None":
+        """The cache at its standard place, or None when `TUNE_WINNER_CACHE=off`. `models` = the model ids to declare
+        in its environment (`environment(models=...)`)."""
+        if not default_enabled():
             return None
-        return cls()
+        return cls(env=environment(models=models))
 
     @staticmethod
     def _key(M: int, N: int, K: int, dtype: str) -> tuple:

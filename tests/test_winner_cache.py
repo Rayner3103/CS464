@@ -121,6 +121,7 @@ def test_a_cache_that_cannot_be_built_never_breaks_selection(tmp_path, fake_sear
     def boom(**k):
         raise FileNotFoundError("kernels/triton_matmul.py")
     monkeypatch.setattr("tune.winner_cache.environment", boom)
+    monkeypatch.setattr(online, "model_ids", lambda ranker: None)
     with pytest.warns(UserWarning, match="winner cache unavailable"):
         sel = online.select_kernel(None, 64, 64, 64, cache=True, use_bundle=False, lt_n=0)
     assert sel["choice"]["key"] == KEY and not sel["cached"] and not (tmp_path / "w.jsonl").exists()
@@ -136,8 +137,55 @@ def test_damaged_bytes_and_wrong_types_cost_their_line_not_the_cache(tmp_path, f
     assert len(wc) == 1 and wc.get(64, 64, 64, "fp16", k=3)["choice"]["key"] == KEY
     monkeypatch.setenv("TUNE_WINNER_CACHE", str(p))
     monkeypatch.setattr("tune.winner_cache.environment", lambda **k: dict(ENV))
+    monkeypatch.setattr(online, "model_ids", lambda ranker: None)
     assert online.select_kernel(None, 64, 64, 64, cache=True, use_bundle=False, lt_n=0)["cached"]
     assert wc.compact() == {"before": 3, "after": 1} and p.read_bytes() == good    # compaction drops the unreadable lines
+
+
+def _model(stem, text):
+    for ext in (".txt", ".json"):
+        (stem.parent / (stem.name + ext)).write_text(text + ext)
+    return stem
+
+
+def test_model_id_names_the_files_content(tmp_path):
+    from tune.winner_cache import model_id
+    a = model_id(_model(tmp_path / "lgbm_rank_v2", "trees"))
+    assert a.startswith("lgbm_rank_v2:") and len(a.split(":")[1]) == 12 and a == model_id(tmp_path / "lgbm_rank_v2")
+    assert model_id(_model(tmp_path / "lgbm_rank_v2", "other trees")) != a          # retrained under the same name
+    assert model_id(None) is None and model_id(tmp_path / "missing") is None
+
+
+def test_default_cache_declares_the_models_so_a_retrained_ranker_is_searched_again(tmp_path, fake_search, monkeypatch):
+    """`select_kernel(cache=True)` after a retrain: the old winner came from another model's proposals. It is soft-stale
+    (a miss by default), not served as current."""
+    import types
+    ranker = types.SimpleNamespace(stem=_model(tmp_path / "lgbm_rank_v2", "trees"), features="v2")
+    monkeypatch.setenv("TUNE_WINNER_CACHE", str(tmp_path / "w.jsonl"))
+    lt_stem = _model(tmp_path / "lt_rank", "lt")
+    monkeypatch.setattr("baselines.cublaslt_rank.default_stem", lambda: lt_stem)
+    monkeypatch.setattr("tune.router.default_stem", lambda: tmp_path / "no_router")
+    monkeypatch.setattr("tune.winner_cache.environment",
+                        lambda models=None, **k: {**ENV, **({"models": models} if models is not None else {})})
+    kw = dict(cache=True, use_bundle=False, lt_n=0)
+    a, b = online.select_kernel(ranker, 64, 64, 64, **kw), online.select_kernel(ranker, 64, 64, 64, **kw)
+    assert not a["cached"] and b["cached"] and len(fake_search) == 1
+    ids = json.loads((tmp_path / "w.jsonl").read_text())["env"]["models"]
+    assert ids == online.model_ids(ranker) and ids["triton"].startswith("lgbm_rank_v2:") and ids["router"] is None
+    assert ids["lt_rank"].startswith("lt_rank:")
+    _model(tmp_path / "lgbm_rank_v2", "retrained trees")
+    c = online.select_kernel(ranker, 64, 64, 64, **kw)
+    assert not c["cached"] and len(fake_search) == 2                                # searched again with the new model
+    old = WinnerCache(tmp_path / "w.jsonl", env={**ENV, "models": online.model_ids(ranker)})
+    assert old.get(64, 64, 64, "fp16", k=3)["stale"] == []                          # ... and that result is current
+    _model(tmp_path / "lt_rank", "retrained lt")                                    # any model of the set counts
+    stale = WinnerCache(tmp_path / "w.jsonl", env={**ENV, "models": online.model_ids(ranker)})
+    assert stale.get(64, 64, 64, "fp16", k=3) is None
+    assert stale.get(64, 64, 64, "fp16", k=3, allow_stale=True)["stale"] == ["models"]
+    # a cache the caller built keeps the caller's environment: nothing is added to it
+    mine = WinnerCache(tmp_path / "mine.jsonl", env=ENV)
+    online.select_kernel(ranker, 64, 64, 64, cache=mine, use_bundle=False, lt_n=0)
+    assert "models" not in json.loads((tmp_path / "mine.jsonl").read_text())["env"]
 
 
 def test_stale_cublaslt_winner_is_a_miss(tmp_path, fake_search, monkeypatch):
