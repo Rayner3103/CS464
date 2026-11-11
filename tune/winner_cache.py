@@ -50,7 +50,9 @@ own scope).
 LIMITATIONS: entries are per machine (nothing is shared across GPUs); the cache never expires by age; a winner is the
 fastest of a short online timing (10 cold samples, one placement), so its ranking against near-ties is only as good as
 `choose`'s (no tie margin). Concurrent writers append whole lines under a file lock; a reader only sees entries from
-before it loaded the file (`reload()` to refresh).
+before it loaded the file (`refresh()` re-reads it when it changed). `WinnerCache.default()` keeps one instance per file
+and environment for the life of the process and refreshes it on every call, so a cache hit costs a `stat`, not a parse
+of the whole file (20 ms at 1,000 shapes, 140 ms at 10,000).
 """
 from __future__ import annotations
 
@@ -161,6 +163,9 @@ def _row_id(r: dict, line: str) -> str:
     return r.get("id") or hashlib.sha1(line.encode()).hexdigest()[:16]
 
 
+_DEFAULTS: dict[tuple, "WinnerCache"] = {}   # (path, environment) -> the instance `WinnerCache.default` hands out
+
+
 def default_enabled() -> bool:
     """False when `TUNE_WINNER_CACHE=off`."""
     return os.environ.get(ENV_PATH, "").lower() != "off"
@@ -177,6 +182,7 @@ class WinnerCache:
         self.env = env if env is not None else environment()
         self._rows: dict[tuple, dict[str, dict]] = {}     # key -> {"current": row, "soft": row} (last line of each tier)
         self._verified: set[str] = set()                   # entry ids verified in exactly this environment
+        self._stamp: tuple | None = None                   # the file state `_rows` reflects (`refresh`)
         self.reload()
 
     @classmethod
@@ -185,7 +191,14 @@ class WinnerCache:
         in its environment (`environment(models=...)`)."""
         if not default_enabled():
             return None
-        return cls(env=environment(models=models))
+        env = environment(models=models)
+        key = (str(default_path()), json.dumps(env, sort_keys=True, default=str))
+        wc = _DEFAULTS.get(key)
+        if wc is None:
+            wc = _DEFAULTS[key] = cls(env=env)
+        else:
+            wc.refresh()
+        return wc
 
     @staticmethod
     def _key(M: int, N: int, K: int, dtype: str) -> tuple:
@@ -206,9 +219,28 @@ class WinnerCache:
                                                and isinstance(r.get("dtype"), str)):
                 yield r, line                 # an entry without usable key fields is skipped like a torn line
 
+    @staticmethod
+    def _stamp_of(st: os.stat_result) -> tuple:
+        return (st.st_ino, st.st_size, st.st_mtime_ns)     # an append grows the file, `compact` replaces the inode
+
+    def _file_stamp(self) -> tuple | None:
+        try:
+            return self._stamp_of(os.stat(self.path))
+        except OSError:
+            return None
+
+    def refresh(self) -> bool:
+        """Re-read the file if it changed since this cache read it (another process appended or compacted); returns
+        whether it did. This process's own `put` / `mark_verified` do not count: they update the tables themselves."""
+        if self._file_stamp() == self._stamp:
+            return False
+        self.reload()
+        return True
+
     def reload(self) -> None:
         """(Re)read the file; hard-stale lines (another GPU, changed kernel source) and unreadable lines are skipped."""
         self._rows, self._verified = {}, set()
+        self._stamp = self._file_stamp()     # taken before reading: a line appended meanwhile costs one more reload, never a miss
         try:
             lines = self.path.read_text(errors="replace").splitlines()   # damaged bytes spoil their line, not the file
         except OSError:
@@ -282,6 +314,9 @@ class WinnerCache:
         """Append one fsync'd line under the file lock. A torn last line (a crash mid-write) is terminated first, so the
         new line is not glued onto it."""
         with self._locked("a+b") as f:
+            st = os.fstat(f.fileno())
+            # nobody else wrote since this cache read the file (or there was no file then and it is still empty)
+            seen = self._stamp == self._stamp_of(st) or (self._stamp is None and st.st_size == 0)
             f.seek(0, os.SEEK_END)
             torn = False
             if f.tell() > 0:
@@ -290,6 +325,8 @@ class WinnerCache:
             f.write((b"\n" if torn else b"") + (json.dumps(row) + "\n").encode())
             f.flush()
             os.fsync(f.fileno())
+            if seen:                             # the caller adds this line to the tables: they still match the file
+                self._stamp = self._stamp_of(os.fstat(f.fileno()))
 
     def put(self, M: int, N: int, K: int, dtype: str, *, k: int, lt_n: int, choice: dict, candidates: list[dict] | None = None,
             order: str | None = None, ranker: str | None = None, lt_knn: int = 0, lt_rank: int = 0) -> dict | None:

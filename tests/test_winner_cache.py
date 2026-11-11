@@ -142,6 +142,41 @@ def test_damaged_bytes_and_wrong_types_cost_their_line_not_the_cache(tmp_path, f
     assert wc.compact() == {"before": 3, "after": 1} and p.read_bytes() == good    # compaction drops the unreadable lines
 
 
+def test_default_cache_is_built_once_and_refreshed_when_the_file_changes(tmp_path, fake_search, monkeypatch):
+    """A cache hit through `cache=True` must not re-read and re-parse the whole file (it did, on every call)."""
+    p = tmp_path / "w.jsonl"
+    monkeypatch.setenv("TUNE_WINNER_CACHE", str(p))
+    monkeypatch.setattr("tune.winner_cache.environment", lambda **k: dict(ENV))
+    monkeypatch.setattr(online, "model_ids", lambda ranker: None)
+    loads = []                                                                       # the instances that (re)read the file
+    reload = WinnerCache.reload
+    monkeypatch.setattr(WinnerCache, "reload", lambda self: loads.append(self) or reload(self))
+    kw = dict(cache=True, use_bundle=False, lt_n=0)
+    sels = [online.select_kernel(None, 64, 64, 64, **kw) for _ in range(5)]
+    assert [s["cached"] for s in sels] == [False, True, True, True, True] and len(fake_search) == 1
+    mine = WinnerCache.default()
+    assert mine is WinnerCache.default() and loads == [mine]                         # one load: its own put is not a change
+    WinnerCache(p, env=ENV).put(128, 64, 64, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})   # "another process"
+    assert online.select_kernel(None, 128, 64, 64, **kw)["cached"] and loads.count(mine) == 2   # seen on the next call
+    assert online.select_kernel(None, 128, 64, 64, **kw)["cached"] and loads.count(mine) == 2
+    WinnerCache(p, env=ENV).compact()                                                # a rewrite (new inode) is a change too
+    assert online.select_kernel(None, 64, 64, 64, **kw)["cached"] and loads.count(mine) == 3
+    other = {**ENV, "driver": "600"}                                                 # another environment: another instance
+    monkeypatch.setattr("tune.winner_cache.environment", lambda **k: dict(other))
+    assert WinnerCache.default().env == other and not online.select_kernel(None, 64, 64, 64, **kw)["cached"]
+
+
+def test_refresh_sees_a_line_another_writer_appended_between_two_puts(tmp_path):
+    p = tmp_path / "w.jsonl"
+    a, b = WinnerCache(p, env=ENV), WinnerCache(p, env=ENV)
+    a.put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})
+    assert a.refresh() is False                                                      # its own line
+    b.put(9, 9, 9, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})    # b never read a's line ...
+    a.put(10, 10, 10, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})  # ... and a writes after b's
+    assert a.get(9, 9, 9, "fp16") is None and a.refresh() is True and a.get(9, 9, 9, "fp16") is not None
+    assert b.refresh() is True and len(b) == 3 and b.refresh() is False
+
+
 def _model(stem, text):
     for ext in (".txt", ".json"):
         (stem.parent / (stem.name + ext)).write_text(text + ext)
