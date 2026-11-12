@@ -289,6 +289,9 @@ def fit_rank_v2(hp: dict, Xs, Pc, Fc, Fa, R, train, Xt, Fct, Fat, ok_t, seed: in
     """Fit rank v2 on shapes `train` and score the targets (Xt, Fct, Fat: their shape features, candidate features and
     analytic features; ok_t: [target, config] runnable). Returns (S [target, pool] predicted log regret, inf where not
     runnable; pool config columns; estimator). Same pool as v1: the union of each training shape's top POOL_TOP."""
+    if hp.get("objective") != "regression":
+        raise ValueError(f"rank v2 regresses log regret with near-top weights; objective {hp.get('objective')!r} "
+                         "is not supported (pick the hyperparameters with v2_hp)")
     nc = len(CAND_FEATURES)
     pool = np.unique(np.argsort(R[train], axis=1, kind="stable")[:, :POOL_TOP])
     Rt = R[np.ix_(train, pool)]
@@ -559,6 +562,30 @@ def v2_tag(ctx: dict, hp: dict) -> str:
                                     NEAR_WEIGHT, N_FOLDS, SEED, FEATURES_V2]).encode()).hexdigest()
 
 
+def v2_hp(data: Path, v1_hp: dict, log=print, v1_tag: str | None = None) -> tuple[dict, str]:
+    """Rank v2's hyperparameters and where they came from. v2 is a regression of log regret (the near-top row weights
+    are regression weights), so it takes v1's CV-chosen hyperparameters only when v1 chose `regression`. When v1's grid
+    search chose `lambdarank` (it did on a 2060 training, 2026-11-13; the two objectives are within a few points of
+    mean regret there), v2 takes the best `regression` entry of that same tune-only search (learned_search.json, best
+    first; only when its tag is v1's `v1_tag`, i.e. the search ran on v1's screen), else v1's other hyperparameters with
+    the objective set to regression."""
+    if v1_hp.get("objective") == "regression":
+        return dict(v1_hp), "lgbm_rank.json (v1 CV-chosen, not re-searched)"
+    cache = Path(data) / "learned_search.json"
+    try:
+        doc = json.loads(cache.read_text())
+        if v1_tag is not None and doc.get("tag") != v1_tag:
+            raise ValueError("learned_search.json is from another screen than lgbm_rank.json")
+        grid = doc["search"]["lgbm_rank"]["grid"]
+        hp = next(dict(e["hp"]) for e in grid if e["hp"].get("objective") == "regression")
+        src = "learned_search.json (best regression entry of v1's CV search; v1 chose " + str(v1_hp.get("objective")) + ")"
+    except (OSError, ValueError, KeyError, TypeError, StopIteration):
+        hp = {**v1_hp, "objective": "regression"}
+        src = "lgbm_rank.json with objective set to regression (v1 chose " + str(v1_hp.get("objective")) + ")"
+    log(f"rank v2 hyperparameters {hp}: {src}")
+    return hp, src
+
+
 def cv_scores_v2(ctx: dict, Fa: np.ndarray, hp: dict, data: Path, log=print) -> np.ndarray:
     """Out-of-fold rank-v2 scores on every tune shape (N_FOLDS grouped folds over all of them), cached in
     data/<hw>/lgbm_rank_v2_cv_scores.npz. inf outside a fold's pool or where not runnable."""
@@ -582,12 +609,13 @@ def train_ranker_v2(data: Path, extra_screens: tuple[str, ...] = V2_EXTRA_SCREEN
                     log=print) -> tuple["Ranker", dict]:
     """Rank v2 (analytic features + near-top weights + the extra tune screens), fit on every tune shape and saved as
     data/<hw>/<out_stem>.*. Hyperparameters are the v1 ranker's CV-chosen ones (data/<hw>/lgbm_rank.json), not
-    re-searched. The diversification rule is refit on v2's own out-of-fold scores over all tune shapes. No held-out
-    shape is read by any fit."""
+    re-searched, or the best regression entry of v1's search when v1 chose lambdarank (v2_hp). The diversification
+    rule is refit on v2's own out-of-fold scores over all tune shapes. No held-out shape is read by any fit."""
     from tune.sweep import parse_key
     data = Path(data)
     ctx = context(data, extra_screens)
-    hp = json.loads((data / "lgbm_rank.json").read_text())["hp"]
+    v1 = json.loads((data / "lgbm_rank.json").read_text())
+    hp, hp_from = v2_hp(data, v1["hp"], log, v1_tag=(v1.get("meta") or {}).get("tag"))
     cfgs = [parse_key(k) for k in ctx["keys"]]
     gpu = json.loads((data / "env.json").read_text())["gpu"]
     from kernels.config_space import full_space, prune
@@ -606,7 +634,7 @@ def train_ranker_v2(data: Path, extra_screens: tuple[str, ...] = V2_EXTRA_SCREEN
                 {"features": FEATURES_V2, "tag": v2_tag(ctx, hp), "n_tune_shapes": len(ctx["shapes"]),
                  "extra_screens": list(extra_screens), "pool_top": POOL_TOP, "near_top": NEAR_TOP,
                  "near_weight": NEAR_WEIGHT, "diverse_rule": rules[0]["rule"], "inner_rule": inner,
-                 "diverse_k": DIVERSE_K, "hp_from": "lgbm_rank.json (v1 CV-chosen, not re-searched)"})
+                 "diverse_k": DIVERSE_K, "hp_from": hp_from})
     rk.save(data / out_stem)
     return rk, {"ctx": ctx, "pool": pool, "rules": rules, "S": S}
 
