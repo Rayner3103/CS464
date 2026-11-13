@@ -468,6 +468,7 @@ class Ranker:
         from kernels.config_space import HwLimits
         self.hw = HwLimits(gpu["smem_per_block_optin_bytes"], gpu["regs_per_sm"], gpu["sm_count"])
         self.features = self.meta.get("features", "v1")
+        self.stem: Path | None = None  # where `load` read it from: its identity for the winner cache (`tune.online.model_ids`)
         self._space = None  # v2: (static-kept configs, space_array, pool -> space column), built on first use
 
     def space(self):
@@ -526,7 +527,9 @@ class Ranker:
         import lightgbm as lgb
         stem = Path(stem)
         d = json.loads(stem.with_suffix(".json").read_text())
-        return cls(lgb.Booster(model_file=str(stem.with_suffix(".txt"))), d["pool"], d["hp"], d["gpu"], d["meta"])
+        r = cls(lgb.Booster(model_file=str(stem.with_suffix(".txt"))), d["pool"], d["hp"], d["gpu"], d["meta"])
+        r.stem = stem
+        return r
 
 
 def train_ranker(data: Path, ctx: dict | None = None, log=print) -> tuple["Ranker", dict]:
