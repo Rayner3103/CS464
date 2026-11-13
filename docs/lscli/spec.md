@@ -212,6 +212,14 @@ quick-failure check), utilization is still not counted: NVML still reports the
 job's own. Otherwise every job would restart the idle clock and the daemon would run one search per
 `gpu_idle_minutes` instead of back to back. A compute process still counts during the grace.
 
+A process NVML lists but that is exiting or gone (no `/proc` entry, a zombie, or an empty `cmdline` with no memory
+left) is not a compute process (this assumes the daemon sees the host's pids, as a per-user service does; in a
+container or under `hidepid`, a GPU user it cannot see would not close the gate): NVML keeps listing a process while its CUDA context is torn down, and a job's short-lived child (a sweep compile
+worker) reaped before the job's tree is walked would otherwise look foreign. The pipeline lock is the job's own when a
+process of the job holds it through one of its fds (`/proc/<pid>/fdinfo`): `/proc/locks` names the process that took
+the lock, which for train_best.sh's `exec 9>.lock; flock -n 9` is the short-lived `flock` child. A foreign lock
+reading counts only when a second reading agrees.
+
 A job's processes are the job's root process and all its descendants, found by walking `/proc/<pid>/task/*/children`
 each poll (sweep compile workers are spawned grandchildren). NVML reports host PIDs: processes in other PID namespaces
 (containers) may appear with PIDs that match nothing, and they count as foreign. This errs on the side of yielding.
