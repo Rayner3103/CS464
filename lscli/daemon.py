@@ -100,7 +100,7 @@ class Daemon:
             config.write_client_json(self.paths, self.cfg, models=ids, gpu_uuid=self.identity.get("uuid"),
                                      model_stems=self.models.stem_paths() if self.models else {})
         self.env_docs.clear()
-        self.log.info("models: %s", ids or "none (cuBLASLt heuristic + no Triton ranker: searches skipped)")
+        self.log.info("models: %s", ids or "none: cuBLASLt-only searches until this GPU's models are trained")
 
     def env_extra(self, eid: str) -> dict:
         return {**config.env_extra(self.cfg, self.models.ids() if self.models else None), "env_id": eid}
@@ -218,9 +218,10 @@ class Daemon:
 
     def next_task(self, caches: dict) -> scheduler.Task | None:
         pend, _ = queue.pending(self.paths)
-        tasks = scheduler.plan(self.cfg, usage.load(self.paths), pend, caches, self.failures, self.clock())
-        if self.models is None or self.models.triton() is None:
-            tasks = []                                       # nothing to rank with: only training can run
+        triton = self.models is not None and self.models.triton() is not None
+        tasks = scheduler.plan(self.cfg, usage.load(self.paths), pend, caches, self.failures, self.clock(), triton=triton)
+        if not triton and not self.cfg["search"]["lt_n"]:
+            tasks = []                                       # no Triton ranker and no cuBLASLt pool: only training runs
         stage = self.training_stage()
         if stage is not None:
             tasks = sorted(tasks + [scheduler.Task("train", stage=stage)])
@@ -431,24 +432,27 @@ class Daemon:
 
     def search(self, task: scheduler.Task) -> dict:
         """Spec 4.4: Triton proposals here (CPU), cuBLASLt ranker proposals in `lscli.propose`, measurement in the
-        env's worker. Raises Preempted / JobError."""
+        env's worker. With no model set the search is cuBLASLt's heuristic top lt_n alone (task.k = 0; spec 4.4).
+        Raises Preempted / JobError."""
         from lscli.cli import source_dir
         from tune.online import proposal_keys, propose_triton
         rec = envs.load(self.paths).get(task.env_id)
         if rec is None:
             raise jobs.JobError(f"env {task.env_id} is no longer registered")
         s = self.cfg["search"]
-        tri, rank_s = propose_triton(self.models.triton(), task.M, task.N, task.K, task.k, "diverse")
+        ms = self.models
+        tri, rank_s = propose_triton(ms.triton() if ms else None, task.M, task.N, task.K, task.k, "diverse")
         proposals = proposal_keys(tri)
-        lt_rank = s["lt_rank"] if (s["lt_n"] and self.models.stems["lt_rank"] is not None) else 0
+        lt_stem = ms.stems["lt_rank"] if ms else None
+        lt_rank = s["lt_rank"] if (s["lt_n"] and lt_stem is not None) else 0
         cwd = source_dir(self.paths)
         if lt_rank:
             job = jobs.Job([self.python, "-m", "lscli.propose"], cwd=cwd, log=self._job_log("propose"))
             res = jobs.converse(job, {"M": task.M, "N": task.N, "K": task.K, "dtype": task.dtype, "lt_n": s["lt_n"],
-                                      "lt_rank": lt_rank, "stem": str(self.models.stems["lt_rank"])},
+                                      "lt_rank": lt_rank, "stem": str(lt_stem)},
                                 watch=self._watch, silence_s=PROPOSE_TIMEOUT_S)
             proposals += res["proposals"]
-        router = self.models.router() if s["lt_n"] else None
+        router = ms.router() if (ms and s["lt_n"] and tri) else None     # nothing to skip without Triton candidates
 
         def answer(msg: dict) -> dict:
             skip, p = router.skip_triton(task.M, task.N, task.K, float(msg["t_lt_us"]))
@@ -456,7 +460,7 @@ class Daemon:
         req = {"M": task.M, "N": task.N, "K": task.K, "dtype": task.dtype, "k": task.k, "lt_n": s["lt_n"],
                "lt_rank": lt_rank, "confirm": 0, "router": router is not None, "proposals": proposals,
                "cache": None, "env_extra": self.env_extra(task.env_id), "order": "diverse",
-               "ranker": self.models.stems["triton"].name, "reply_timeout_s": 30, "rank_s": rank_s}
+               "ranker": ms.stems["triton"].name if ms else None, "reply_timeout_s": 30, "rank_s": rank_s}
         job = jobs.Job([rec["python"], "-m", "lscli.worker", "measure"], cwd=cwd, log=self._job_log("measure"))
         res = jobs.converse(job, req, watch=self._watch, answer=answer if router is not None else None)
         if res.get("skipped"):

@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/learned-selector-cli/install/install.sh | bash
 #
 # The default --ref is the lscli main branch, which moves; pass --ref <tag> (and fetch install.sh from that tag) to
-# install a fixed version. The pinned model hash protects the models, not the source.
+# install a fixed version.
 #
 # Installs the learned-selector CLI and its daemon for THIS user: a git clone in $LSCLI_HOME/src, a venv with the pinned
 # versions, the zero-shot models, ~/.local/bin/lscli, the config, and a systemd --user unit. Needs no root, except for
@@ -27,9 +27,10 @@ START=1
 YES=0
 CHECK_ONLY=0
 TORCH_INDEX="https://download.pytorch.org/whl/cu130"
-# Zero-shot models (the RTX 3080's rankers, cuBLASLt ranker and router), a release asset of $REF. The hash is pinned
-# HERE, not fetched from the release, so a replaced asset is refused. Empty = none published yet: the daemon then
-# trains this GPU's own models before it selects anything with a Triton ranker (install/pack_zero_shot.py makes one).
+# Zero-shot models: the RTX 3080's Triton ranker, cuBLASLt ranker and router, committed in the source as
+# install/zero_shot.tar.xz (install/pack_zero_shot.py), so they come with the clone. --models-url with --models-sha256
+# installs another archive instead. With neither, the daemon searches with cuBLASLt alone until it has trained this
+# GPU's models.
 MODELS_URL=""
 MODELS_SHA256=""
 
@@ -40,7 +41,7 @@ Usage: install.sh [options]
   --repo URL              repository (default $REPO_URL)
   --home DIR              state directory (default ~/.local/share/lscli; also \$LSCLI_HOME)
   --python BIN            interpreter for the daemon venv (default: python3.12 / python3.11 / python3 >= 3.11)
-  --models-url URL        zero-shot model archive (with --models-sha256; overrides the pinned one)
+  --models-url URL        zero-shot model archive to use instead of the committed one (needs --models-sha256)
   --models-sha256 HEX
   --clock-helper          install the SM clock helper (sudo) without asking; --clock-mhz MHZ sets its clock
   --no-clock-helper
@@ -115,6 +116,9 @@ preflight() {
   "$PYTHON" -c 'import os, sysconfig, sys; sys.exit(not os.path.exists(os.path.join(sysconfig.get_paths()["include"], "Python.h")))' \
     || die "the Python headers are missing for $PYTHON (e.g. apt install python3-dev); Triton needs them" 4
   "$PYTHON" -c 'import venv' 2>/dev/null || die "$PYTHON has no venv module (e.g. apt install python3-venv)" 4
+  "$PYTHON" -c 'import lzma' 2>/dev/null || die "$PYTHON has no lzma module (the zero-shot models are .tar.xz)" 4
+  "$PYTHON" -c 'import sys, tarfile; sys.exit(not hasattr(tarfile, "data_filter"))' \
+    || die "$PYTHON's tarfile has no extraction filters (needs 3.11.4 or later)" 4
   echo "GPU: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader -i 0); Python: $PYTHON"
 }
 preflight
@@ -159,18 +163,24 @@ echo "$SRC" > "$site/lscli-src.pth"                 # the daemon venv runs lscli
 "$VENV/bin/python" -c 'import torch, triton, lightgbm, lscli' || die "the venv cannot import its packages"
 
 # ------------------------------------------------------------------ models and kernels
+archive=""
 if [[ -n "$MODELS_URL" ]]; then
-  [[ -n "$MODELS_SHA256" ]] || die "--models-url needs --models-sha256 (or a pinned MODELS_SHA256)"
-  say "zero-shot models"
+  [[ -n "$MODELS_SHA256" ]] || die "--models-url needs --models-sha256"
   tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-  curl -fsSL "$MODELS_URL" -o "$tmp/models.tar.gz" || die "download failed: $MODELS_URL"
-  echo "$MODELS_SHA256  $tmp/models.tar.gz" | sha256sum -c --quiet - || die "zero-shot models: sha256 mismatch"
+  curl -fsSL "$MODELS_URL" -o "$tmp/models.tar" || die "download failed: $MODELS_URL"
+  echo "$MODELS_SHA256  $tmp/models.tar" | sha256sum -c --quiet - || die "zero-shot models: sha256 mismatch"
+  archive="$tmp/models.tar"
+elif [[ -f "$SRC/install/zero_shot.tar.xz" ]]; then
+  archive="$SRC/install/zero_shot.tar.xz"          # part of the clone: git checks its integrity
+fi
+if [[ -n "$archive" ]]; then
+  say "zero-shot models"
   rm -rf "$LSCLI_HOME/models/zero_shot.new"
   mkdir -p "$LSCLI_HOME/models/zero_shot.new"
   # regular files only, no absolute paths, no "..", no links (tarfile's "data" filter + an explicit member check)
-  "$VENV/bin/python" - "$tmp/models.tar.gz" "$LSCLI_HOME/models/zero_shot.new" <<'PY' || die "unsafe or broken model archive"
+  "$VENV/bin/python" - "$archive" "$LSCLI_HOME/models/zero_shot.new" <<'PY' || die "unsafe or broken model archive"
 import sys, tarfile
-with tarfile.open(sys.argv[1], "r:gz") as t:
+with tarfile.open(sys.argv[1], "r:*") as t:
     for m in t.getmembers():
         if not m.isfile() or m.name.startswith("/") or ".." in m.name.split("/"):
             sys.exit(f"refusing member {m.name!r}")
@@ -181,7 +191,7 @@ PY
   mv "$LSCLI_HOME/models/zero_shot.new" "$LSCLI_HOME/models/zero_shot"
   rm -rf "$LSCLI_HOME/models/zero_shot.old"
 else
-  echo "note: no zero-shot models for this release; the daemon trains this GPU's models before it selects kernels"
+  echo "note: no zero-shot models; the daemon searches with cuBLASLt alone until it has trained this GPU's models"
 fi
 (cd "$SRC" && "$VENV/bin/python" -m tune bundle unpack >/dev/null 2>&1) \
   && echo "kernel bundle unpacked" || echo "note: kernel bundle not unpacked (other Triton / GPU, or none)"
@@ -217,7 +227,7 @@ if [[ $CLOCK_HELPER == yes ]]; then
     || die "bad clock $CLOCK_MHZ (300..$max MHz)"
   say "clock helper (sudo): /usr/local/libexec/lscli-clock, lock at $CLOCK_MHZ MHz"
   tmp_sudo="$(mktemp)"
-  trap 'rm -f "$tmp_sudo"' EXIT
+  trap 'rm -f "$tmp_sudo"; rm -rf "${tmp:-}"' EXIT        # keeps the model download's cleanup
   printf '%s ALL=(root) NOPASSWD: /usr/local/libexec/lscli-clock lock, /usr/local/libexec/lscli-clock reset\n' \
     "$(id -un)" > "$tmp_sudo"
   sudo visudo -cf "$tmp_sudo" >/dev/null || die "the sudoers rule did not validate"
