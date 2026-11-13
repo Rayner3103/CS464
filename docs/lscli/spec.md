@@ -27,7 +27,7 @@ implementation plan (branches, PRs, order of work) is [`plan.md`](plan.md). Anyt
 | **daemon** (`lscli daemon run`, unit `lscli.service`) | `~/.local/share/lscli/venv` (pinned versions) | the repo's `requirements.txt` | idle gate, scheduler, Triton ranking and the router (CPU: LightGBM), training, model registry, cache compaction. The daemon process itself never creates a CUDA context |
 | **proposer** (`python -m lscli.propose`) | the daemon venv, started per search job | same as the daemon | the GPU-needing part of ranking: the learned cuBLASLt ranker's proposals (`propose_lt`), which build descriptors and call `cublasLtMatmulAlgoCheck` |
 | **CLI** (`lscli ...`) | the daemon venv (on `PATH` via `~/.local/bin/lscli`) | same as the daemon | user commands, section 6 |
-| **clock helper** (`/usr/local/libexec/lscli-clock`, optional) | root, via one sudoers rule | `nvidia-smi` | locks / resets the SM clock around idle jobs |
+| **clock helper** (`/usr/local/libexec/lscli-clock`, optional) | root, via one sudoers rule | `nvidia-smi` | locks the SM clock around idle jobs and restores the state it found (section 4.6) |
 
 The client and the daemon never import each other at run time; they communicate only through the files in section 3.
 Nothing leaves the machine: there is no telemetry, and the usage record (shapes, interpreter paths) stays in
@@ -213,13 +213,18 @@ While a job runs, a watcher polls every second. When the gate closes (section 4.
 
 1. The job's process group gets SIGTERM, then SIGKILL after 5 s. Descendants that left the group (spawned compile
    workers) are killed by PID from the last descendant walk.
-2. The clock is reset if it was locked.
+2. If the daemon locked the clock, it is restored to the state found before the job (section 4.6).
 3. The unit in flight is discarded. A search writes nothing, because the worker writes its winner only as its last
    step and is killed before that. A training stage keeps only the shapes it completed (train_best stages are
    resumable per shape).
 4. `backoff_minutes` of backoff starts.
 
 No measurement taken while a foreign compute process existed is ever written.
+
+The protection is one-sided. A user process that starts during a daemon job shares the GPU with it until the job is
+gone: up to about 1 s before the watcher sees it, then up to 5 s of SIGTERM grace, so about 6 s at worst. The
+daemon's result is discarded; the user's measurement is not. Before a measurement that matters, run `lscli pause`
+and start only when `lscli status` shows no job.
 
 ### 4.3 Scheduler
 
@@ -294,13 +299,23 @@ program first runs them.
   validated against `nvidia-smi -q -d SUPPORTED_CLOCKS`. It writes the root-owned `/etc/lscli/clock.conf` and sets
   `[clock] lock_mhz` to the same value.
 * With `lock_mhz > 0`, the daemon runs `sudo -n /usr/local/libexec/lscli-clock lock` before a GPU job and
-  `sudo -n /usr/local/libexec/lscli-clock reset` after it, on preemption and on exit. The unit runs the reset in
-  `ExecStartPre` and `ExecStopPost`, so a crash or SIGKILL is cleaned up at the next start.
+  `sudo -n /usr/local/libexec/lscli-clock restore` after it, on preemption and on exit.
+* **Restore, not reset.** `lock` first saves the clock state it finds (the SM clock lock in force, or none) to a
+  root-owned file under `/run/lscli-clock/`, then locks to `clock.conf`'s MHz. If a saved state already exists (an
+  earlier `lock` was never restored, e.g. after a crash), it keeps that one instead of saving lscli's own lock as
+  the previous state. If it cannot read the current state reliably, it saves `unknown`.
+* `restore` puts the saved state back and deletes the file: the previous lock is re-applied, or the clock is reset
+  (`nvidia-smi -rgc`) when none was in force. With no saved state, or one that is `unknown` or unreadable, it falls
+  back to the reset. A manual lock such as `nvidia-smi -lgc 1755,1755` therefore survives the daemon's jobs.
+* **Fail-safe.** The unit runs `restore` in `ExecStartPre` and `ExecStopPost`, so a crash or SIGKILL ends at the
+  saved baseline (or the reset, when none was saved) by the next start at the latest. `/run` is cleared at reboot,
+  as is any clock lock.
 * The helper:
   * is root-owned (0755) in root-owned directories;
   * uses an absolute `/usr/bin/nvidia-smi` and a scrubbed environment;
-  * takes exactly one argument, `lock` or `reset`;
-  * reads the MHz only from `clock.conf` and re-validates it.
+  * takes exactly one argument, `lock` or `restore`;
+  * reads the MHz only from `clock.conf` and re-validates it, and re-validates a saved state the same way before
+    applying it.
 * `/etc/sudoers.d/lscli` allows exactly those two command lines, for the installing user only, and is checked with
   `visudo -c`.
 * Without the helper, `lock_mhz` must be 0.
@@ -313,6 +328,17 @@ program first runs them.
 * `LSCLI_PATCH=1` in the environment enables it at interpreter start-up, through `lscli.pth` (installed by
   `lscli enable-env`), which imports nothing unless the variable is set.
 * `LSCLI_DISABLE=1` overrides both (a kill switch).
+* **Runtime guard.** `lscli.enable()` (and so the `LSCLI_PATCH` hook) and `python -m lscli.worker` first check that
+  the harness packages lscli imports (`tune`, `kernels`, `baselines`, and `analysis` where present) resolve under
+  the same source directory as `lscli` itself, by comparing each module's `__file__` with that directory. On a
+  machine that develops this repo, a checkout reached through the cwd or `PYTHONPATH` and lscli's copy can both be
+  importable, and which one a process gets depends on the directory it started in. If any package resolves
+  elsewhere:
+  * the client does not patch and warns once, naming the package and both paths;
+  * the worker exits with an `error` before it touches CUDA. The daemon records a failed probe or search: no winner
+    is written, and the env is not retried until its record changes (`lscli enable-env` again) or the daemon
+    restarts, so there is no retry loop. `lscli status` and `lscli doctor` name the env and the package.
+  This makes a mixed import impossible whatever the cwd.
 
 ### 5.2 Which calls are dispatched
 
@@ -382,7 +408,7 @@ reason.
 | Command | Synopsis | Effect |
 |---|---|---|
 | `status` | `lscli status [--watch]` | Daemon state, gate and reasons, current job, queue, training progress, cache tiers, client hit rate (from the profile) |
-| `enable-env` | `lscli enable-env [PYTHON]` (default: `python3` on `PATH`) | Install the client into that interpreter's env (`pip install --no-deps` from `src/`, then numpy / nvidia-ml-py if missing), write `lscli.pth`, register in `envs.json`, queue the env's shapes for search |
+| `enable-env` | `lscli enable-env [PYTHON]` (default: `python3` on `PATH`) | Install the client into that interpreter's env (`pip install --no-deps` from `src/`, then numpy / nvidia-ml-py if missing), write `lscli.pth`, register in `envs.json`, queue the env's shapes for search. Refuses when a package named like lscli's (`lscli`, `tune`, `kernels`, `baselines`, `analysis`) is importable from anywhere but lscli's copy, checked both isolated (`python -I`) and from the caller's cwd with its `PYTHONPATH`, so a checkout reachable there is reported as a clash instead of being registered |
 | `disable-env` | `lscli disable-env PYTHON` | Remove `lscli.pth` and the client package; unregister |
 | `envs` | `lscli envs` | List registered interpreters and their versions |
 | `pause` / `resume` | `lscli pause [--for DURATION]`, `lscli resume` | Stop starting jobs (a running one is preempted) / clear the pause |
@@ -394,7 +420,7 @@ reason.
 | `logs` | `lscli logs [-f] [--job ID]` | Daemon or job log |
 | `doctor` | `lscli doctor` | Checks: GPU and driver, systemd user session and linger, unit state, clock helper, versions of each registered env (and gcc + `Python.h`, which Triton's launcher needs), file permissions, models present, processes holding a CUDA context (they keep the gate closed) |
 | `daemon` | `lscli daemon run` (used by the unit) / `start` / `stop` / `restart` | Foreground loop / `systemctl --user` wrappers |
-| `uninstall` | `lscli uninstall [--purge] [--yes]` | Stop and remove the unit, reset clocks, remove the clock helper (sudo), `disable-env` every registered env, remove `~/.local/bin/lscli`; keep `$LSCLI_HOME` unless `--purge` |
+| `uninstall` | `lscli uninstall [--purge] [--yes]` | Stop and remove the unit, restore the clock (section 4.6), remove the clock helper (sudo), `disable-env` every registered env, remove `~/.local/bin/lscli`; keep `$LSCLI_HOME` unless `--purge` |
 
 Exit codes: `0` success, `1` failure, `2` usage error, `3` the daemon is needed but not running, `4` unsupported
 system (no NVIDIA GPU, no systemd user session).
@@ -472,8 +498,14 @@ night trains in whatever window it is awake for. Without linger, the service sto
 ## 9. Known limitations (v1)
 
 * NN only: workloads whose GEMMs go through `nn.Linear` are counted but not sped up.
-* The client package installs top-level `tune`, `kernels` and `baselines` packages into the user's env. A user
-  package with one of these names conflicts; `enable-env` refuses if it finds one.
+* The client puts top-level `tune`, `kernels`, `baselines` (and `analysis`) packages in the user's env. A user
+  package with one of these names conflicts: `enable-env` refuses if it finds one (isolated and from the caller's
+  cwd / `PYTHONPATH`), and the runtime guard (section 5.1) refuses to patch or measure if one shadows lscli's copy
+  at run time. The guard cannot protect a program that does not import lscli: in an interpreter a CS464 checkout
+  is developed with, a script started outside the repo root imports lscli's copy of the harness. Do not enable
+  such an interpreter. A namespaced layout would remove the clash (plan section 4).
+* A user process that starts during a daemon job shares the GPU with it for up to about 6 s (section 4.2). Run
+  `lscli pause` before a measurement that matters.
 * Winners are timed in idle conditions and served under load; near-ties (within 4 % at ≥ 50 µs at stock clocks, 3 %
   locked; 5 % below, borrowed: graph timing has no noise study) are arbitrary.
 * A user env whose Triton is not the bundle's version gets no prebuilt kernels: its compiles happen in the worker,
