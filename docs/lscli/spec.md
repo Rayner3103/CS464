@@ -317,8 +317,8 @@ program first runs them.
 
 ### 4.6 Clock
 
-* The lock MHz is chosen **at install time**. The installer suggests about 85 % of the card's maximum SM clock,
-  validated against `nvidia-smi -q -d SUPPORTED_CLOCKS`. It writes the root-owned `/etc/lscli/clock.conf` and sets
+* The lock MHz is chosen **at install time**. The installer suggests about 85 % of the card's maximum SM clock
+  and accepts 300 MHz up to that maximum, with no leading zeros. It writes the root-owned `/etc/lscli/clock.conf` and sets
   `[clock] lock_mhz` to the same value.
 * With `lock_mhz > 0`, the daemon runs `sudo -n /usr/local/libexec/lscli-clock lock` before a GPU job and
   `sudo -n /usr/local/libexec/lscli-clock reset` after it, on preemption and on exit. The unit runs the reset in
@@ -507,6 +507,9 @@ curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/<tag>/install/inst
    `src` in editable mode. `$LSCLI_HOME` is created with mode 0700.
 3. Download the zero-shot models (GitHub release assets of `<tag>`) into `models/zero_shot/`. Their sha256 sums are
    **pinned in `install.sh`** itself, not fetched from the release. Unpack `kernels/bundle.tar.xz`.
+   `install/pack_zero_shot.py` builds the archive and prints the hash to pin. Until an asset is published, the pin is
+   empty and the installer skips this step: the daemon then trains this GPU's models first and selects nothing with a
+   Triton ranker until they exist. `--models-url URL --models-sha256 HEX` installs another archive.
 4. Write `~/.config/lscli/config.toml` if absent. Link `~/.local/bin/lscli`. Install and start `lscli.service`
    (`systemctl --user enable --now`). Run `loginctl enable-linger` when the user agrees (prompt; `--linger` /
    `--no-linger`).

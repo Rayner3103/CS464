@@ -469,6 +469,101 @@ def cmd_train(args, paths: Paths) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------------------------------------------------------------------ doctor
+def cmd_doctor(args, paths: Paths) -> int:
+    from lscli import doctor
+    rows = doctor.checks(paths)
+    _out(args, rows, doctor.report(rows))
+    return doctor.exit_code(rows)
+
+
+# ------------------------------------------------------------------------------------------------------------ uninstall
+CLOCK_FILES = ("/usr/local/libexec/lscli-clock", "/etc/sudoers.d/lscli", "/etc/lscli/clock.conf")
+_MARKERS = ("venv", "src", "state.json", "envs.json", "winners.jsonl", "client.json", "profile", "queue.jsonl")
+
+
+def purge_refusal(root: Path) -> str | None:
+    """Why `--purge` must not delete `root` (None = safe): never /, $HOME or one of its ancestors, and only a
+    directory that looks like an lscli home."""
+    root = root.resolve()
+    home = Path.home().resolve()
+    if root == Path("/") or root == home or root in home.parents:
+        return "it is / or your home directory (or above it)"
+    if not root.is_dir():
+        return "not a directory"
+    if not any((root / m).exists() for m in _MARKERS):
+        return "it does not look like an lscli home"
+    return None
+
+
+def cmd_uninstall(args, paths: Paths) -> int:
+    """Spec 6: stop and remove the unit, reset the clock, remove the clock helper (sudo), remove every env's hook,
+    remove ~/.local/bin/lscli; keep $LSCLI_HOME and the config unless --purge."""
+    import shutil
+    if not args.yes:
+        what = "everything, including the usage record and models" if args.purge else "lscli (data kept)"
+        try:
+            ans = input(f"Uninstall {what}? [y/N] ")
+        except EOFError:
+            ans = ""
+        if not ans.lower().startswith("y"):
+            print("nothing done")
+            return EXIT_FAIL
+    done = []
+    unit = Path.home() / ".config" / "systemd" / "user" / "lscli.service"
+    if shutil.which("systemctl"):
+        subprocess.run(["systemctl", "--user", "disable", "--now", "lscli.service"], capture_output=True)
+    if unit.exists():
+        unit.unlink()
+        done.append(f"removed {unit}")
+        if shutil.which("systemctl"):
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    helper = Path(CLOCK_FILES[0])
+    if helper.exists():
+        reset = subprocess.run(["sudo", "-n", str(helper), "reset"], capture_output=True)
+        if reset.returncode != 0:                      # keep the helper: it is the user's way back to stock clocks
+            done.append("clock reset FAILED; the clock helper was kept (run `sudo nvidia-smi -rgc`, then uninstall again)")
+        else:
+            r = subprocess.run(["sudo", "rm", "-f", *CLOCK_FILES])        # may ask for a password: the only root step
+            subprocess.run(["sudo", "rmdir", "/etc/lscli"], capture_output=True)
+            done.append("removed the clock helper" if r.returncode == 0 else "could NOT remove the clock helper (sudo)")
+    for eid, rec in list(envs.load(paths).items()):
+        try:
+            site = Path(_py(rec["python"], "-c", _SITE))
+            (site / PTH).unlink(missing_ok=True)
+            done.append(f"removed {site / PTH}")
+        except (RuntimeError, OSError) as e:
+            done.append(f"env {eid}: could not remove its hook ({e})")
+        envs.unregister(paths, eid)
+    wrapper = Path.home() / ".local" / "bin" / "lscli"
+    try:                                               # only the wrapper install.sh writes
+        if wrapper.exists() and '/venv/bin/python" -m lscli "$@"' in wrapper.read_text(errors="replace"):
+            wrapper.unlink()
+            done.append(f"removed {wrapper}")
+    except OSError:
+        pass
+    done.append("linger was left as it is (loginctl disable-linger $USER if you enabled it for lscli)")
+    if args.purge:
+        from lscli.paths import config_path
+        why = purge_refusal(paths.root)
+        if why:
+            print(f"lscli uninstall --purge: refusing to delete {paths.root}: {why}", file=sys.stderr)
+            return EXIT_FAIL
+        shutil.rmtree(paths.root, ignore_errors=True)
+        cfg = config_path()
+        cfg.unlink(missing_ok=True)                    # the file only; its directory only when it is lscli's and empty
+        try:
+            if cfg.parent.name == "lscli":
+                cfg.parent.rmdir()
+        except OSError:
+            pass
+        done.append(f"removed {paths.root} and {cfg}")
+    else:
+        done.append(f"kept {paths.root} (lscli uninstall --purge removes it)")
+    _out(args, {"done": done}, "\n".join(done))
+    return EXIT_OK
+
+
 # ------------------------------------------------------------------------------------------------------------ main
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="lscli", description="learned-selector CLI (docs/lscli/spec.md)")
@@ -516,6 +611,11 @@ def build_parser() -> argparse.ArgumentParser:
     tn.add_argument("action", choices=("status", "start", "retrain"))
     tn.add_argument("--stages", help="retrain: comma-separated train_best stages (default: everything)")
     tn.set_defaults(fn=cmd_train)
+    sub.add_parser("doctor", help="check the GPU, systemd, the daemon, the clock helper, envs and models").set_defaults(fn=cmd_doctor)
+    un = sub.add_parser("uninstall", help="remove the unit, clock helper, env hooks and command (data kept unless --purge)")
+    un.add_argument("--purge", action="store_true", help="also delete $LSCLI_HOME and the config")
+    un.add_argument("--yes", action="store_true", help="do not ask")
+    un.set_defaults(fn=cmd_uninstall)
     k = sub.add_parser("cache", help="inspect / verify / compact / clear the winner cache")
     k.add_argument("action", choices=("ls", "verify", "compact", "clear"))
     k.add_argument("--env", help="env id or interpreter path")

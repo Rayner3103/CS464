@@ -67,7 +67,14 @@ analysis/
   zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`); `load_screen` keeps `slow` screen rows
   lt_ceiling.py / lt_clusters.py / lt_knn_scan.py / lt_knn_ab.py / lt_rank.py / lt_rank_ab.py / router.py / confirm_ab.py / joint_rank.py  the cuBLASLt k-NN, learned-ranker, router and joint-score study (router: fit + held-out score; confirm_ab: paired scoring of the router / confirmation online runs; joint_rank: the negative result) (CPU only): where the joint search's regret comes from, winner structure, tune-only leave-one-out choice of k, held-out A/B from one stage-2 session
   cross_gpu.py       cross-GPU comparison on the held-out shapes the runs share: regret vs each GPU's own screen, speed vs B3+, family ceiling, PTX mma check, paired bootstrap; CPU-only (`python -m analysis.cross_gpu --side LABEL DIR ...`, docstring has the command). Never compare a subset run to the 86-shape `REFERENCE_3080` constants in `zero_shot.py`
-tests/       pytest unit tests (200 tests; most need a CUDA GPU)
+lscli/       the learned-selector CLI and daemon (docs/lscli/spec.md is the contract, docs/lscli/plan.md the PR plan):
+  client.py      opt-in torch patch (LSCLI_PATCH=1 via lscli.pth, or lscli.enable()): dispatches cached winners, counts shapes
+  worker.py      measure / env / verify under the USER's interpreter (line protocol on a private fd)
+  daemon.py      idle-time loop: gate.py (NVML + window + power + locks), scheduler.py, jobs.py (process trees, preemption),
+                 models.py (native / zero-shot sets), propose.py (cuBLASLt ranker proposals), training.py (train_best stages)
+  cli.py         `lscli` commands; config.py, files.py, envs.py, usage.py, search_queue.py, control.py, doctor.py
+install/     install.sh (curl | bash), lscli.service (systemd --user), lscli-clock (optional root clock helper), pack_zero_shot.py
+tests/       pytest unit tests (~300 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)
@@ -234,6 +241,20 @@ Other findings to keep in mind:
   An inner pass over warps / stages of the top tile (`--order inner`, fit on tune CV, not chosen there) ties it except for fixing 381×1401×250 (graph p95 9.7% → 8.2%). It is never slower, but it is not adopted,
   because that would fit the rule to held-out data. Held-out p99 (essentially the worst shape): diverse online top-3 20.2%, knnf 40.9%, knn5 122%; a 100-config static portfolio still 18.2%. Remaining tail (+10–22%) is ranker error: 320×1×79, 5398×196×774, 4065×8842×28. Shape → config classifiers and every linear model are worse than k-NN.
   Against B3+: 1.01 under 50 µs graph; G4 still fails at ≥ 50 µs. The Triton-only selector is slower than B3+ on 35 of 86 held-out shapes (v2). Its win over knnf at equal budget (top-1, no timing) is in the tail and mean, not the median (2.4% vs 2.5%); the top-3 numbers pay ~0.4 s of compile and timing that a table lookup does not.
+
+## 6b. lscli (the selector as a service)
+
+`lscli` turns `select_kernel` into a per-user service (spec: `docs/lscli/spec.md`). Pieces an agent must not break:
+- **The daemon process never creates a CUDA context.** NVML only, LightGBM on the CPU; everything GPU runs in a job
+  (`lscli.propose`, `lscli.worker` under the user's interpreter, `train_best.sh` stages). Otherwise NVML lists the daemon
+  as a compute process and the idle gate never opens. `tests/test_lscli_daemon.py` checks the end-to-end path.
+- **Winners are timed where they run**: the worker runs under the registered env's interpreter; the daemon writes the
+  entry only after a final gate check. Entries carry `env_extra` (clock policy, model ids, `env_id`); see the
+  winner-cache tiers in `tune/winner_cache.py`.
+- **Daemon measurements are not study data**: they run at stock or helper-locked clocks with no noise study and are
+  never written into `data/<hw>/` result files or reports.
+- **Branches**: nothing is committed directly to `learned-selector-cli` (or `learned-selectors`); every change is a PR
+  from its own branch, reviewed first.
 
 ## 7. Rules for agents
 
