@@ -61,6 +61,8 @@ analysis/
   learned.py         learned selectors v0: DT, linear SVM, LightGBM, RF, logistic regression; cls and rank forms; grouped CV;
                      Ranker (saved lgbm_rank), top-k scoring (build_topk)
   alloc_variance.py  allocation-placement noise experiment
+  noise_compare.py   noise floor of one group of `tune noise` sessions vs another (locked vs unlocked clock): cross-session, within-session, single-measurement
+                     and short-online-timing error, shape-bootstrap intervals, margin read-off; CPU only (`python -m analysis.noise_compare --group NAME=s1,s2,...`)
   plots.py           figures + reports/results_overview.md for the current state (baselines, noise, selectors, kernel-selection stats); CPU-only, reads existing results (`python -m analysis.plots`)
   zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`); `load_screen` keeps `slow` screen rows
   lt_ceiling.py / lt_clusters.py / lt_knn_scan.py / lt_knn_ab.py / lt_rank.py / lt_rank_ab.py / router.py / confirm_ab.py / joint_rank.py  the cuBLASLt k-NN, learned-ranker, router and joint-score study (router: fit + held-out score; confirm_ab: paired scoring of the router / confirmation online runs; joint_rank: the negative result) (CPU only): where the joint search's regret comes from, winner structure, tune-only leave-one-out choice of k, held-out A/B from one stage-2 session
@@ -211,7 +213,7 @@ The screen biases the oracle low (winner's curse); stage 2 under-covers it. Repo
 
 | Gate (plan §8.2) | Status |
 |---|---|
-| G1 measurement validity | **Pass** for kernels ≥ 50 µs (cross-session p95 ≈ 1.75%; tie margin **ε = 2%**; p99 of the two-session cold / hot difference 2.1% / 2.2% over 44 / 43 kernels, i.e. essentially the worst kernel sits at the margin, `reports/results_overview.md`). Under 50 µs use ε = 5% per-launch, or rank with graph-amortized timing (no cross-session noise study yet) |
+| G1 measurement validity | **Pass** for kernels ≥ 50 µs (cross-session p95 ≈ 1.75%; tie margin **ε = 2%**; p99 of the two-session cold / hot difference 2.1% / 2.2% over 44 / 43 kernels, i.e. essentially the worst kernel sits at the margin, `reports/results_overview.md`). Under 50 µs use ε = 5% per-launch, or rank with graph-amortized timing (no cross-session noise study yet). **Unlocked clock** (3 sessions, 2026-11-13): ε = 2% / 5% still hold across sessions (p95 1.90%), but one measurement is ~2x noisier (p95 1.8-2.0% vs 1.0-1.1%) and the short online timing needs ~4% (locked 3%); `docs/methodology.md` (unlocked section), `reports/noise_compare_unlocked.md` |
 | G2 family ≥ 90% of B3+ | **Pass**: median 98.8% over 160 shapes (aligned 98.8%, unaligned 90.4%) |
 | G3 selection value | **Pass**: B6 `bm32_bn32_bk32_w4_s5_g1_sk1` median regret 68–74%, p90 ≈ 275–307%, p99 ≈ 1000% (477 tune shapes); holds out of sample (median 48%, p99 973%) |
 | G4 differentiation vs B3+ | **Fails ≥ 50 µs** (0 of 86 shapes > 5% faster). Narrow pass for tiny GEMMs (B3+ < ~5 µs: 12/20 shapes, 0.23–0.59 µs saved) |
@@ -273,7 +275,7 @@ Other findings to keep in mind:
   with a log in `data/<hw>/logs/`.
 - Commit harness changes before measuring when possible. Rows record `harness_dirty`, and reports call it out when true.
 - Kernels under 50 µs: rank them with `--cache-modes hot --graph-batch 50`. Per-launch times sit on a ~1.02 µs grid.
-- Treat differences within ε (2% ≥ 50 µs, 5% below) as ties. Report distributions (median, p10/p90/p95/p99, worst; at n ≈ 60-90 shapes p99 is essentially the worst shape, so name it) and regimes, never only means.
+- Treat differences within ε (2% ≥ 50 µs, 5% below) as ties. With the clock unlocked the same ε holds between sessions, but single rows differ by up to ~2% at p95 and two short online timings by ~4% (`docs/methodology.md`, unlocked section). Report distributions (median, p10/p90/p95/p99, worst; at n ≈ 60-90 shapes p99 is essentially the worst shape, so name it) and regimes, never only means.
 - Compare against **B3+**, not B1/B2, before claiming any win over cuBLAS.
 - Keep held-out shapes out of every fitting step (portfolio, selector weights, rule tuning). Say so explicitly when a choice was informed by held-out misses.
 
@@ -333,7 +335,7 @@ Full training of the shipped selector on another GPU (rank v1 + v2, cuBLASLt ran
 1. **Learned selector v0: done** (lgbm_rank, see §6 and `reports/week1.md` 2026-10-19 late). Next: lambdarank / regression blends, a larger candidate pool.
 2. **Top-k + short online search: done** (`tune online --order diverse`, top-3; inner warps / stages pass tried, a tie). Next: better ranking for N = 1 / tiny-K shapes and near-optimal tiles ranked low.
 3. **Joint {Triton ∪ cuBLASLt} selection: done without a router, with k-NN cuBLASLt proposals** (2026-11-04; learned cuBLASLt ranker and the cost-only router done; one additive score over both families tried and not adopted. Next: the 3090 screen, a second, wider order-bias fix (interleaved timing); the shipped selector was checked on fresh shapes 2026-11-05) (`--lt-n 16`, see §6). Left: a cost-only family router (skip Triton compiles when cuBLASLt is clearly ahead), the joint selector in the zero-shot runbook, and faster v2 ranking (+40 ms). The cache that moves a shape from k = 3 to k = 5 is the winner cache (§5).
-4. Noise study for graph-amortized mode (second session plus a reboot) before relying on tiny-GEMM wins.
+4. Noise study for graph-amortized mode (second session plus a reboot) before relying on tiny-GEMM wins. The 3080's unlocked floor is measured (2026-11-13, 3 sessions, `analysis/noise_compare.py`; not straight after a cold boot, desktop idle only).
 5. Kernel-level fixes if differentiation matters: an aligned-copy or padded path for unaligned strides, and a fused or atomic split-K reduction.
 6. Not built yet: B4 (CUTLASS), per-candidate subprocess isolation with hang timeouts (plan 7.2), adaptive sampling.
 
@@ -360,6 +362,6 @@ Full training of the shipped selector on another GPU (rank v1 + v2, cuBLASLt ran
 **Winner cache** (`tune/winner_cache.py`):
 - Entries are per machine and per environment (schema 2: GPU id, Triton, torch, CUDA runtime, cuBLASLt version, driver, VBIOS, kernel source hash, declared clock lock, optional model ids). A soft-stale entry is a miss unless `serve_stale=True`; a hard-stale one (other GPU; Triton winner of other kernel source) is never served. Schema 1 lines (4-field environment) read as soft-stale, so the first lookup after upgrading re-searches once; so do lines the default cache wrote before it declared model ids. A field the current process does not declare (no `TUNE_CLOCK_LOCK`, a `WinnerCache` built without model ids) is not compared: such a process serves winners timed under any clock policy as current. Nothing is shared across GPUs.
 - `compact()` drops a line that a later line of exactly the same environment replaced, and a superseded stale line only inside the compactor's own `env_id` scope (`environment(env_id=...)`; lscli sets one per registered interpreter). Without an `env_id` several interpreters may share the file, so nothing else is dropped: the file keeps one line per shape per environment it has seen (delete it to start over).
-- Nothing expires by age: a winner is reused until the environment changes, a wider search is requested for that shape, or the file is deleted. A stored winner is the fastest of one short online timing (10 cold samples, one placement, no tie margin), so near-ties are as arbitrary as in `choose`.
+- Nothing expires by age: a winner is reused until the environment changes, a wider search is requested for that shape, or the file is deleted. A stored winner is the fastest of one short online timing (10 cold samples, one placement, no tie margin), so near-ties (within ~4% at stock clocks, ~3% locked: the short timing's p95 noise, `reports/week1.md` 2026-11-13) are as arbitrary as in `choose`.
 - A cuBLASLt winner is a heuristic key; if the library no longer returns it the entry is a miss and the shape is searched again.
 - A cache hit returns no `candidates` and `rank_s = 0`; callers that read the candidate list (experiments) must pass `cache=None`.
