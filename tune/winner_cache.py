@@ -288,6 +288,12 @@ class WinnerCache:
                 return self._out(r)
         return None
 
+    def entries(self, allow_stale: bool = True) -> list[dict]:
+        """Every entry `get` could return for some width: the current one of each shape and, with allow_stale, the
+        soft-stale one (both, when a shape has both)."""
+        tiers = ("current", "soft") if allow_stale else ("current",)
+        return [self._out(v[t]) for v in self._rows.values() for t in tiers if t in v]
+
     def stale_entries(self) -> list[dict]:
         """The soft-stale entries `get(allow_stale=True)` can still return: those of shapes with no current entry, and
         those whose search was wider than the shape's current entry (served for the wider request). What an idle-time
@@ -329,8 +335,10 @@ class WinnerCache:
                 self._stamp = self._stamp_of(os.fstat(f.fileno()))
 
     def put(self, M: int, N: int, K: int, dtype: str, *, k: int, lt_n: int, choice: dict, candidates: list[dict] | None = None,
-            order: str | None = None, ranker: str | None = None, lt_knn: int = 0, lt_rank: int = 0) -> dict | None:
+            order: str | None = None, ranker: str | None = None, lt_knn: int = 0, lt_rank: int = 0,
+            extra: dict | None = None) -> dict | None:
         """Store a search result's winner in the current environment. Searches that found no valid kernel are not stored.
+        `extra` adds caller fields to the line (lscli: `torch_us`); they cannot overwrite the entry's own fields.
         Returns the entry."""
         if not choice or choice.get("key") is None:
             return None
@@ -341,6 +349,7 @@ class WinnerCache:
                "choice": {x: choice.get(x) for x in ("key", "family", "mode", "rank", "compile_s", "time_s")},
                "winner_us": win.get("graph_us") if choice.get("mode") == "graph" else win.get("cold_us"),
                "timestamp": time.time()}
+        row = {**{k: v for k, v in (extra or {}).items() if k not in _RESERVED}, **row}
         self._append(row)
         self._rows.setdefault(self._key(M, N, K, dtype), {})["current"] = {**row, "_stale": []}
         return row
