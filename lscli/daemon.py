@@ -235,6 +235,14 @@ class Daemon:
         tr = training.Training(self.paths, self.hw_id)
         ctl = control.read_control(self.paths)
         req = ctl.get("retrain")
+        cont = ctl.get("continue")
+        if cont:                                            # `lscli train start`: consumed once, like a retrain request
+            ctl = {k: v for k, v in ctl.items() if k != "continue"}
+            control.write_control(self.paths, ctl)
+            t = cont.get("t") if isinstance(cont, dict) else None
+            if not req and tr.continue_failed(t):          # a retrain request starts over instead
+                self.log.info("continuing failed training run %s at stage %s (lscli train start)", tr.state["run"],
+                              tr.next_stage())
         if req:
             control.write_control(self.paths, {k: v for k, v in ctl.items() if k != "retrain"})   # consumed once
             self._refresh_daemon_env()
@@ -269,8 +277,7 @@ class Daemon:
                 self.load_models()
             except Exception as e:                          # never let a bad run break the loop
                 self.log.error("activating run %s failed: %s: %s", tr.state["run"], type(e).__name__, e)
-                tr.state["status"] = "failed"
-                tr.save()
+                tr.mark_failed()
             self._clear_train_now()
             return None
         return stage

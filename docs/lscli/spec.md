@@ -326,14 +326,19 @@ program first runs them.
     venv is seen without a restart.
   * **Recorded training environment.** The models' `trained_env` is the environment the stages ran under.
   * **Stage failures.** A stage that fails twice stops the training (status `failed`, no automatic restart) until
-    `lscli train retrain`. A stage that exits non-zero within a minute while the GPU has become busy counts as a
+    `lscli train start` (continues the same run once the cause is fixed, keeping every finished stage) or
+    `lscli train retrain` (starts over). A stage that exits non-zero within a minute while the GPU has become busy counts as a
     preemption, not a failure: train_best's own idle check lost a race with a user's process.
   * **Locks.** The daemon's own `train_best.sh` run holds `src/pipeline/.lock`, so the gate ignores that lock when the
     holder is in the running job's tree.
   * **Stage output.** A stage's output goes to its job log (`logs/jobs/*-train-<stage>.log`), never to a pipe.
   * **`lscli train retrain --stages`.** The stages run in train_best order, and only on top of a finished training.
     Each request is consumed once.
-  * **`lscli train start`.** The window is ignored until the current training finishes or fails.
+  * **`lscli train start`.** The window is ignored until the current training finishes or fails. On a training that
+    stopped on a failed stage, it also continues that run: same run directory, from the first unstamped stage, with
+    every finished stage kept and the failure counts cleared. The request is consumed once and only un-fails a run that
+    had already failed when it was made, so a `train start` issued earlier never restarts a broken stage in a loop. A
+    pending `lscli train retrain` wins (it starts over).
 
 ### 4.6 Clock
 
@@ -456,7 +461,7 @@ overhead.
 | `prewarm` | `lscli prewarm (--shapes FILE \| MxNxK ...) [--dtype fp16] [--env ID]` | Queue shapes (`manual`); FILE is a shapes JSON (`suites/` format) |
 | `profile` | `lscli profile [--top N] [--layout NN\|NT]` | The usage record, hottest first |
 | `cache` | `lscli cache ls [--stale]` / `verify` / `compact` / `clear [--yes]` | List entries with tiers; run the correctness check on every entry served here; compact; delete the file |
-| `train` | `lscli train status` / `start` / `retrain [--stages S,...]` | Training progress; allow training now (window ignored, gate still required); force stages |
+| `train` | `lscli train status` / `start` / `retrain [--stages S,...]` | Training progress; allow training now (window ignored, gate still required; continues a failed run); force stages |
 | `config` | `lscli config [KEY [VALUE]]` | Show / get / set a config key (`idle.window`, ...) and tell the daemon to reload |
 | `logs` | `lscli logs [-f] [--job ID]` | Daemon or job log |
 | `doctor` | `lscli doctor` | Checks: GPU and driver, systemd user session and linger, unit state, clock helper, versions of each registered env (and gcc + `Python.h`, which Triton's launcher needs), file permissions, models present, processes holding a CUDA context (they keep the gate closed) |
