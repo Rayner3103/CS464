@@ -161,19 +161,27 @@ def measure_request(req: dict, proto: _Proto | None = None) -> dict:
         return {"skipped": f"oom_torch: {str(e).splitlines()[0][:150]}", "choice": None, "candidates": [],
                 "written": False, "env": env}
     choice = choose(r["candidates"], k)
+    timed = {c["config_key"] for c in r["candidates"]}
+    n_rank = sum(1 for b in lt if b[0] == "cublaslt_rank" and b[1] in timed)
+    n_knn = sum(1 for b in lt if b[0] == "cublaslt_knn" and b[1] in timed)
+    put = {"M": M, "N": N, "K": K, "dtype": req.get("dtype", "fp16"), "k": k, "lt_n": lt_n,
+           "lt_rank": min(int(req.get("lt_rank", n_rank)), n_rank), "lt_knn": min(int(req.get("lt_knn", n_knn)), n_knn),
+           "choice": choice, "candidates": r["candidates"], "order": req.get("order"), "ranker": req.get("ranker"),
+           "extra": {"torch_us": t_us, "lscli": True}}
     written = False
-    if req.get("cache") and choice.get("key") is not None:
-        from tune.winner_cache import WinnerCache
-        timed = {c["config_key"] for c in r["candidates"]}
-        n_rank = sum(1 for b in lt if b[0] == "cublaslt_rank" and b[1] in timed)
-        n_knn = sum(1 for b in lt if b[0] == "cublaslt_knn" and b[1] in timed)
-        WinnerCache(req["cache"], env=env).put(
-            M, N, K, req.get("dtype", "fp16"), k=k, lt_n=lt_n, lt_rank=min(int(req.get("lt_rank", n_rank)), n_rank),
-            lt_knn=min(int(req.get("lt_knn", n_knn)), n_knn), choice=choice, candidates=r["candidates"],
-            order=req.get("order"), ranker=req.get("ranker"), extra={"torch_us": t_us, "lscli": True})
+    if req.get("cache") and choice.get("key") is not None:   # standalone use; the daemon writes it itself (spec 4.4)
+        write_entry(req["cache"], env, put)
         written = True
     return {"choice": choice, "candidates": r["candidates"], "router": r.get("router"), "torch_us": t_us,
-            "written": written, "env": env, "pool": [b[1] for b in triton + lt]}
+            "written": written, "env": env, "pool": [b[1] for b in triton + lt], "put": put}
+
+
+def write_entry(cache: str, env: dict, put: dict) -> dict | None:
+    """Store a measured winner (the `put` document of a measure result) with the environment it was timed in."""
+    from tune.winner_cache import WinnerCache
+    put = dict(put)
+    M, N, K, dtype = put.pop("M"), put.pop("N"), put.pop("K"), put.pop("dtype")
+    return WinnerCache(cache, env=env).put(M, N, K, dtype, **put)
 
 
 def verify(cache: str, env_extra: dict | None = None) -> dict:
