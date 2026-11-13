@@ -10,7 +10,7 @@ this file is the route to it. Decisions were taken in the 2026-11-08 design inte
 | Name | `lscli` (learned-selector CLI); unit `lscli.service`; home `~/.local/share/lscli` |
 | What is learned | This GPU's own models (rank v1/v2, cuBLASLt ranker, router) via `pipeline/train_best.sh` stages in idle slices, plus a usage record of the user's shapes. The models are LightGBM, not a linear regression |
 | Shape capture | Opt-in torch patch, NN `torch.matmul` / `@` / `torch.mm` only, fp16 (bf16 dispatched but unvalidated); `F.linear` (NT) shapes are logged, never dispatched |
-| Cache miss | Fall back to torch and queue the shape; search inline only for shapes the usage record counts at ≥ 1M decayed calls. A winner is dispatched only when torch's kernel is ≥ 50 µs and the winner saves ≥ max(5 µs, 2 %) |
+| Cache miss | Fall back to torch and queue the shape; search inline only for shapes the usage record counts at ≥ 1M decayed calls. A winner is dispatched only when torch's kernel is ≥ 50 µs and the winner saves ≥ max(5 µs, 4 %) (3 % under a clock lock) |
 | Idle gate | GPU idle (no foreign compute process, low utilization) + time window + AC power |
 | Preemption | Abort, discard the unit in flight, back off, resume later from per-shape checkpoints |
 | Clock | Optional sudoers helper (MHz chosen at install) locks the SM clock only around idle jobs; otherwise stock clocks, recorded |
@@ -70,8 +70,8 @@ rebased.
   the gate's whole purpose), it kills sweep compile workers by PID, and it never runs two GPU jobs at once (`gpu.lock`
   for its own jobs; `train_best.sh` takes `src/pipeline/.lock` itself, and a lock held by a manual run keeps the gate
   closed).
-* **Daemon measurements are not study data.** They run at stock or helper-locked clocks with no noise study, and they
-  are never written into `data/<hw>/` result files or reports.
+* **Daemon measurements are not study data.** They run at stock or helper-locked clocks (the stock-clock noise floor
+  is measured on the 3080 only, `reports/week1.md` 2026-11-13), and they are never written into `data/<hw>/` result files or reports.
 * **Version skew.** Bundle cubins only serve a user env with Triton 3.7.1 on sm_86. In other envs the worker compiles
   in idle time, and the compiled kernels land in the user's own Triton cache.
 * **Packaging.** The client installs the existing top-level `tune`, `kernels` and `baselines` packages plus `lscli`. The
@@ -83,4 +83,5 @@ rebased.
 * NT / TN layouts (`nn.Linear`): the cuBLASLt transpose flag, an NT axis in the Triton training suites, layout as a ranker feature.
 * Multi-GPU (per-device models, caches, gates) and a shared multi-user service.
 * Moving the vendored packages under an `lscli._vendor` namespace to remove the name-conflict limitation.
-* A noise study for daemon conditions, to replace the borrowed 2 % / 5 % tie margins.
+* Noise floor for daemon conditions: done for stock clocks on the 3080, desktop idle (2026-11-13; the dispatch margin is
+  4 % unlocked / 3 % locked). Open: other GPUs, measuring while the desktop is in use, graph timing under 50 µs.
