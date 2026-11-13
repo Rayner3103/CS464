@@ -10,6 +10,7 @@
   drift      thermal drift run -> data/<hw_id>/drift-*.csv
   analyze    build plots + markdown summaries into reports/
   portfolio  config-space reduction from the sweep screen (B6 over the full space, G3, G5) -> reports/sweep_portfolio.md
+  bundle     build / status / verify / pack / unpack the prebuilt Triton kernel bundle (kernels/bundle/, see kernels/bundle.py)
 """
 from __future__ import annotations
 
@@ -116,7 +117,11 @@ def cmd_sweep(args):
     from tune.sweep import HELDOUT_SPLITS, coarse_subset, run_sweep
     splits = HELDOUT_SPLITS if args.split == "heldout" else ("tune",)
     screen_dir = args.screen_dir or ("sweep_screen_heldout" if args.split == "heldout" else "sweep_screen")
-    shapes = coarse_subset(_shapes(args.suite), args.per_suite, args.max_gflop, splits)
+    if args.shapes_file:                                   # an explicit shape list (e.g. suites/fresh/fresh465.json): screen all of it
+        shapes = _shapes(args.suite, args.shapes_file)
+        screen_dir = args.screen_dir or "sweep_screen_custom"
+    else:
+        shapes = coarse_subset(_shapes(args.suite), args.per_suite, args.max_gflop, splits)
     sweep_dir = args.out / screen_dir
     sweep_dir.mkdir(parents=True, exist_ok=True)
     subset = sweep_dir / "subset.json"
@@ -159,6 +164,73 @@ def cmd_selectors(args):
     out, s = build(args.data, args.report, results=args.results, graph_results=args.graph_results)
     print(f"{s['n_heldout_shapes']} held-out shapes; held-out screen p95 regret: "
           + ", ".join(f"{n} {100 * v['all']['p95']:.1f}%" for n, v in s["screen"].items()) + f" -> {out}")
+
+
+def cmd_learned(args):
+    from analysis.learned import build
+    out, s = build(args.data, args.report, results=args.results, graph_results=args.graph_results)
+    print(f"{s['n_heldout_shapes']} held-out shapes; held-out screen median / p95 regret: "
+          + ", ".join(f"{n} {100 * v['all']['p50']:.1f}% / {100 * v['all']['p95']:.1f}%" for n, v in s["screen"].items())
+          + f" -> {out}")
+
+
+def cmd_topk(args):
+    from analysis.learned import build_topk
+    out, s = build_topk(args.data, args.report, results=args.results, graph_results=args.graph_results,
+                        online=args.online, online_diverse=args.online_diverse, online_inner=args.online_inner)
+    print(f"diverse rule {s['diverse_rule']}; held-out screen best-of-k median / p95: " + "; ".join(
+        f"{o} " + ", ".join(f"k={k} {100 * v['p50']:.1f}% / {100 * v['p95']:.1f}%" for k, v in sc.items())
+        for o, sc in s["screen_best_of_k"].items()) + f" -> {out}")
+
+
+def cmd_ranker_v2(args):
+    from analysis.learned import train_ranker_v2
+    rk, info = train_ranker_v2(args.data, tuple(args.extra_screens), args.stem)
+    r = info["rules"][0]
+    print(f"saved {args.data / args.stem}.txt/.json: {len(rk.pool_keys)} pool configs, {rk.meta['n_tune_shapes']} tune shapes; "
+          f"diverse rule {r['rule']} (tune OOF best-of-3 mean {100 * r['k3']['mean']:.2f}%, p95 {100 * r['k3']['p95']:.1f}%)")
+
+
+def cmd_online(args):
+    if args.fresh_cache:
+        # Before any Triton compile in this process: compile cost must be a first use, not a cache hit.
+        cache = args.out / "online_triton_cache" / time.strftime("%Y%m%d-%H%M%S")
+        cache.mkdir(parents=True, exist_ok=True)
+        os.environ["TRITON_CACHE_DIR"] = str(cache)
+    from tune.online import run
+    out_name = args.out_name or ("online_lgbm_rank.jsonl" if args.order == "plain" else f"online_lgbm_rank_{args.order}.jsonl")
+    if args.lt_n and not args.out_name:
+        out_name = out_name.replace("online_lgbm_rank", "online_joint")
+    from tune.online import KPolicy
+    policy = KPolicy(args.k, args.k_frequent, args.frequent_calls) if args.k_frequent else None
+    path = run(_shapes(args.suite, args.shapes_file), Path(args.ranker or args.out / "lgbm_rank"), args.out, k=args.k,
+               dtype=args.dtype, order=args.order, out_name=out_name, session_id=args.session, lt_n=args.lt_n, lt_knn=args.lt_knn, lt_rank=args.lt_rank, use_router=args.router, router_threshold=args.router_threshold, confirm=args.confirm, policy=policy)
+    print(f"online -> {path}")
+
+
+def cmd_bundle(args):
+    """`tune bundle build|status|verify`: the prebuilt kernel bundle (kernels/bundle.py). build and verify need the GPU idle."""
+    from kernels import bundle as B
+    if args.bundle_cmd == "status":
+        print(json.dumps(B.status(), indent=1))
+        return 0
+    if args.bundle_cmd == "pack":
+        B.pack(args.bundle_dir, args.archive)
+        return 0
+    if args.bundle_cmd == "unpack":
+        B.unpack(args.archive or B.archive_for(args.bundle_dir), args.bundle_dir)
+        return 0
+    from kernels import bundle_build as BB
+    bundle_dir = args.bundle_dir or B.bundle_root()
+    pools = [Path(p) for p in (args.pool or [args.data / "lgbm_rank", args.data / "lgbm_rank_v2"])]
+    if args.bundle_cmd == "build":
+        BB.build(pools, bundle_dir, args.build_cache or args.data / "bundle_build_cache", dtypes=tuple(args.dtypes.split(",")),
+                 workers=args.workers, limit=args.limit)
+        return 0
+    shapes = _shapes("S1,S2,S3,S4,S5,S6,S7") + _shapes("edge")
+    res = BB.verify_bundle(bundle_dir, shapes, BB.pool_configs(pools), per_shape=args.per_shape, smoke=args.smoke)
+    print(json.dumps(res, indent=1))
+    return 0 if res["ok"] else 1
 
 
 def cmd_analyze(args):
@@ -207,13 +279,15 @@ def main(argv=None):
     p.add_argument("--suite", default="all")
     p.add_argument("--per-suite", type=int, default=24, help="shapes per suite in the coarse subset")
     p.add_argument("--max-gflop", type=float, default=1200.0, help="skip shapes above this many GFLOP")
-    p.add_argument("--workers", type=int, default=10, help="parallel compile processes")
+    p.add_argument("--workers", type=int, default=0, help="parallel compile processes; 0 = auto (up to 10). Either way capped by free host RAM and VRAM (~1 GiB and ~450 MiB per worker), see tune/sweep.py")
     p.add_argument("--session", default=None)
     p.add_argument("--list-only", action="store_true", help="write the subset and stop")
     p.add_argument("--split", choices=["tune", "heldout"], default="tune",
                    help="heldout = heldout_region + heldout_random shapes (G5 out-of-sample check)")
     p.add_argument("--screen-dir", default=None,
                    help="directory under --out; default sweep_screen (tune) or sweep_screen_heldout (heldout)")
+    p.add_argument("--shapes-file", default=None, help="JSON with a 'shapes' list: screen exactly these shapes (overrides --suite / --split / "
+                                                       "--per-suite; default --screen-dir sweep_screen_custom)")
     p = add("noise", cmd_noise)
     p.add_argument("--shapes", default="suites/v1/noise.json")
     p.add_argument("--backends", default="torch,triton:bm128_bn128_bk32_w4_s4_g8_sk1")
@@ -251,10 +325,94 @@ def main(argv=None):
     p.add_argument("--graph-results", default="results_lock1755_selectors3_graph.jsonl",
                    help="graph-amortized stage-2 file under --data (< 50 us shapes)")
 
+    p = sub.add_parser("learned", help="learned selectors v0 (decision tree, linear SVM, LightGBM, random forest, logistic "
+                                       "regression; cls and rank forms) on held-out shapes; writes data/<hw>/learned_picks.json")
+    p.set_defaults(fn=cmd_learned)
+    p.add_argument("--data", type=Path, default=None)
+    p.add_argument("--report", type=Path, default=Path("reports"))
+    p.add_argument("--results", default="results_lock1755_learned.jsonl", help="cold stage-2 file under --data")
+    p.add_argument("--graph-results", default="results_lock1755_learned_graph.jsonl",
+                   help="graph-amortized stage-2 file under --data (< 50 us shapes)")
+
+    p = sub.add_parser("topk", help="refit lgbm_rank on all tune shapes, save it (data/<hw>/lgbm_rank.*), write its top-5 "
+                                    "picks per held-out shape (learned_topk_picks.json) and score best-of-k / online search")
+    p.set_defaults(fn=cmd_topk)
+    p.add_argument("--data", type=Path, default=None)
+    p.add_argument("--report", type=Path, default=Path("reports"))
+    p.add_argument("--results", default="results_lock1755_topk.jsonl", help="cold stage-2 file under --data")
+    p.add_argument("--graph-results", default="results_lock1755_topk_graph.jsonl", help="graph stage-2 file (< 50 us)")
+    p.add_argument("--online", default="online_lgbm_rank.jsonl", help="`tune online` output under --data")
+    p.add_argument("--online-diverse", default="online_lgbm_rank_diverse.jsonl", help="`tune online --order diverse` output")
+    p.add_argument("--online-inner", default="online_lgbm_rank_inner.jsonl", help="`tune online --order inner` output")
+    p = add("online", cmd_online, help="top-k + short online search with the saved learned ranker")
+    p.add_argument("--suite", default="S1,S2")
+    p.add_argument("--shapes-file", default=None)
+    p.add_argument("--ranker", default=None, help="model stem; default data/<hw>/lgbm_rank")
+    p.add_argument("--k", type=int, default=5, help="candidates compiled and timed per shape")
+    p.add_argument("--dtype", default="fp16")
+    p.add_argument("--session", default=None)
+    p.add_argument("--order", choices=["plain", "diverse", "inner"], default="plain",
+                   help="top-k order: score order, the ranker's CV-chosen diversification rule, or the diagnostic "
+                        "rule that also varies warps / stages of the top tile")
+    p.add_argument("--k-frequent", type=int, default=0,
+                   help="call-count-aware k: shapes in --shapes-file with `calls` >= --frequent-calls (or `frequent: true`) "
+                        "get this many candidates, the rest --k (e.g. --k 3 --k-frequent 5); 0 = same k for every shape")
+    p.add_argument("--frequent-calls", type=int, default=1_000_000,
+                   help="launches at which a shape counts as frequently called (default: the held-out 3 -> 5 break-even)")
+    p.add_argument("--lt-n", type=int, default=0,
+                   help="also time cuBLASLt's heuristic top N in the same pool (joint selection); default 0 = Triton only")
+    p.add_argument("--lt-knn", type=int, default=0,
+                   help="with --lt-n: also time the cuBLASLt configs the deep searches of the N nearest tune shapes found "
+                        "(baselines/cublaslt_knn.py; top 2 each); default 0 = off")
+    p.add_argument("--lt-rank", type=int, default=0,
+                   help="with --lt-n: also time the M configs a learned cuBLASLt ranker (data/<hw>/lt_rank, baselines/cublaslt_rank.py) "
+                        "predicts fastest among all valid configs; default 0 = off")
+    p.add_argument("--router", action="store_true",
+                   help="with --lt-n: time the cuBLASLt candidates first and skip the Triton half when the family router "
+                        "(tune/router.py) says Triton cannot win; recorded per shape in `router`")
+    p.add_argument("--router-threshold", type=float, default=None,
+                   help="override the router's skip threshold (0 = cuBLASLt first, never skip: the ordering control)")
+    p.add_argument("--confirm", type=int, default=0,
+                   help="re-time the N fastest candidates in reverse order after the pass and rank them by the mean of both "
+                        "timings (cancels the timing-order bias); default 0 = off")
+    p.add_argument("--out-name", default=None, help="default online_lgbm_rank[_diverse].jsonl (online_joint_* with --lt-n)")
+    p.add_argument("--fresh-cache", action="store_true", help="compile into an empty TRITON_CACHE_DIR under --out")
+
+    p = sub.add_parser("ranker-v2", help="fit rank v2 (analytic features, near-top weights, extra tune screens) on all tune "
+                                         "shapes and save data/<hw>/lgbm_rank_v2.*; CPU only, reads no held-out shape")
+    p.set_defaults(fn=cmd_ranker_v2)
+    p.add_argument("--data", type=Path, default=None)
+    p.add_argument("--extra-screens", nargs="*", default=["sweep_screen_tail"], help="extra tune screen dirs under --data")
+    p.add_argument("--stem", default="lgbm_rank_v2")
+
+    p = sub.add_parser("bundle", help="prebuilt Triton kernel bundle: build (compile every kernel the rankers can pick), status, "
+                                      "verify (zero-compile coverage gate); build and verify need an idle GPU")
+    p.set_defaults(fn=cmd_bundle)
+    p.add_argument("--data", type=Path, default=None)
+    bsub = p.add_subparsers(dest="bundle_cmd", required=True)
+    for name in ("build", "status", "verify", "pack", "unpack"):
+        q = bsub.add_parser(name)
+        if name == "status":
+            continue
+        if name in ("pack", "unpack"):
+            q.add_argument("--bundle-dir", type=Path, default=None, help="default: kernels/bundle (or $TUNE_KERNEL_BUNDLE_DIR)")
+            q.add_argument("--archive", type=Path, default=None, help="default: <bundle-dir>.tar.xz (kernels/bundle.tar.xz)")
+            continue
+        q.add_argument("--bundle-dir", type=Path, default=None, help="default: kernels/bundle (or $TUNE_KERNEL_BUNDLE_DIR)")
+        q.add_argument("--pool", nargs="*", default=None, help="ranker stems whose pools to cover; default data/<hw>/lgbm_rank{,_v2}")
+        if name == "build":
+            q.add_argument("--dtypes", default="fp16", help="comma-separated: fp16 (default), bf16")
+            q.add_argument("--workers", type=int, default=0, help="0 = auto (capped by free host RAM and VRAM)")
+            q.add_argument("--limit", type=int, default=0, help="build only the first N configs (smoke test; recorded in the manifest)")
+            q.add_argument("--build-cache", type=Path, default=None, help="scratch Triton cache (resumable); default data/<hw>/bundle_build_cache")
+        else:
+            q.add_argument("--per-shape", type=int, default=40, help="random runnable pool configs warmed per shape (0 = all)")
+            q.add_argument("--smoke", type=int, default=6, help="kernels launched for real and checked against torch.matmul")
+
     args = ap.parse_args(argv)
     if args.clock_lock is not None:
         os.environ["TUNE_CLOCK_LOCK"] = args.clock_lock
-    if args.cmd in ("analyze", "portfolio", "selectors"):
+    if args.cmd in ("analyze", "portfolio", "selectors", "learned", "topk", "ranker-v2", "bundle"):
         args.data = args.data or default_data_dir()
     else:
         args.out = args.out or default_data_dir()

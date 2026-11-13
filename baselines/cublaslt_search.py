@@ -185,7 +185,8 @@ def _screen_time_us(lib, handle, problem, res, a, b, c, ws, reps: int = 3) -> fl
     return s.elapsed_time(e) * 1e3 / reps
 
 
-def search(M: int, N: int, K: int, dtype: str = "fp16", budget_s: float = 20.0, top_k: int = 8, seed: int = 0) -> dict:
+def search(M: int, N: int, K: int, dtype: str = "fp16", budget_s: float = 20.0, top_k: int = 8, seed: int = 0,
+           keep_all: bool = False) -> dict:
     tdtype = DTYPES[dtype]
     ctype = _CUDA_DTYPE[tdtype]
     problem = _Problem(M, N, K, tdtype)
@@ -233,7 +234,7 @@ def search(M: int, N: int, K: int, dtype: str = "fp16", budget_s: float = 20.0, 
             "screened_all": len(screened) + failed >= len(order), "enumerate_s": round(t_enum, 3),
             "screen_s": round(time.perf_counter() - t_screen0, 3),
             "best_seed_us": min((s["us"] for s in screened if s["seed"]), default=None),
-            "top": top}
+            "top": top, **({"screened": screened} if keep_all else {})}
 
 
 def cache_path(cache_dir: Path, M: int, N: int, K: int, dtype: str) -> Path:
@@ -277,8 +278,11 @@ def main():
     ap.add_argument("--budget-s", type=float, default=20.0)
     ap.add_argument("--top-k", type=int, default=8)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--keep-all", action="store_true",
+                    help="also write every screened config's time (`screened`), not only the top-k: the training set of "
+                         "a learned cuBLASLt ranker (baselines/cublaslt_screen.py)")
     a = ap.parse_args()
-    d = search(a.M, a.N, a.K, a.dtype, a.budget_s, a.top_k)
+    d = search(a.M, a.N, a.K, a.dtype, a.budget_s, a.top_k, keep_all=a.keep_all)
     Path(a.out).write_text(json.dumps(d, indent=1))
 
 

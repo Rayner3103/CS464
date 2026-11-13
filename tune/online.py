@@ -1,0 +1,529 @@
+"""Top-k + short online search (AGENTS.md next step 2): what the learned ranker would do at a shape's first use.
+
+Per shape: the saved lgbm_rank model (analysis.learned.Ranker, fit on the tune screen only) ranks its candidate pool;
+the top k runnable configs (plain score order; --order diverse: the CV-chosen diversification rule, which spreads
+the k picks over distinct tile x BLOCK_K x split choices; --order inner: the diagnostic rule that also spends a slot on
+the top tile's warps / stages) are compiled and validated (the correctness gate, so a broken pick is never chosen), then
+timed with a short protocol on one input placement:
+
+  * cold, per-launch: SHORT_REPS samples after a SHORT_WARMUP_MS warmup;
+  * if the fastest cold median is under SMALL_US, every valid candidate is re-timed hot, CUDA-graph amortized
+    (GRAPH_BATCH launches x GRAPH_REPS samples), and the pick uses those times: per-launch events tick in ~1 us
+    steps, which cannot separate us-scale kernels (methodology).
+
+The row stores every candidate's short times and wall-clock costs (compile + validate, timing), so the choice and
+cost for any k' <= k is recomputed offline (`choose`) without re-running. Run it with an empty Triton cache
+(TRITON_CACHE_DIR, or `tune online --fresh-cache`) so compile cost is a true first-use cost, not a cache hit
+from an earlier stage-2 session that timed the same configs. k is per shape when a KPolicy is given (`select_kernel` for one shape, `run(policy=...)` / `tune online --k 3 --k-frequent 5`
+for a file of shapes): a shape that carries `calls` (expected launches, >= policy.frequent_calls) or `frequent: true` gets
+k_frequent candidates, every other shape k. The signal is the caller's; the ranker cannot know how often a kernel runs.
+
+With lt_n > 0 (`tune online --lt-n 16`) cuBLASLt's heuristic top lt_n joins the same pool (joint selection): they need
+no compile, so they cost only validation + short timing; `choice_lt` stores the choice for every k' and lt_n' in
+{0, 1, 4, lt_n} (lt_n' = 0 is Triton only, 1 is B2 + Triton). Picks are scored against a full-protocol stage-2
+session in analysis/learned.py (`build_topk`).
+"""
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Iterable
+
+import torch
+
+from tune.correctness import placed_inputs, reference, validate
+from tune.env import provenance, write_env
+from tune.records import RecordWriter
+from tune.winner_cache import PROPOSAL_FAMILIES   # cuBLASLt candidates that are not the heuristic's
+
+# How many Triton candidates to compile and time. The ranker cannot know how often a shape will be launched, so the
+# call-count signal comes from the caller (KPolicy). k = 3 is the default (~0.5 s first use, ~0.6 s joint with cuBLASLt);
+# k = 5 (~0.8-0.9 s) pays back only for shapes launched often: on the 86 held-out shapes, 3 -> 5 saved 0.2 us/call on
+# average (10 of 86 shapes improved) for 0.3 s, a payback of ~1.4M calls overall, ~0.6M at >= 50 us and ~13M below 50 us.
+# FREQUENT_CALLS = 1M is that overall break-even rounded; it is measured on one GPU, so treat it as a tunable.
+K_DEFAULT = 3
+K_FREQUENT = 5
+FREQUENT_CALLS = 1_000_000
+
+SHORT_REPS = 10
+SHORT_WARMUP_MS = 2.0
+GRAPH_BATCH = 20
+GRAPH_REPS = 5
+SMALL_US = 50.0
+
+
+@dataclass(frozen=True)
+class KPolicy:
+    """Maps a caller-supplied launch-count signal to the number of Triton candidates to search.
+
+    k_for(calls=None, frequent=None): an explicit `frequent` flag wins; otherwise the shape is frequent when it is
+    expected to run at least `frequent_calls` times. No signal means the default k (never the larger one)."""
+    k: int = K_DEFAULT
+    k_frequent: int = K_FREQUENT
+    frequent_calls: int = FREQUENT_CALLS
+
+    def __post_init__(self):
+        if self.k < 1 or self.k_frequent < self.k or self.frequent_calls < 1:
+            raise ValueError(f"need 1 <= k <= k_frequent and frequent_calls >= 1, got {self}")
+
+    def k_for(self, calls: int | None = None, frequent: bool | None = None) -> int:
+        if calls is not None and calls < 0:
+            raise ValueError(f"calls must be >= 0, got {calls}")
+        if frequent is None:
+            frequent = calls is not None and calls >= self.frequent_calls
+        return self.k_frequent if frequent else self.k
+
+
+def shape_k(shape: dict, k: int, policy: KPolicy | None) -> int:
+    """k for one shape of a shapes file: the policy's (from the shape's `calls` / `frequent` fields) or the global k."""
+    return policy.k_for(shape.get("calls"), shape.get("frequent")) if policy else k
+
+
+ROUTER_CONFIRM = 3   # the router times cuBLASLt first; re-timing the top 3 in reverse order cancels the resulting position bias
+RANK_DEFAULT = 5   # learned cuBLASLt ranker picks per search (held-out: top-5 = top-10 = top-16 in the online choice; reports/week1.md 2026-11-04)
+KNN_DEFAULT = 8   # nearest tune shapes for the cuBLASLt proposals: chosen on a tune-only leave-one-out scan (reports/week1.md 2026-11-04)
+
+
+def short_configs():
+    from tune.timing import TimingConfig
+    cold = TimingConfig(cache_mode="cold", warmup_ms=SHORT_WARMUP_MS, min_warmup_iters=1, min_reps=SHORT_REPS,
+                        max_reps=SHORT_REPS, target_rse=1.0, max_time_s=1.0, keep_raw=False)
+    graph = TimingConfig(cache_mode="hot", warmup_ms=SHORT_WARMUP_MS, min_warmup_iters=1, min_reps=GRAPH_REPS,
+                         max_reps=GRAPH_REPS, target_rse=1.0, max_time_s=1.0, batch=GRAPH_BATCH, use_graph=True,
+                         keep_raw=False)
+    return cold, graph
+
+
+def _is_lt(x: dict) -> bool:
+    return x.get("family", "triton") != "triton"
+
+
+def _subset(cands: list[dict], k: int, lt_n: int | None) -> list[dict]:
+    """The first k Triton candidates plus the first lt_n cuBLASLt heuristic ones (all of them for None); rows written
+    before cuBLASLt candidates existed have no "family" and are all Triton, so this is cands[:k] for them. kNN proposals
+    (family "cublaslt_knn", `--lt-knn`) are not heuristic candidates: they count toward no lt_n and join only when
+    lt_n is None, so `choice_lt[j_lt<n>]` stays the heuristic-only search and `choice` is the full pool."""
+    out, n_tri, n_lt = [], 0, 0
+    for x in cands:
+        if x.get("family") in PROPOSAL_FAMILIES:
+            if lt_n is None:
+                out.append(x)
+        elif _is_lt(x):
+            n_lt += 1
+            if lt_n is None or n_lt <= lt_n:
+                out.append(x)
+        else:
+            n_tri += 1
+            if n_tri <= k:
+                out.append(x)
+    return out
+
+
+def choose(cands: list[dict], k: int, lt_n: int | None = None) -> dict:
+    """Online choice among the first k ranked Triton candidates of a row, plus its first lt_n cuBLASLt heuristic
+    candidates (None = all, 0 = Triton only): fastest valid by short graph time when the fastest short cold time is
+    < SMALL_US, else by short cold time. Cost = compile + timing wall time of those candidates. The cuBLASLt problem
+    setup (descriptor + heuristic query) is booked on its first candidate's compile_s."""
+    c = _subset(cands, k, lt_n)
+    ok = [x for x in c if x["valid"] and x.get("cold_us") is not None]
+    cost = {"compile_s": sum(x["compile_s"] for x in c), "time_s": sum(x.get("time_s", 0.0) for x in c)}
+    if not ok:
+        return {"key": None, "mode": None, **cost}
+    small = min(x["cold_us"] for x in ok) < SMALL_US and all(x.get("graph_us") is not None for x in ok)
+    best = min(ok, key=lambda x: x.get("confirm_us", x["graph_us"] if small else x["cold_us"]))
+    return {"key": best["config_key"], "rank": c.index(best), "mode": "graph" if small else "cold",
+            "family": best.get("family", "triton"), **cost}
+
+
+def all_choices(cands: list[dict], k: int, lt_n: int) -> dict:
+    """The row fields for a search of k Triton candidates (+ lt_n cuBLASLt): `choice` for every k' <= k (all cuBLASLt
+    candidates included) and, with lt_n > 0, `choice_lt` for k' x lt_n' in {0, 1, 4, lt_n}."""
+    out = {"choice": {str(j): choose(cands, j) for j in range(1, k + 1)}}
+    if lt_n:
+        out["choice_lt"] = {f"{j}_lt{n}": choose(cands, j, n) for j in range(1, k + 1) for n in sorted({0, 1, 4, lt_n}) if n <= lt_n}
+    return out
+
+
+def _inputs(M: int, N: int, K: int, dtype):
+    """One placement of the shape's inputs + the fp32 reference, or a `skipped` record when they do not fit in memory."""
+    try:
+        a, b, _ = placed_inputs(M, N, K, dtype, seed=0)
+        return a, b, reference(a, b)
+    except torch.OutOfMemoryError as e:  # the shape's tensors + fp32 reference do not fit: record it, do not kill the run
+        torch.cuda.empty_cache()
+        return {"rank_s": 0.0, "candidates": [], "skipped": f"oom_inputs: {str(e).splitlines()[0][:150]}"}
+
+
+def propose_lt(M: int, N: int, K: int, dtype=torch.float16, lt_n: int = 0, lt_knn: int = 0,
+               lt_rank: int = 0) -> tuple[list[tuple], float]:
+    """The cuBLASLt half of a search's pool, as (family, key, backend, setup_s) tuples, and the heuristic query's wall time
+    (lt_setup_s). lt_n = 0 proposes nothing. Heuristic top lt_n first, then the k-NN proposals (`baselines/cublaslt_knn.py`)
+    and the learned ranker's picks (`baselines/cublaslt_rank.py`), both minus the configs the heuristic already returned;
+    each source's setup time is booked on its first candidate (`choose` sums them). Needs the GPU (descriptors,
+    cublasLtMatmulAlgoCheck) and, for lt_rank, lightgbm."""
+    lt_backends: list[tuple] = []
+    if lt_n <= 0:
+        return lt_backends, 0.0
+    from baselines.cublaslt import candidates as lt_candidates
+    t = time.perf_counter()
+    lts = lt_candidates(M, N, K, dtype, lt_n)
+    lt_setup_s = time.perf_counter() - t
+    lt_backends += [("cublaslt", c.key, c, lt_setup_s if i == 0 else 0.0) for i, c in enumerate(lts)]
+    if lt_knn > 0:
+        from baselines.cublaslt_knn import candidates as knn_candidates, cfg_tuple
+        t = time.perf_counter()
+        known = {cfg_tuple(c.cfg) for c in lts}
+        knn = knn_candidates(M, N, K, dtype, lt_knn, problem=lts[0].problem if lts else None, skip=known)
+        knn_setup_s = time.perf_counter() - t
+        lt_backends += [("cublaslt_knn", c.key, c, knn_setup_s if i == 0 else 0.0) for i, c in enumerate(knn)]
+    if lt_rank > 0:
+        from baselines.cublaslt_rank import candidates as rank_candidates
+        from baselines.cublaslt_knn import cfg_tuple
+        t = time.perf_counter()
+        known = {cfg_tuple(c.cfg) for c in lts}
+        ranked = rank_candidates(M, N, K, dtype, lt_rank, problem=lts[0].problem if lts else None, skip=known)
+        rank_setup_s = time.perf_counter() - t
+        lt_backends += [("cublaslt_rank", c.key, c, rank_setup_s if i == 0 else 0.0) for i, c in enumerate(ranked)]
+    return lt_backends, lt_setup_s
+
+
+def propose_triton(ranker, M: int, N: int, K: int, k: int, order: str = "plain") -> tuple[list[tuple], float]:
+    """The Triton half: the ranker's top k (plain / diverse / inner order) as (family, key, backend, 0.0) tuples, and the
+    ranking's wall time (rank_s). CPU only (the ranker is lightgbm); building a TritonMatmul compiles nothing."""
+    from kernels.triton_matmul import TritonMatmul
+    t0 = time.perf_counter()
+    keys = ranker.rank(M, N, K, k, order=order)
+    return [("triton", key, TritonMatmul(ranker.cfgs[ranker.pool_keys.index(key)]), 0.0) for key in keys], time.perf_counter() - t0
+
+
+def proposal_keys(backends: list[tuple]) -> list[dict]:
+    """Serializable form of proposed candidates ({family, key, setup_s}): what a ranking process hands to a measuring
+    process that may run another interpreter (`backends_from_keys` rebuilds them there)."""
+    return [{"family": f, "key": key, "setup_s": s} for f, key, _, s in backends]
+
+
+def _heuristic_width(keys: list[str]) -> int:
+    """How many heuristic candidates must be asked for to find every `h<rank>_...` key in `keys` (highest rank + 1)."""
+    import re
+    ranks = [int(m.group(1)) for m in (re.match(r"h(\d+)_", k) for k in keys) if m]
+    return max(ranks) + 1 if ranks else len(keys)
+
+
+def backends_from_keys(entries: list[dict], M: int, N: int, K: int, dtype=torch.float16, lt_n: int | None = None) -> list[tuple]:
+    """Rebuild (family, key, backend, setup_s) tuples from `proposal_keys` output in THIS process, each through
+    `tune.winner_cache.backend_for` (the one place that turns a key into a backend): Triton keys are parsed, k-NN / ranker
+    cuBLASLt keys are rebuilt with `cublaslt_knn.from_key`, heuristic keys (`h<rank>_...`) are looked up in this process's
+    own heuristic list, because that list belongs to the cuBLASLt library loaded here. The list is queried once, for
+    `lt_n` candidates; lt_n=None (default) asks for as many as the entries name (highest rank + 1), so a caller that
+    forwards a top-16 proposal gets all 16 back without repeating the width. A key this process cannot build (malformed,
+    or the library no longer returns or accepts it) is dropped, so the measured pool is the subset that exists here; the
+    caller sees it in the returned keys."""
+    from tune.winner_cache import backend_for
+    heur_keys = [e["key"] for e in entries if e.get("family", "triton") not in ("triton", *PROPOSAL_FAMILIES)]
+    out, heur = [], None
+    for e in entries:
+        fam, key, s = e.get("family", "triton"), e["key"], float(e.get("setup_s", 0.0))
+        if fam != "triton" and fam not in PROPOSAL_FAMILIES and heur is None:
+            from baselines.cublaslt import candidates as lt_candidates
+            heur = lt_candidates(M, N, K, dtype, max(lt_n, 1) if lt_n is not None else _heuristic_width(heur_keys))
+        try:
+            b = backend_for({"key": key, "family": fam}, M, N, K, dtype, heuristics=heur)
+        except ValueError:                                   # a malformed key: unbuildable here, like a rejected one
+            b = None
+        if b is not None:
+            out.append((fam, key, b, s))
+    return out
+
+
+def measure(M: int, N: int, K: int, dtype, lt_backends: list[tuple], triton, *, lt_n: int = 0, router=None,
+            confirm: int = 0, inputs=None) -> dict:
+    """Compile + validate + short-time a proposed pool on one placement and return the per-candidate record (the second
+    half of `search_shape`; no ranking model needed, so it runs under any interpreter with torch + triton).
+
+    `lt_backends` = `propose_lt(...)[0]`; `triton` = the Triton proposals, either a list of tuples or a zero-argument
+    callable returning (tuples, rank_s) that is only called when the Triton half is not skipped (so a router-skipped shape
+    pays no ranking). `router` (anything with `skip_triton(M, N, K, t_lt_us) -> (skip, p)` and `.threshold`) and `confirm`
+    behave as documented in `search_shape`. `inputs` = `_inputs(...)` when the caller already allocated them. Every
+    cuBLASLt candidate's row carries its `family` (so `choose` never takes it for a Triton config); `lt_n` > 0 only adds
+    the field to the Triton rows too, as `search_shape` always wrote it for a joint search. Returns
+    {"rank_s", "candidates", "router"?} (lt_setup_s / lt_knn / lt_rank are added by the caller, who knows them)."""
+    from tune.timing import benchmark
+    if inputs is None:
+        inputs = _inputs(M, N, K, dtype)
+    if isinstance(inputs, dict):
+        return inputs
+    a, b, ref = inputs
+    cold_cfg, graph_cfg = short_configs()
+    cands, bk = [], {}
+
+    def run(backends):
+        for family, key, backend, extra_s in backends:
+            t = time.perf_counter()
+            chk = validate(backend, M, N, K, dtype, ref=ref, inputs=(a, b))  # first call: JIT compile + correctness
+            torch.cuda.synchronize()
+            x = {"config_key": key, "valid": chk.valid, "failure_reason": chk.failure_reason,
+                 "compile_s": time.perf_counter() - t + extra_s}
+            if lt_n > 0 or family != "triton":       # Triton-only rows stay as they were written before cuBLASLt joined
+                x["family"] = family
+            if chk.valid:
+                t = time.perf_counter()
+                x["cold_us"] = benchmark(backend.make_runner(a, b), cold_cfg).median_us
+                x["time_s"] = time.perf_counter() - t
+            cands.append(x)
+            bk[key] = backend
+
+    def graph_pass(xs):
+        """Graph-time the valid candidates `xs` (those not timed yet) when the fastest cold time is below SMALL_US."""
+        ok = [x for x in cands if x["valid"]]
+        if ok and min(x["cold_us"] for x in ok) < SMALL_US:
+            for x in xs:
+                if x["valid"] and "graph_us" not in x:
+                    t = time.perf_counter()
+                    x["graph_us"] = benchmark(bk[x["config_key"]].make_runner(a, b), graph_cfg).median_us
+                    x["time_s"] += time.perf_counter() - t
+
+    def triton_half():
+        return triton() if callable(triton) else (list(triton), 0.0)
+
+    rank_s, info = 0.0, None
+    if router is not None and lt_backends:
+        run(lt_backends)
+        graph_pass(cands)
+        ok = [x for x in cands if x["valid"] and x.get("cold_us") is not None]
+        if ok:
+            small = min(x["cold_us"] for x in ok) < SMALL_US and all(x.get("graph_us") is not None for x in ok)
+            t_lt = min(x["graph_us"] if small else x["cold_us"] for x in ok)
+            skip, p = router.skip_triton(M, N, K, t_lt)
+        else:                                              # no valid cuBLASLt candidate: Triton is the only way out
+            t_lt, skip, p = None, False, None
+        info = {"p_win": p, "t_lt_us": t_lt, "skipped": bool(skip), "threshold": router.threshold}
+        if not skip:
+            tb, rank_s = triton_half()
+            run(tb)
+    else:
+        tb, rank_s = triton_half()
+        run(tb + lt_backends)
+    graph_pass(cands)
+    if confirm > 0:
+        ok = [x for x in cands if x["valid"] and x.get("cold_us") is not None]
+        small = bool(ok) and min(x["cold_us"] for x in ok) < SMALL_US and all(x.get("graph_us") is not None for x in ok)
+        metric = "graph_us" if small else "cold_us"
+        top = sorted(ok, key=lambda x: x[metric])[:confirm]
+        for x in reversed(top):
+            t = time.perf_counter()
+            again = benchmark(bk[x["config_key"]].make_runner(a, b), graph_cfg if small else cold_cfg).median_us
+            x["confirm_us"] = 0.5 * (x[metric] + again)
+            x["time_s"] += time.perf_counter() - t
+        for x in ok:                                   # unconfirmed candidates were all slower than the confirmed ones
+            x.setdefault("confirm_us", x[metric])
+    del a, b, ref, inputs
+    torch.cuda.empty_cache()
+    return {"rank_s": rank_s, "candidates": cands, **({"router": info} if info else {})}
+
+
+def search_shape(ranker, M: int, N: int, K: int, k: int, dtype=torch.float16, order: str = "plain",
+                 lt_n: int = 0, lt_knn: int = 0, lt_rank: int = 0, router=None, confirm: int = 0) -> dict:
+    """Rank (plain or diverse top-k, Ranker.rank), then compile + validate + short-time the top k on one placement.
+    lt_n > 0 also times cuBLASLt's heuristic top lt_n (no compile; same validate + short timing) in the same pool, so
+    the choice is joint over both families. lt_knn > 0 (needs lt_n > 0) adds the cuBLASLt configs that the deep searches
+    of the lt_knn nearest tune shapes found (`baselines/cublaslt_knn.py`, top 2 each, minus those the heuristic already
+    returned), validated and short-timed like the rest. lt_rank > 0 (needs lt_n > 0) adds the lt_rank configs a learned
+    ranker over all valid cuBLASLt configs predicts fastest (`baselines/cublaslt_rank.py`; family "cublaslt_rank", not
+    deduplicated against the k-NN proposals so subsets of the pool can be scored from one run). `router` (a
+    `tune.router.Router`, needs lt_n > 0) times the cuBLASLt candidates FIRST and skips the Triton half (ranking, compile,
+    validation, timing) when P(Triton still wins) is below its threshold; a shape that is not skipped runs the same
+    candidates as without a router. `confirm` = n > 0 re-times the n fastest candidates once more in the REVERSE order of
+    their first ranking, after everything else was timed, and ranks them by the mean of the two timings (`confirm_us`):
+    a candidate timed first or last in the pass gets the opposite position the second time, which cancels the
+    position / GPU-state bias that made the pick change with the timing order (reports/week1.md 2026-11-04 later).
+    Returns the per-candidate record (`router`: p_win, t_lt_us, skipped).
+
+    It is `propose_lt` + `propose_triton` (the ranking half, which needs the models) followed by `measure` (the GPU half,
+    which needs none): a process with the models can rank and hand `proposal_keys(...)` to a measuring process running
+    another interpreter, which rebuilds them with `backends_from_keys` and calls `measure`."""
+    inputs = _inputs(M, N, K, dtype)
+    if isinstance(inputs, dict):
+        return inputs
+    lt_backends, lt_setup_s = propose_lt(M, N, K, dtype, lt_n, lt_knn, lt_rank)
+    r = measure(M, N, K, dtype, lt_backends, lambda: propose_triton(ranker, M, N, K, k, order), lt_n=lt_n,
+                router=router, confirm=confirm, inputs=inputs)
+    del inputs                                       # measure() emptied the allocator cache while this frame still held them
+    torch.cuda.empty_cache()
+    info = r.pop("router", None)
+    return {"rank_s": r["rank_s"], "candidates": r["candidates"], **({"lt_setup_s": lt_setup_s} if lt_n > 0 else {}),
+            **({"lt_knn": lt_knn} if lt_knn > 0 else {}), **({"lt_rank": lt_rank} if lt_rank > 0 else {}),
+            **({"router": info} if info else {})}
+
+
+_DTYPE_NAMES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
+
+
+def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, frequent: bool | None = None,
+                  policy: KPolicy = KPolicy(), lt_n: int = 16, order: str = "diverse", dtype=torch.float16,
+                  cache=True, use_bundle: bool = True, lt_knn: int | None = None, lt_rank: int = RANK_DEFAULT,
+                  router: bool | str = "auto", serve_stale: bool = False) -> dict:
+    """First-use kernel selection for one shape with the call-count-aware k policy. `calls` (expected launches) or
+    `frequent` (explicit) come from the caller; the ranker cannot know them. Searches the policy's k Triton candidates
+    plus cuBLASLt's heuristic top lt_n (0 = Triton only) plus, with lt_n > 0, the configs the deep searches of the lt_knn
+    nearest tune shapes found (`baselines/cublaslt_knn.py`; 0 = off; no table for this GPU = none) and the lt_rank configs a
+    learned ranker over all valid cuBLASLt configs predicts fastest (`baselines/cublaslt_rank.py`; 0 = off). lt_knn=None
+    means automatic: KNN_DEFAULT neighbours only when the ranker is off or has no model for this GPU, else none (the
+    ranker alone beat the proposals; the union adds little for +0.1 s). `router` (`tune/router.py`) times the cuBLASLt
+    candidates first and skips the Triton half when P(Triton still wins) is under the router's threshold: "auto" (default)
+    = on only when the Triton kernels will really compile (no bundle, or a bundle built for another Triton / GPU), off
+    when the bundle serves them (the Triton half is then ~0.06 s of ~0.17 s); True / False force it; no model for this GPU
+    = off. A skipped shape's cached winner is the cuBLASLt one. Returns {"k", "reason", "choice", "candidates", "rank_s",
+    "cached"}. choice = {"key", "family", "mode", "rank", "compile_s", "time_s"} (key None if no candidate was valid); a shape
+    whose tensors do not fit in memory returns {"skipped": ...} with choice None.
+
+    Two things make a repeat or a fresh clone cheap (both default on, both opt-out because experiments measure the search
+    itself and pass `cache=None, use_bundle=False`):
+      * `use_bundle`: install the prebuilt Triton kernel bundle (`kernels/bundle.py`), so a candidate the rankers can
+        propose is loaded instead of compiled. Any kernel not in it, or a bundle built for another Triton / GPU
+        architecture, compiles as before (a mismatch is warned about once);
+      * `cache`: the per-shape winner cache (`tune/winner_cache.py`). True = the default file for this GPU (None / False /
+        `TUNE_WINNER_CACHE=off` = off; or pass a `WinnerCache`). A stored winner from a search at least as wide as this
+        one is returned with no ranking, compiling or timing: {"reason": "cached", "cached": True, "candidates": []}. A
+        miss searches and stores the winner. Cache problems are warned about and never fail the selection. The default
+        cache declares the model set this search draws on (`model_ids(ranker)`), so winners found with a ranker,
+        cuBLASLt ranker or router that was since retrained are soft-stale: searched again once. A `WinnerCache` you
+        pass keeps the environment you built it with (lscli declares its own model ids).
+        `serve_stale=True` also returns a soft-stale entry (timed under another driver / torch / Triton / cuBLASLt / clock /
+        model set on this GPU; `tune/winner_cache.py`): it is run once through the correctness gate in this environment
+        (recorded, so later processes skip it; a failure is a miss), then served with reason "cached_stale" and `stale` =
+        the differing fields, so the caller can queue a re-search. Default False: a stale entry is a miss, as before."""
+    import warnings
+    bundle_serves = False
+    if use_bundle:
+        from kernels import bundle
+        info = bundle.install()
+        bundle_serves = bool(info.get("installed") and info.get("matches"))
+    try:
+        wc = _winner_cache(cache, ranker)
+    except Exception as e:                          # e.g. the environment cannot be read: select without a cache
+        warnings.warn(f"winner cache unavailable ({type(e).__name__}: {e}); searching without it")
+        wc = None
+    if lt_n and lt_rank:
+        from baselines.cublaslt_rank import ranker as _lt_ranker
+        if _lt_ranker() is None:
+            lt_rank = 0
+    if lt_knn is None:
+        lt_knn = 0 if (lt_rank or not lt_n) else KNN_DEFAULT
+    if not lt_n:
+        lt_knn = lt_rank = 0
+    rt = None
+    if lt_n and (router is True or (router == "auto" and not bundle_serves)):
+        from tune.router import router as _router
+        rt = _router()
+    k = policy.k_for(calls, frequent)
+    dname = _DTYPE_NAMES.get(dtype, str(dtype))
+    if wc is not None:
+        try:
+            from tune.winner_cache import backend_for
+            hit = wc.get(M, N, K, dname, k=k, lt_n=lt_n, lt_knn=lt_knn, lt_rank=lt_rank, allow_stale=serve_stale)
+            b = backend_for(hit["choice"], M, N, K, dtype, hit["lt_n"]) if hit is not None else None
+            if b is not None and hit.get("stale") and not hit.get("verified"):
+                if validate(b, M, N, K, dtype).valid:   # still a correct GEMM in this environment: record it once
+                    wc.mark_verified(hit)
+                else:
+                    b = None
+            if b is not None:
+                return {"k": hit["k"], "reason": "cached_stale" if hit.get("stale") else "cached", "rank_s": 0.0,
+                        "choice": hit["choice"], "candidates": [], "cached": True, "stale": hit.get("stale") or []}
+        except Exception as e:                      # a broken cache must not break selection: search instead
+            warnings.warn(f"winner cache lookup failed ({type(e).__name__}: {e}); searching")
+    r = search_shape(ranker, M, N, K, k, dtype, order, lt_n,
+                     **({"lt_knn": lt_knn} if lt_knn else {}), **({"lt_rank": lt_rank} if lt_rank else {}),
+                     **({"router": rt, "confirm": ROUTER_CONFIRM} if rt is not None else {}))
+    out = {"k": k, "reason": "frequent" if k == policy.k_frequent and k != policy.k else "default", "rank_s": r["rank_s"],
+           "cached": False}
+    if r.get("skipped"):
+        return {**out, "skipped": r["skipped"], "choice": None, "candidates": []}
+    choice = choose(r["candidates"], k)
+    if wc is not None:
+        try:
+            wc.put(M, N, K, dname, k=k, lt_n=lt_n, lt_knn=lt_knn, lt_rank=lt_rank, choice=choice, candidates=r["candidates"], order=order,
+                   ranker=f"lgbm_rank/{getattr(ranker, 'features', None) or 'v1'}")
+        except Exception as e:
+            warnings.warn(f"winner cache write failed ({type(e).__name__}: {e})")
+    return {**out, "choice": choice, "candidates": r["candidates"]}
+
+
+def model_ids(ranker) -> dict:
+    """Ids (`tune.winner_cache.model_id`) of the models a search on this machine takes its candidates from: the Triton
+    ranker given to `select_kernel` (`Ranker.load` remembers its stem) and the cuBLASLt ranker and family router files a
+    search here would load. All three are declared whether or not one call uses them (the router is off when the bundle
+    serves the kernels), so every call of a process setup shares its entries. None where there is no saved model (no
+    ranker, one built in memory, no file for this GPU)."""
+    from baselines.cublaslt_rank import default_stem as lt_rank_stem
+    from tune.router import default_stem as router_stem
+    from tune.winner_cache import model_id
+    return {"triton": model_id(getattr(ranker, "stem", None)), "lt_rank": model_id(lt_rank_stem()),
+            "router": model_id(router_stem())}
+
+
+def _winner_cache(cache, ranker=None):
+    """`cache` argument of `select_kernel` -> a WinnerCache or None. True = the default file, with this search's model
+    ids in its environment."""
+    if cache is None or cache is False:
+        return None
+    if cache is True:
+        from tune.winner_cache import WinnerCache, default_enabled
+        return WinnerCache.default(models=model_ids(ranker)) if default_enabled() else None
+    return cache
+
+
+def run(shapes: Iterable[dict], ranker_stem: Path, out_dir: Path, *, k: int = 5, dtype: str = "fp16",
+        order: str = "plain", out_name: str = "online_lgbm_rank.jsonl", session_id: str | None = None, lt_n: int = 0,
+        lt_knn: int = 0, lt_rank: int = 0, use_router: bool = False, router_threshold: float | None = None, confirm: int = 0,
+        policy: KPolicy | None = None,
+        log: Callable[[str], None] = print) -> Path:
+    from analysis.learned import Ranker
+    from tune.runner import DTYPES
+    import os
+    session_id = session_id or time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    env = write_env(out_dir, session_id=session_id, kind="online")
+    ranker = Ranker.load(ranker_stem)
+    rt = None
+    if use_router:
+        from tune.router import router as _router
+        rt = _router()
+        if rt is None:
+            raise RuntimeError("--router: no family router model for this GPU (python -m analysis.router fit --save data/<hw>/router)")
+        if router_threshold is not None:                    # control runs: 0 = cuBLASLt timed first but Triton never skipped
+            rt.threshold = float(router_threshold)
+    path = out_dir / out_name
+    done = set()
+    if path.exists():
+        rule = None if order == "plain" else ranker.rule(order)
+        done = {(r["M"], r["N"], r["K"], r.get("k")) for r in map(json.loads, path.read_text().splitlines())
+                if r.get("order", "plain") == order and r.get("rule") == rule and r.get("lt_n", 0) == lt_n and r.get("lt_knn", 0) == lt_knn and r.get("lt_rank", 0) == lt_rank
+                and bool(r.get("router")) == use_router and r.get("confirm", 0) == confirm}
+    # Per-shape k: the policy's, from the shape's own `calls` / `frequent` fields; without a policy, the global k.
+    shapes = [dict(s, _k=shape_k(s, k, policy)) for s in shapes]
+    shapes = [s for s in shapes if (s["M"], s["N"], s["K"], s["_k"]) not in done]
+    t0 = time.perf_counter()
+    with RecordWriter(path) as w:
+        for i, s in enumerate(shapes):
+            M, N, K, ks = s["M"], s["N"], s["K"], s["_k"]
+            t = time.perf_counter()
+            r = search_shape(ranker, M, N, K, ks, DTYPES[dtype], order, lt_n,
+                             **({"lt_knn": lt_knn} if lt_knn else {}), **({"lt_rank": lt_rank} if lt_rank else {}),
+                             **({"router": rt} if rt is not None else {}), **({"confirm": confirm} if confirm else {}))
+            row = {"M": M, "N": N, "K": K, "dtype": dtype, "k": ks, "order": order, "lt_n": lt_n, "lt_knn": lt_knn, "lt_rank": lt_rank, "confirm": confirm,
+                   **({"calls": s.get("calls"), "frequent": s.get("frequent"),
+                       "k_reason": "frequent" if ks == policy.k_frequent and ks != policy.k else "default"} if policy else {}),
+                   "rule": None if order == "plain" else ranker.rule(order),
+                   "split": s.get("split"), "suite": s.get("suite"),
+                   "session_id": session_id, "hw_id": env["hw_id"], "driver": env["driver"], **provenance(env),
+                   "ranker": str(ranker_stem), "ranker_meta": ranker.meta,
+                   "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"), "wall_s": time.perf_counter() - t,
+                   **r, **all_choices(r["candidates"], ks, lt_n), "timestamp": time.time()}
+            w.write(row)
+            el = time.perf_counter() - t0
+            log(f"[{i + 1}/{len(shapes)}] {M}x{N}x{K} k={ks} -> {row['choice'][str(ks)]['key']} ({row['wall_s']:.1f}s) | "
+                f"{el:.0f}s elapsed, ETA {el / (i + 1) * (len(shapes) - i - 1):.0f}s")
+    return path
