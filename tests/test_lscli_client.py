@@ -49,6 +49,20 @@ def test_dispatch_rule():
     assert not client.dispatch_rule({"winner_us": 1.0}, SETTINGS)                           # no torch time: never
 
 
+def test_dispatch_margin_follows_the_clock_policy():
+    """4 % at stock clocks (or with no declared policy), 3 % under a declared lock: the short timing's measured noise."""
+    unlocked = {"torch_us": 1000.0, "winner_us": 965.0, "env": {"clock_lock": "unlocked"}}    # saves 3.5 %
+    locked = dict(unlocked, env={"clock_lock": "1755"})
+    assert client.saving_frac(unlocked) == client.SAVING_FRAC_UNLOCKED == 0.04
+    assert client.saving_frac(locked) == client.SAVING_FRAC_LOCKED == 0.03
+    assert client.saving_frac({"torch_us": 1.0}) == 0.04 and client.saving_frac({"env": {"clock_lock": None}}) == 0.04
+    assert not client.dispatch_rule(unlocked, SETTINGS)                    # 3.5 % is inside the stock-clock noise
+    assert client.dispatch_rule(locked, SETTINGS)                          # but outside the locked one
+    assert not client.dispatch_rule({"torch_us": 1000.0, "winner_us": 965.0}, SETTINGS)        # undeclared = stock
+    assert client.dispatch_rule(dict(unlocked, winner_us=959.0), SETTINGS)                     # 4.1 %
+    assert not client.dispatch_rule(dict(locked, winner_us=975.0), SETTINGS)                   # 2.5 % < 3 %
+
+
 @requires_cuda
 def test_hit_dispatches_the_winner_and_counts(home, monkeypatch):
     _put(home, 1024, 1024, 1024)
