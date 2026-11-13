@@ -435,6 +435,40 @@ def cmd_logs(args, paths: Paths) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------------------------------------------------------------------ train
+def cmd_train(args, paths: Paths) -> int:
+    from lscli import training
+    st = control.read_state(paths) or {}
+    if args.action == "start":
+        control.train_now(paths.ensure())
+        _out(args, {"train_now": True}, "training may run outside the time window until it finishes (the GPU gate still applies)")
+        return EXIT_OK
+    if args.action == "retrain":
+        stages = [s.strip() for s in args.stages.split(",")] if args.stages else None
+        bad = [s for s in stages or [] if s not in training.STAGES]
+        if bad:
+            print(f"lscli train retrain: unknown stage(s) {', '.join(bad)}; stages: {', '.join(training.STAGES)}", file=sys.stderr)
+            return EXIT_USAGE
+        control.retrain(paths.ensure(), stages)
+        _out(args, {"retrain": stages or "all"}, f"retraining {'stages ' + ', '.join(stages) if stages else 'everything'} "
+             "at the next open gate")
+        return EXIT_OK
+    hw = st.get("hw_id")
+    if not hw:
+        print("lscli train status: unknown GPU (the daemon has not run yet)", file=sys.stderr)
+        return EXIT_NO_DAEMON
+    tr = training.Training(paths, hw)
+    doc = {**tr.summary(), "trained_env": training.trained_env(paths, hw), "models": (st.get("models") or {}).get("ids")}
+    text = (f"training: {doc['status']}" + (f" (run {doc['run']}: {doc['reason']})" if doc.get("run") else "")
+            + (f"\n  next stage {doc['stage']}, {doc['done']}/{doc['total']} done" if doc.get("stage") else "")
+            + (f"\n  failures {doc['failures']}" if doc.get("failures") else "")
+            + f"\nmodels: {(doc['models'] or {}).get('source', 'none')}"
+            + (f"\n  trained on triton {doc['trained_env'].get('triton')}, cuBLASLt {doc['trained_env'].get('cublaslt')}, "
+               f"driver {doc['trained_env'].get('driver')}" if doc.get("trained_env") else ""))
+    _out(args, doc, text)
+    return EXIT_OK
+
+
 # ------------------------------------------------------------------------------------------------------------ main
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="lscli", description="learned-selector CLI (docs/lscli/spec.md)")
@@ -478,6 +512,10 @@ def build_parser() -> argparse.ArgumentParser:
     lg.add_argument("-n", "--lines", type=int, default=50)
     lg.add_argument("--job", help="part of a job log name (logs/jobs/)")
     lg.set_defaults(fn=cmd_logs)
+    tn = sub.add_parser("train", help="training status; allow training now; force a retraining")
+    tn.add_argument("action", choices=("status", "start", "retrain"))
+    tn.add_argument("--stages", help="retrain: comma-separated train_best stages (default: everything)")
+    tn.set_defaults(fn=cmd_train)
     k = sub.add_parser("cache", help="inspect / verify / compact / clear the winner cache")
     k.add_argument("action", choices=("ls", "verify", "compact", "clear"))
     k.add_argument("--env", help="env id or interpreter path")
