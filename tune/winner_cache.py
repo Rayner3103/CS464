@@ -7,7 +7,9 @@ searched shape (the same crash-safe style as `tune/records.py`: one fsync'd line
 
 Key = shape + dtype; each line also carries the environment it was timed in (`environment()`): GPU id, Triton, torch,
 CUDA runtime, cuBLASLt build, driver, VBIOS, a hash of the Triton kernel's source, the declared clock-lock state, and,
-when the caller passes them, the ids of the models that proposed the candidates. Comparing a line's environment with
+when the caller passes them, the ids of the models that proposed the candidates (`model_id`; `select_kernel`'s default
+cache passes the ids of the Triton ranker it was given and of this GPU's cuBLASLt ranker and router files, so a
+retrained model makes the old winners soft-stale). Comparing a line's environment with
 the current one sorts it into one of three tiers (schema 2):
 
   * current: every field the current environment declares matches. Served.
@@ -29,15 +31,28 @@ A cuBLASLt winner is stored as its key (`h<rank>_a<algo>_t<tile>_...`); `select_
 key that no longer exists as a miss (`backend_for` returns None), so a stale entry costs one re-search, never a wrong
 kernel. `backend_for(sel["choice"], M, N, K)` turns a choice (cached or fresh) into a runnable backend.
 
-The file only grows until `compact()` rewrites it (atomically, under the same lock the writers take): for each shape and
-GPU, a line that a later current-environment search re-searched is dropped, otherwise the last line per distinct
-environment is kept, so soft-stale entries stay until they are re-searched. Lines of other GPUs are kept (the card may
-come back).
+The file only grows until `compact()` rewrites it (atomically, under the same lock the writers take). What it may drop
+is decided by who else can still be reading the line:
+
+  * always: a line that a later line of the SAME environment (every field equal) replaced. That search superseded it
+    for every reader, whatever its own environment: a reader keeps only the last line per tier anyway.
+  * only inside the compactor's own `env_id` scope: a line that is stale here, was written before this environment's
+    current line for the shape, and whose search was not wider than it. `env_id` is an optional field of the
+    environment naming the one interpreter the entry belongs to (lscli sets it per registered Python environment;
+    `environment(env_id=...)`). Inside a scope the environment only changes over time (an upgrade), so a re-searched
+    line has no reader left. Without an `env_id`, several interpreters may share the file (two virtualenvs with
+    different torch builds on one GPU): a line that is stale for the compactor may be another one's current entry, so
+    nothing but exact duplicates is dropped and the file keeps one line per shape per environment it has seen.
+
+Lines of other GPUs and of other `env_id`s are never dropped (the card may come back; the other interpreter compacts its
+own scope).
 
 LIMITATIONS: entries are per machine (nothing is shared across GPUs); the cache never expires by age; a winner is the
 fastest of a short online timing (10 cold samples, one placement), so its ranking against near-ties is only as good as
 `choose`'s (no tie margin). Concurrent writers append whole lines under a file lock; a reader only sees entries from
-before it loaded the file (`reload()` to refresh).
+before it loaded the file (`refresh()` re-reads it when it changed). `WinnerCache.default()` keeps one instance per file
+and environment for the life of the process and refreshes it on every call, so a cache hit costs a `stat`, not a parse
+of the whole file (20 ms at 1,000 shapes, 140 ms at 10,000).
 """
 from __future__ import annotations
 
@@ -55,12 +70,37 @@ READS = (1, 2)                     # schema 1 lines (4-field environment) are re
 HARD_FIELDS = ("hw_id",)           # another GPU: the measurement says nothing here
 TRITON_HARD_FIELDS = ("kernel_src",)  # the Triton kernel's code changed: a Triton key now names a different kernel
 _RESERVED = ("stale", "verified")  # annotations `get` adds to the rows it returns; never stored
+PROPOSAL_FAMILIES = ("cublaslt_knn", "cublaslt_rank")   # cuBLASLt candidates rebuilt from their key alone (`backend_for`)
 
 
 def kernel_src_hash() -> str:
     """sha256 (16 hex) of `kernels/triton_matmul.py`: any edit changes what a Triton config key compiles to."""
     src = Path(__file__).resolve().parent.parent / "kernels" / "triton_matmul.py"
     return hashlib.sha256(src.read_bytes()).hexdigest()[:16]
+
+
+_MODEL_IDS: dict[tuple, str] = {}
+
+
+def model_id(stem: str | os.PathLike | None) -> str | None:
+    """Identity of a saved model (`<stem>.txt` + `<stem>.json`: the Triton ranker, the cuBLASLt ranker, the router):
+    `<stem name>:<12 hex of the sha256 of both files>`, the form lscli uses for its model sets. None without a stem or
+    when a file is missing. A retrained model gets another id under the same file name. Hashed once per process and file
+    state (path, size, mtime): the Triton ranker is ~36 MB."""
+    if not stem:
+        return None
+    files = [Path(str(stem) + ext) for ext in (".txt", ".json")]
+    try:
+        stats = [f.stat() for f in files]
+    except OSError:
+        return None
+    key = tuple((str(f), st.st_size, st.st_mtime_ns) for f, st in zip(files, stats))
+    if key not in _MODEL_IDS:
+        h = hashlib.sha256()
+        for f in files:
+            h.update(f.read_bytes())
+        _MODEL_IDS[key] = f"{Path(stem).name}:{h.hexdigest()[:12]}"
+    return _MODEL_IDS[key]
 
 
 def clock_lock_declared(value: str | None = None) -> str | None:
@@ -73,9 +113,10 @@ def clock_lock_declared(value: str | None = None) -> str | None:
     return "unlocked" if v in ("none", "off", "0", "unlocked") else v
 
 
-def environment(*, models: dict | None = None, clock_lock: str | None = None) -> dict:
+def environment(*, models: dict | None = None, clock_lock: str | None = None, env_id: str | None = None) -> dict:
     """What a timed winner depends on besides the shape. `models` (ids of the rankers / router that proposed the
-    candidates) and `clock_lock` (a policy to declare instead of `TUNE_CLOCK_LOCK`) come from the caller."""
+    candidates), `clock_lock` (a policy to declare instead of `TUNE_CLOCK_LOCK`) and `env_id` (a name for this
+    interpreter when several share the file; it scopes `compact`) come from the caller."""
     import torch
     import triton
     from baselines.cublaslt import library_info
@@ -89,6 +130,8 @@ def environment(*, models: dict | None = None, clock_lock: str | None = None) ->
            "kernel_src": kernel_src_hash(), "clock_lock": clock_lock_declared(clock_lock)}
     if models is not None:
         env["models"] = models
+    if env_id is not None:
+        env["env_id"] = env_id
     return env
 
 
@@ -108,8 +151,24 @@ def tier(row: dict, env: dict) -> tuple[str, list[str]]:
     return ("soft" if fields else "current"), fields
 
 
+WIDTH = ("k", "lt_n", "lt_knn", "lt_rank")
+
+
+def _wider(a: dict, b: dict) -> bool:
+    """Entry `a` came from a search wider than `b`'s in some dimension: `get` can serve `a` where `b` is a miss."""
+    return any(a.get(w, 0) > b.get(w, 0) for w in WIDTH)
+
+
 def _row_id(r: dict, line: str) -> str:
     return r.get("id") or hashlib.sha1(line.encode()).hexdigest()[:16]
+
+
+_DEFAULTS: dict[tuple, "WinnerCache"] = {}   # (path, environment) -> the instance `WinnerCache.default` hands out
+
+
+def default_enabled() -> bool:
+    """False when `TUNE_WINNER_CACHE=off`."""
+    return os.environ.get(ENV_PATH, "").lower() != "off"
 
 
 def default_path() -> Path:
@@ -123,14 +182,23 @@ class WinnerCache:
         self.env = env if env is not None else environment()
         self._rows: dict[tuple, dict[str, dict]] = {}     # key -> {"current": row, "soft": row} (last line of each tier)
         self._verified: set[str] = set()                   # entry ids verified in exactly this environment
+        self._stamp: tuple | None = None                   # the file state `_rows` reflects (`refresh`)
         self.reload()
 
     @classmethod
-    def default(cls) -> "WinnerCache | None":
-        """The cache at its standard place, or None when `TUNE_WINNER_CACHE=off`."""
-        if os.environ.get(ENV_PATH, "").lower() == "off":
+    def default(cls, models: dict | None = None) -> "WinnerCache | None":
+        """The cache at its standard place, or None when `TUNE_WINNER_CACHE=off`. `models` = the model ids to declare
+        in its environment (`environment(models=...)`)."""
+        if not default_enabled():
             return None
-        return cls()
+        env = environment(models=models)
+        key = (str(default_path()), json.dumps(env, sort_keys=True, default=str))
+        wc = _DEFAULTS.get(key)
+        if wc is None:
+            wc = _DEFAULTS[key] = cls(env=env)
+        else:
+            wc.refresh()
+        return wc
 
     @staticmethod
     def _key(M: int, N: int, K: int, dtype: str) -> tuple:
@@ -138,7 +206,8 @@ class WinnerCache:
 
     @staticmethod
     def _parse(lines: list[str]):
-        """(row, line) for every readable line of a known schema; a torn last line from a crash is skipped."""
+        """(row, line) for every readable line of a known schema; a torn last line from a crash, or a line whose key
+        fields are missing or of the wrong type (a damaged file), is skipped."""
         for line in lines:
             try:
                 r = json.loads(line)
@@ -146,14 +215,34 @@ class WinnerCache:
                 continue
             if not isinstance(r, dict) or r.get("schema") not in READS:
                 continue
-            if r.get("kind") == "verified" or all(x in r for x in ("M", "N", "K", "dtype", "k", "lt_n")):
-                yield r, line                 # an entry missing its key fields is unusable: skipped like a torn line
+            if r.get("kind") == "verified" or (all(isinstance(r.get(x), int) for x in ("M", "N", "K", "k", "lt_n"))
+                                               and isinstance(r.get("dtype"), str)):
+                yield r, line                 # an entry without usable key fields is skipped like a torn line
+
+    @staticmethod
+    def _stamp_of(st: os.stat_result) -> tuple:
+        return (st.st_ino, st.st_size, st.st_mtime_ns)     # an append grows the file, `compact` replaces the inode
+
+    def _file_stamp(self) -> tuple | None:
+        try:
+            return self._stamp_of(os.stat(self.path))
+        except OSError:
+            return None
+
+    def refresh(self) -> bool:
+        """Re-read the file if it changed since this cache read it (another process appended or compacted); returns
+        whether it did. This process's own `put` / `mark_verified` do not count: they update the tables themselves."""
+        if self._file_stamp() == self._stamp:
+            return False
+        self.reload()
+        return True
 
     def reload(self) -> None:
         """(Re)read the file; hard-stale lines (another GPU, changed kernel source) and unreadable lines are skipped."""
         self._rows, self._verified = {}, set()
+        self._stamp = self._file_stamp()     # taken before reading: a line appended meanwhile costs one more reload, never a miss
         try:
-            lines = self.path.read_text().splitlines()
+            lines = self.path.read_text(errors="replace").splitlines()   # damaged bytes spoil their line, not the file
         except OSError:
             return
         for r, line in self._parse(lines):
@@ -206,15 +295,18 @@ class WinnerCache:
         return [self._out(v[t]) for v in self._rows.values() for t in tiers if t in v]
 
     def stale_entries(self) -> list[dict]:
-        """The soft-stale entries of shapes with no current entry: what an idle-time re-search should redo."""
-        return [self._out(v["soft"]) for v in self._rows.values() if "soft" in v and "current" not in v]
+        """The soft-stale entries `get(allow_stale=True)` can still return: those of shapes with no current entry, and
+        those whose search was wider than the shape's current entry (served for the wider request). What an idle-time
+        re-search should redo; a list that left the second kind out would let them be served for ever."""
+        return [self._out(v["soft"]) for v in self._rows.values()
+                if "soft" in v and ("current" not in v or _wider(v["soft"], v["current"]))]
 
     def _locked(self, mode: str):
         """Open the file and take the exclusive lock, re-opening when `compact` replaced it while this process waited
         (the handle would point at the old, unlinked file). Returns the open, locked file; closing it releases the lock."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         for _ in range(20):
-            f = open(self.path, mode)
+            f = open(self.path, mode, **({} if "b" in mode else {"errors": "replace"}))
             fcntl.flock(f, fcntl.LOCK_EX)
             try:
                 if os.fstat(f.fileno()).st_ino == os.stat(self.path).st_ino:
@@ -228,6 +320,9 @@ class WinnerCache:
         """Append one fsync'd line under the file lock. A torn last line (a crash mid-write) is terminated first, so the
         new line is not glued onto it."""
         with self._locked("a+b") as f:
+            st = os.fstat(f.fileno())
+            # nobody else wrote since this cache read the file (or there was no file then and it is still empty)
+            seen = self._stamp == self._stamp_of(st) or (self._stamp is None and st.st_size == 0)
             f.seek(0, os.SEEK_END)
             torn = False
             if f.tell() > 0:
@@ -236,6 +331,8 @@ class WinnerCache:
             f.write((b"\n" if torn else b"") + (json.dumps(row) + "\n").encode())
             f.flush()
             os.fsync(f.fileno())
+            if seen:                             # the caller adds this line to the tables: they still match the file
+                self._stamp = self._stamp_of(os.fstat(f.fileno()))
 
     def put(self, M: int, N: int, K: int, dtype: str, *, k: int, lt_n: int, choice: dict, candidates: list[dict] | None = None,
             order: str | None = None, ranker: str | None = None, lt_knn: int = 0, lt_rank: int = 0,
@@ -266,15 +363,15 @@ class WinnerCache:
         self._verified.add(entry["id"])
 
     def compact(self) -> dict:
-        """Rewrite the file without the lines a re-search made obsolete; returns {"before", "after"} line counts.
+        """Rewrite the file without the lines no reader can be served any more; returns {"before", "after"} line counts.
 
-        Per (shape, dtype, GPU, env_id): the last line per distinct environment is a candidate. `env_id` (set by lscli,
-        one per registered interpreter; None otherwise) scopes the rewrite, so compacting with one env's environment
-        never drops another env's lines. When a line is current in this
-        environment, the last current line stays and an older candidate stays only if its search was wider in some
-        dimension (k, lt_n, lt_knn, lt_rank), because `get(allow_stale=True)` can still serve it for a wider request;
-        otherwise every candidate stays (soft-stale entries are kept until re-searched). Verification lines stay while
-        their entry does. Unreadable lines are dropped. Atomic (temp file + rename) under the writers' lock; a
+        Per (shape, dtype, GPU, env_id): the last line per distinct environment is a candidate, every earlier line of the
+        same environment is dropped. The candidates all stay, except in this cache's own scope (the group's `env_id` is
+        this environment's, and not None): there a candidate that is not current here is dropped when a current line was
+        written after it and its search was not wider in some dimension (k, lt_n, lt_knn, lt_rank; `get(allow_stale=True)`
+        can still serve a wider one). A line written after the current one stays even when it is stale here: it comes
+        from a newer state of the interpreter than the environment this compactor was built with. Verification lines stay
+        while their entry does. Unreadable lines are dropped. Atomic (temp file + rename) under the writers' lock; a
         compactor that waited for the lock while another one replaced the file re-opens the new file."""
         if not self.path.exists():
             return {"before": 0, "after": 0}
@@ -288,20 +385,19 @@ class WinnerCache:
             for i, (r, line) in enumerate(entries):
                 e = r.get("env") or {}
                 groups.setdefault((r["M"], r["N"], r["K"], r["dtype"], e.get("hw_id"), e.get("env_id")), []).append(i)
-            width = ("k", "lt_n", "lt_knn", "lt_rank")
+            scope = self.env.get("env_id")
             keep: set[int] = set()
-            for idx in groups.values():
+            for gkey, idx in groups.items():
                 last: dict[str, int] = {}
                 for i in idx:
                     last[json.dumps(entries[i][0].get("env"), sort_keys=True)] = i
-                cur = [i for i in idx if tier(entries[i][0], self.env)[0] == "current"]
-                if not cur:
-                    keep.update(last.values())
+                cand = sorted(last.values())
+                current = {i for i in cand if tier(entries[i][0], self.env)[0] == "current"}
+                if scope is None or gkey[-1] != scope or not current:
+                    keep.update(cand)
                     continue
-                c = entries[cur[-1]][0]
-                keep.add(cur[-1])
-                keep.update(i for i in last.values() if i != cur[-1] and tier(entries[i][0], self.env)[0] != "current"
-                            and any(entries[i][0].get(w, 0) > c.get(w, 0) for w in width))
+                newest = max(current)                          # the line `get` serves here
+                keep.update(i for i in cand if i in current or i > newest or _wider(entries[i][0], entries[newest][0]))
             kept_ids = {_row_id(entries[i][0], entries[i][1]) for i in keep}
             out = [entries[i][1] for i in sorted(keep)] + [line for r, line in verified if r.get("id") in kept_ids]
             tmp = self.path.with_name(f"{self.path.name}.tmp-{uuid.uuid4().hex[:12]}")
@@ -319,10 +415,12 @@ class WinnerCache:
         return {"before": len(lines), "after": len(out)}
 
 
-def backend_for(choice: dict, M: int, N: int, K: int, dtype=None, lt_n: int = 16):
+def backend_for(choice: dict, M: int, N: int, K: int, dtype=None, lt_n: int = 16, heuristics: list | None = None):
     """The runnable backend a choice names (`.make_runner(a, b)`), or None when it no longer exists (a cuBLASLt key the
     library does not return any more): the caller then searches again. `choice` is `select_kernel(...)["choice"]` or a
-    stored entry's `["choice"]`; `lt_n` bounds the cuBLASLt heuristic list rebuilt to find the named candidate."""
+    stored entry's `["choice"]`; `lt_n` bounds the cuBLASLt heuristic list rebuilt to find the named candidate, unless the
+    caller passes that list (`heuristics`, e.g. `tune.online.backends_from_keys`, which rebuilds many keys of one shape).
+    A malformed Triton key raises ValueError (`tune.sweep.parse_key`)."""
     import torch
     dtype = dtype or torch.float16
     if choice.get("key") is None:
@@ -331,8 +429,10 @@ def backend_for(choice: dict, M: int, N: int, K: int, dtype=None, lt_n: int = 16
         from kernels.triton_matmul import TritonMatmul
         from tune.sweep import parse_key
         return TritonMatmul(parse_key(choice["key"]))
-    if choice.get("family") in ("cublaslt_knn", "cublaslt_rank"):
+    if choice.get("family") in PROPOSAL_FAMILIES:
         from baselines.cublaslt_knn import from_key
         return from_key(choice["key"], M, N, K, dtype)
-    from baselines.cublaslt import candidates as lt_candidates
-    return next((c for c in lt_candidates(M, N, K, dtype, max(lt_n, 1)) if c.key == choice["key"]), None)
+    if heuristics is None:
+        from baselines.cublaslt import candidates as lt_candidates
+        heuristics = lt_candidates(M, N, K, dtype, max(lt_n, 1))
+    return next((c for c in heuristics if c.key == choice["key"]), None)
