@@ -67,8 +67,10 @@ def write_control(paths, doc: dict) -> None:
 
 
 def train_now(paths) -> dict:
-    """`lscli train start`: let training ignore the time window until the current training finishes."""
-    doc = {**read_control(paths), "train_now": True}
+    """`lscli train start`: let training ignore the time window until the current training finishes, and continue a
+    training that stopped on a failed stage (`continue`, a request the daemon consumes once: it only ever un-fails a run
+    that had already failed when the user asked, so a stage that keeps failing never loops)."""
+    doc = {**read_control(paths), "train_now": True, "continue": {"t": time.time()}}
     write_control(paths, doc)
     return doc
 
