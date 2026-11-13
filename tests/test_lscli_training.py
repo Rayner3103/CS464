@@ -266,6 +266,70 @@ def test_a_stage_that_fails_twice_stops_the_training(home, monkeypatch):
     assert d.counters["failed"] == 2 and not control.read_control(home).get("train_now")
     d.tick()
     assert training.Training(home, HW).state["run"] == 1             # no automatic restart after a failure
+    assert training.Training(home, HW).state["status"] == "failed"   # the `train start` made before it failed is spent
+
+
+@needs_ranker
+def test_train_start_continues_a_failed_run_in_the_same_directory(home, monkeypatch, capsys):
+    """After the cause is fixed, `lscli train start` goes on from the failed stage: the finished stages (days of sweeps on
+    a real GPU) are kept, not re-run, and the run activates its models as usual."""
+    from lscli import cli, control
+    monkeypatch.setenv("FAKE_FAIL_STAGE", "train_v2")
+    d = _daemon(home)
+    assert _run_until(d, lambda: training.Training(home, HW).state.get("status") == "failed")
+    run = home.train / HW / "1"
+    before = (run / "ran.txt").read_text().split()
+    assert before[-1] == "tail_sweep" and "train_v2" not in before
+    write_json(home.state, {"hw_id": HW, "pid": 1})
+    capsys.readouterr()
+    assert cli.main(["train", "start"]) == 0
+    assert "continuing failed training run 1 at stage train_v2" in capsys.readouterr().out
+    assert training.Training(home, HW).state["status"] == "failed"   # the daemon un-fails it, not the CLI
+    monkeypatch.delenv("FAKE_FAIL_STAGE")                               # "the cause is fixed"
+    assert _run_until(d, lambda: d.models is not None and d.models.source == "native")
+    tr = training.Training(home, HW)
+    assert tr.state["run"] == 1 and tr.state["status"] == "done" and tr.state["failures"] == {}
+    assert tr.state["continued"][0]["failures"] == {"train_v2": 2}
+    after = (run / "ran.txt").read_text().split()
+    assert after[:len(before)] == before and after[len(before)] == "train_v2" and after.count("tune_sweep") == 1
+    assert not (home.train / HW / "2").exists() and "continue" not in control.read_control(home)
+
+
+@needs_ranker
+def test_a_train_start_made_while_the_failing_stage_ran_does_not_continue_it(home, monkeypatch):
+    """The daemon reads control.json between jobs, so a `train start` issued during a stage's last attempt is only seen
+    after that attempt failed. It was not a request to continue a failed run."""
+    from lscli import control
+    monkeypatch.setenv("FAKE_FAIL_STAGE", "check")
+    d = _daemon(home)
+    orig = d.run_training_stage
+
+    def start_during(stage):                                      # the user runs `train start` while the stage runs
+        if stage == "check" and training.Training(home, HW).state.get("failures", {}).get("check") == 1:
+            control.train_now(home)
+        return orig(stage)
+    d.run_training_stage = start_during
+    assert _run_until(d, lambda: training.Training(home, HW).state.get("status") == "failed")
+    for _ in range(3):
+        d.tick()
+    tr = training.Training(home, HW)
+    assert tr.state["status"] == "failed" and tr.state["failures"] == {"check": 2} and "continued" not in tr.state
+    assert "continue" not in control.read_control(home)                # consumed, not left for later
+
+
+@needs_ranker
+def test_a_pending_retrain_wins_over_continuing(home, monkeypatch):
+    from lscli import control
+    monkeypatch.setenv("FAKE_FAIL_STAGE", "check")
+    d = _daemon(home)
+    assert _run_until(d, lambda: training.Training(home, HW).state.get("status") == "failed")
+    monkeypatch.delenv("FAKE_FAIL_STAGE")
+    control.train_now(home)
+    control.retrain(home, None)
+    d.tick()
+    tr = training.Training(home, HW)
+    assert tr.state["run"] == 2 and tr.state["status"] == "running" and "continued" not in tr.state
+    assert "continue" not in control.read_control(home)
 
 
 @needs_ranker

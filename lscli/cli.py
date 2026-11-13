@@ -441,7 +441,14 @@ def cmd_train(args, paths: Paths) -> int:
     st = control.read_state(paths) or {}
     if args.action == "start":
         control.train_now(paths.ensure())
-        _out(args, {"train_now": True}, "training may run outside the time window until it finishes (the GPU gate still applies)")
+        tr = training.Training(paths, st["hw_id"]) if st.get("hw_id") else None
+        failed = tr is not None and tr.state.get("status") == "failed"
+        msg = "training may run outside the time window until it finishes (the GPU gate still applies)"
+        if failed:
+            where = f"at stage {tr.next_stage_any()}" if tr.next_stage_any() else "by activating its models again"
+            msg = (f"continuing failed training run {tr.state['run']} {where} (finished stages are kept; failures were "
+                   f"{tr.state.get('failures') or {}}; a pending `train retrain` starts over instead); " + msg)
+        _out(args, {"train_now": True, "continue_failed_run": tr.state["run"] if failed else None}, msg)
         return EXIT_OK
     if args.action == "retrain":
         stages = [s.strip() for s in args.stages.split(",")] if args.stages else None
@@ -462,6 +469,9 @@ def cmd_train(args, paths: Paths) -> int:
     text = (f"training: {doc['status']}" + (f" (run {doc['run']}: {doc['reason']})" if doc.get("run") else "")
             + (f"\n  next stage {doc['stage']}, {doc['done']}/{doc['total']} done" if doc.get("stage") else "")
             + (f"\n  failures {doc['failures']}" if doc.get("failures") else "")
+            + (f"\n  stopped {'at stage ' + tr.next_stage_any() if tr.next_stage_any() else 'activating its models'}: "
+               "`lscli train start` continues this run (finished stages are kept), `lscli train retrain` starts over"
+               if doc["status"] == "failed" else "")
             + f"\nmodels: {(doc['models'] or {}).get('source', 'none')}"
             + (f"\n  trained on triton {doc['trained_env'].get('triton')}, cuBLASLt {doc['trained_env'].get('cublaslt')}, "
                f"driver {doc['trained_env'].get('driver')}" if doc.get("trained_env") else ""))

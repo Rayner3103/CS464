@@ -158,10 +158,12 @@ class Training:
         return bool(self.state.get("stages")) and self.state.get("status") == "running"
 
     def next_stage(self) -> str | None:
-        if not self.active():
-            return None
+        return self.next_stage_any() if self.active() else None
+
+    def next_stage_any(self) -> str | None:
+        """The first unstamped stage of the run, whatever its status (where a failed run stopped)."""
         done = self.done()
-        return next((s for s in self.state["stages"] if s not in done), None)
+        return next((s for s in self.state.get("stages") or [] if s not in done), None)
 
     def begin(self, change: set[str], stages: list[str], env: dict, reason: str, request_t: float | None = None) -> None:
         """Start a training run for `stages` (run in train_best order) in a new run directory, seeded from the previous
@@ -182,9 +184,30 @@ class Training:
         f = self.state.setdefault("failures", {})
         f[stage] = f.get(stage, 0) + 1
         if f[stage] >= MAX_STAGE_FAILURES:
-            self.state["status"] = "failed"
+            self.mark_failed()
         self.save()
         return f[stage]
+
+    def mark_failed(self) -> None:
+        self.state["status"] = "failed"
+        self.state["failed_t"] = time.time()
+        self.save()
+
+    def continue_failed(self, request_t: float | None = None) -> bool:
+        """`lscli train start` after a failure: the same run directory goes on from its first unstamped stage, with every
+        finished stage kept and the failure counts cleared (each stage gets MAX_STAGE_FAILURES attempts again). Only a
+        run whose status is `failed`, and only for a request made after it failed (`request_t`): the daemon reads the
+        request between jobs, so one made while the failing stage was still running must not un-fail it. Returns
+        whether the run was continued."""
+        if self.state.get("status") != "failed" or self.run_dir is None:
+            return False
+        if request_t is not None and request_t < (self.state.get("failed_t") or 0.0):
+            return False
+        self.state["status"] = "running"
+        self.state.setdefault("continued", []).append({"t": time.time(), "failures": self.state.get("failures", {})})
+        self.state["failures"] = {}
+        self.save()
+        return True
 
     def record_success(self, stage: str) -> None:
         if self.state.get("failures", {}).pop(stage, None) is not None:
