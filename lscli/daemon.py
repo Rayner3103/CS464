@@ -316,6 +316,7 @@ class Daemon:
             raise
         finally:
             job.close()
+        self.gate.job_ended(self.clock())       # the check below must not count the stage's own utilization (as search)
         if code != 0 or stage not in tr.done():
             # train_best's own idle-GPU check or lock can lose a race with a user process that appeared after our
             # gate poll: a quick failure with the GPU now busy is a preemption, not a broken stage.
@@ -468,7 +469,10 @@ class Daemon:
         if not (res.get("choice") or {}).get("key"):
             raise jobs.JobError("no valid kernel")
         # Final check, after the worker is gone: a foreign process that appeared since the last watch poll (<= 1 s)
-        # may have overlapped the last samples. Then nothing is written (spec 4.2).
+        # may have overlapped the last samples. Then nothing is written (spec 4.2). The utilization NVML reports now is
+        # still the worker's own: start the post-job grace first, or the check would count it as a busy GPU and restart
+        # the idle clock (one search per gpu_idle_minutes instead of back to back). A foreign process still counts.
+        self.gate.job_ended(self.clock())
         late = self.gate_reasons(own=set())
         if any(r.startswith("compute process") for r in late):
             self.reasons = late
