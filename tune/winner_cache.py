@@ -238,17 +238,19 @@ class WinnerCache:
         return True
 
     def reload(self) -> None:
-        """(Re)read the file; hard-stale lines (another GPU, changed kernel source) and unreadable lines are skipped."""
-        self._rows, self._verified = {}, set()
+        """(Re)read the file; hard-stale lines (another GPU, changed kernel source) and unreadable lines are skipped. The
+        new tables are built aside and swapped in at the end, so a reader in another thread sees the old table or the new
+        one, never an empty or half-filled one."""
+        rows, verified = {}, set()
         self._stamp = self._file_stamp()     # taken before reading: a line appended meanwhile costs one more reload, never a miss
         try:
             lines = self.path.read_text(errors="replace").splitlines()   # damaged bytes spoil their line, not the file
         except OSError:
-            return
+            lines = []
         for r, line in self._parse(lines):
             if r.get("kind") == "verified":
                 if r.get("env") == self.env:
-                    self._verified.add(r.get("id"))
+                    verified.add(r.get("id"))
                 continue
             t, fields = tier(r, self.env)
             if t == "hard":
@@ -256,7 +258,8 @@ class WinnerCache:
             r = {k: v for k, v in r.items() if k not in _RESERVED}
             r["id"] = _row_id(r, line)
             r["_stale"] = fields
-            self._rows.setdefault(self._key(r["M"], r["N"], r["K"], r["dtype"]), {})[t] = r
+            rows.setdefault(self._key(r["M"], r["N"], r["K"], r["dtype"]), {})[t] = r
+        self._rows, self._verified = rows, verified
 
     def __len__(self) -> int:
         """Shapes with a current entry."""

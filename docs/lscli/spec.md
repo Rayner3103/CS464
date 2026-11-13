@@ -22,7 +22,7 @@ implementation plan (branches, PRs, order of work) is [`plan.md`](plan.md). Anyt
 
 | Component | Runs in | Needs | Does |
 |---|---|---|---|
-| **client** (`lscli` package: `lscli.enable()`, the patch) | the user's own Python env | torch, triton, numpy, nvidia-ml-py | counts shapes, dispatches cached winners, falls back to torch, queues misses |
+| **client** (`lscli.enable()`, the patch; `src/` on the env's path via `lscli.pth`) | the user's own Python env | torch, triton, numpy, nvidia-ml-py (+ lightgbm / pandas for the optional inline search) | counts shapes, dispatches cached winners, falls back to torch, queues misses |
 | **worker** (`python -m lscli.worker`) | the user's interpreter, started by the daemon | same as the client | compiles, validates and times one proposed pool (`tune.online.measure`), writes the winner |
 | **daemon** (`lscli daemon run`, unit `lscli.service`) | `~/.local/share/lscli/venv` (pinned versions) | the repo's `requirements.txt` | idle gate, scheduler, Triton ranking and the router (CPU: LightGBM), training, model registry, cache compaction. The daemon process itself never creates a CUDA context |
 | **proposer** (`python -m lscli.propose`) | the daemon venv, started per search job | same as the daemon | the GPU-needing part of ranking: the learned cuBLASLt ranker's proposals (`propose_lt`), which build descriptors and call `cublasLtMatmulAlgoCheck` |
@@ -314,22 +314,27 @@ program first runs them.
 ### 5.1 Enabling
 
 * `import lscli; lscli.enable()` patches for the rest of the process; `lscli.disable()` restores torch.
-* `LSCLI_PATCH=1` in the environment enables it at interpreter start-up, through `lscli.pth` (installed by
-  `lscli enable-env`), which imports nothing unless the variable is set.
+* `LSCLI_PATCH=1` in the environment enables it through `lscli.pth` (installed by `lscli enable-env`). The hook
+  imports nothing unless the variable is set. It then enables the client right after the program's own `import
+  torch`: it never imports torch or initializes CUDA itself, so `CUDA_VISIBLE_DEVICES` set in-script still works and
+  programs without torch pay nothing.
 * `LSCLI_DISABLE=1` overrides both (a kill switch).
 
 ### 5.2 Which calls are dispatched
 
-`torch.matmul(a, b)`, `a @ b` and `torch.mm(a, b)` are handled when all of these hold:
+`torch.matmul(a, b)`, `a @ b`, `torch.mm(a, b)`, `a.matmul(b)` and `a.mm(b)` are handled when all of these hold:
 
-* both are CUDA tensors on the current device;
+* exactly two positional arguments: keyword calls (`input=`, `out=`, ...) go to torch with their arguments as given;
+* both are plain tensors or `nn.Parameter`s (other subclasses keep their own dispatch), on CUDA;
+* the tensors' device is the current device;
 * that device's UUID equals the daemon's GPU (`gpu_uuid` in `client.json`), so `CUDA_VISIBLE_DEVICES` cannot route a
   winner to another card;
 * the dtype is fp16 or bf16, both operands have the same dtype, and both are 2-D;
 * M, N and K are in [1, 16384];
 * both are contiguous with 16-byte-aligned data pointers;
 * `out=` is not given;
-* the call is not inside `torch.compile` tracing or CUDA-graph capture.
+* the call is not inside `torch.compile` tracing (compiled code uses torch's op), CUDA-graph capture, `torch.autocast`
+  (torch's cast semantics apply), a `torch.func` transform (`grad`, `vmap`, `jvp`) or forward-mode AD.
 
 The kernel runs inside an `autograd.Function` only when an operand requires grad. Its backward calls the **original**
 (unpatched) `torch.matmul`.
@@ -365,19 +370,38 @@ Every other call goes to the original torch function untouched. `F.linear` is wr
      study's 2 % margin is for full-protocol medians and is too small for these.
    Otherwise call torch, which is still counted as a hit: the selector chose torch.
 
-A dispatched call never raises a new exception type. On any error the client calls torch, disables dispatch for that
-shape for the rest of the process, and logs one warning.
+A dispatched call never raises a new exception type. Routing errors are contained and the call goes to torch. On
+a kernel error the client calls torch, disables dispatch for that shape for the rest of the process, and logs one
+warning.
+
+* **Threads.** Decisions run outside the client's lock with a per-shape guard. While one thread decides a shape,
+  other threads calling it get torch. Reloading the table swaps it in atomically.
+* **Large soft-stale entries.** A soft-stale entry whose correctness check would allocate more than 512 MiB in the
+  user's process is not checked there: the call uses torch and a `stale` re-search is queued.
 
 ### 5.4 Overhead budget
 
-`tests/lscli/test_overhead.py` measures the host time per call (the median over 10,000 calls, with the CPU model
-printed) against an unpatched `torch.matmul`:
+`tests/test_lscli_client.py::test_overhead` measures the host time per call (median of 10,000 calls; the CPU is
+printed):
 
-* **Undispatched call** (wrong dtype, layout, device, ...): at most +5 µs.
-* **Dispatched hit:** at most +15 µs.
+* **Undispatched call** (wrong dtype, layout, device, ...): at most +5 µs over the unpatched function.
+* **Dispatched hit:** at most +20 µs over calling the selected kernel directly (`backend.make_runner(a, b)()`). That
+  launch itself costs more than torch's (a Triton launch from Python takes tens of µs). This is why dispatch is limited
+  to kernels of at least `min_kernel_us`, where the launch runs ahead of the GPU.
 
-The budgets are reviewed once the test exists; dispatch is restricted to kernels of at least `min_kernel_us` for this
-reason.
+Measured on the RTX 2060 box (x86_64), after all the scope checks of 5.2:
+
+* +2.3 µs for an early exit (fp32; torch takes 11.5 µs);
+* +3.7 µs for a late exit (fp16, non-contiguous);
+* +13.5 µs for a dispatched call over a 36.9 µs Triton launch.
+
+The dispatched budget was raised from 15 to 20 µs once measured. The routing checks cost 4.7 µs timed alone but
+about 13 µs when interleaved with a Triton launch: each check costs more next to the launcher (the usage count goes
+from 0.75 to 3.3 µs), which points to CPU cache effects, so the cost is real. Measured runs give 13-14 µs; the budget
+leaves room for machine noise.
+
+The test syncs often enough that the launch queue never fills, because a full queue would count GPU time as host
+overhead.
 
 ## 6. CLI
 
@@ -386,8 +410,8 @@ reason.
 | Command | Synopsis | Effect |
 |---|---|---|
 | `status` | `lscli status [--watch]` | Daemon state, gate and reasons, current job, queue, training progress, cache tiers, client hit rate (from the profile) |
-| `enable-env` | `lscli enable-env [PYTHON]` (default: `python3` on `PATH`) | Install the client into that interpreter's env (`pip install --no-deps` from `src/`, then numpy / nvidia-ml-py if missing), write `lscli.pth`, register in `envs.json`, queue the env's shapes for search |
-| `disable-env` | `lscli disable-env PYTHON` | Remove `lscli.pth` and the client package; unregister |
+| `enable-env` | `lscli enable-env [PYTHON] [--no-deps]` (default: `python3` on `PATH`) | Needs torch + triton importable there. Refuses if the env has its own `lscli` / `tune` / `kernels` / `baselines` / `analysis` package. pip-installs numpy / nvidia-ml-py if missing (`--no-deps`: fail instead). Writes `lscli.pth` into the env's site-packages: it puts `src/` on the path and runs the `LSCLI_PATCH` hook. Registers the env in `envs.json` and queues the shapes the profile already knows for it |
+| `disable-env` | `lscli disable-env PYTHON` | Remove `lscli.pth`; unregister |
 | `envs` | `lscli envs` | List registered interpreters and their versions |
 | `pause` / `resume` | `lscli pause [--for DURATION]`, `lscli resume` | Stop starting jobs (a running one is preempted) / clear the pause |
 | `prewarm` | `lscli prewarm (--shapes FILE \| MxNxK ...) [--dtype fp16] [--env ID]` | Queue shapes (`manual`); FILE is a shapes JSON (`suites/` format) |
@@ -476,8 +500,9 @@ night trains in whatever window it is awake for. Without linger, the service sto
 ## 9. Known limitations (v1)
 
 * NN only: workloads whose GEMMs go through `nn.Linear` are counted but not sped up.
-* The client package installs top-level `tune`, `kernels` and `baselines` packages into the user's env. A user
-  package with one of these names conflicts; `enable-env` refuses if it finds one.
+* The client puts `src/` on the user's env path (`lscli.pth`), so lscli's top-level `tune`, `kernels`, `baselines` and
+  `analysis` packages become importable there. A user package with one of these names conflicts; `enable-env` refuses
+  if it finds one. Code updates reach every env with the next `src/` update; there is no per-env copy.
 * Winners are timed in idle conditions and served under load; near-ties (within 4 % at ≥ 50 µs at stock clocks, 3 %
   locked; 5 % below, borrowed: graph timing has no noise study) are arbitrary.
 * A user env whose Triton is not the bundle's version gets no prebuilt kernels: its compiles happen in the worker,
