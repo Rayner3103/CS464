@@ -80,7 +80,7 @@ half_life_days = 30         # decay of the usage record
 dispatch = true             # false = count shapes only, never dispatch
 inline_search = true        # search inline on a miss of a frequent shape (section 5.3)
 min_kernel_us = 50          # never dispatch when torch's kernel is shorter than this (host launch cost dominates)
-min_saving_us = 5           # nor when the winner saves less than this per call vs torch (also needs >= 2 %)
+min_saving_us = 5           # nor when the winner saves less than this per call vs torch (also needs >= 4 %, 3 % locked)
 
 [clock]
 lock_mhz = 0                # 0 = measure at stock clocks; > 0 must equal the helper's /etc/lscli/clock.conf (set at install)
@@ -406,7 +406,11 @@ Every other call goes to the original torch function untouched. `F.linear` is wr
    * **Otherwise**, call torch and queue `miss` once per process.
 6. **Dispatch rule.** Dispatch only when the entry has `torch_us` and both conditions hold:
    * `torch_us >= min_kernel_us`: under 50 µs the Python-side Triton launch costs as much as the kernel;
-   * `torch_us - winner_us >= max(min_saving_us, 0.02 · torch_us)`: the 2 % tie margin of the study.
+   * `torch_us - winner_us >= max(min_saving_us, f · torch_us)` with f = 0.04 when the entry was timed at stock clocks
+     (`env.clock_lock` "unlocked", or not declared) and f = 0.03 under a declared clock lock. Both times come from
+     the short online timing (10 cold samples, one placement), whose kernel-vs-kernel error at >= 50 µs is p95 3.5 %
+     unlocked and 2.7 % locked on the 3080 (`reports/week1.md` 2026-11-13, `analysis/noise_compare.py`). The
+     study's 2 % margin is for full-protocol medians and is too small for these.
    Otherwise call torch, which is still counted as a hit: the selector chose torch.
 
 A dispatched call never raises a new exception type. Routing errors are contained and the call goes to torch. On
@@ -550,8 +554,8 @@ night trains in whatever window it is awake for. Without linger, the service sto
 * The client puts `src/` on the user's env path (`lscli.pth`), so lscli's top-level `tune`, `kernels`, `baselines` and
   `analysis` packages become importable there. A user package with one of these names conflicts; `enable-env` refuses
   if it finds one. Code updates reach every env with the next `src/` update; there is no per-env copy.
-* Winners are timed in idle conditions and served under load; near-ties (within 2 % at ≥ 50 µs, 5 % below) are
-  arbitrary.
+* Winners are timed in idle conditions and served under load; near-ties (within 4 % at ≥ 50 µs at stock clocks, 3 %
+  locked; 5 % below, borrowed: graph timing has no noise study) are arbitrary.
 * A user env whose Triton is not the bundle's version gets no prebuilt kernels: its compiles happen in the worker,
   in idle time.
 * Zero-shot quality depends on the GPU: close to native on sm_86 (3090), Triton half useless on sm_75 (2060), where
