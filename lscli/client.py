@@ -17,7 +17,8 @@ Per call:
      miss -> an inline `select_kernel` for shapes the usage record counts as frequent (once per process, needs lightgbm
      and the models in client.json; the ranker is loaded once per process), otherwise torch + queue `miss` once.
      Decisions run outside the global lock with a per-shape guard: another thread meanwhile gets torch;
-  4. dispatch rule: the entry's `torch_us` >= `min_kernel_us` and `torch_us - winner_us >= max(min_saving_us, 2 %)`.
+  4. dispatch rule: the entry's `torch_us` >= `min_kernel_us` and `torch_us - winner_us >= max(min_saving_us, f)`,
+     f = 4 % of torch_us for an entry timed at stock clocks, 3 % under a declared clock lock (`saving_frac`).
 A failure of a dispatched kernel falls back to torch, disables that shape for the process and warns once. Under
 autograd the kernel runs inside an `autograd.Function` whose backward calls the ORIGINAL torch.matmul.
 
@@ -44,6 +45,12 @@ _PLAIN = (torch.Tensor, torch.nn.Parameter)
 MAX_DIM = 16384
 FLUSH_S = 30.0
 VERIFY_MAX_BYTES = 512 << 20
+# Smallest relative saving the dispatch rule trusts. torch_us and winner_us both come from the short online timing
+# (10 cold samples, one placement); its kernel-vs-kernel error at >= 50 us is p95 3.5 % at stock clocks and 2.7 %
+# under a 1755 MHz lock on the 3080, rounded up (reports/week1.md 2026-11-13, analysis/noise_compare.py). The study's
+# 2 % tie margin is for full-protocol medians and is too small for these timings.
+SAVING_FRAC_UNLOCKED = 0.04
+SAVING_FRAC_LOCKED = 0.03
 _UNSET = object()
 
 
@@ -85,14 +92,21 @@ class _Mm(torch.autograd.Function):
         return ga, gb, None
 
 
+def saving_frac(entry: dict) -> float:
+    """The relative saving an entry must show, from the clock policy it was timed under (`env.clock_lock`): a declared
+    lock (a MHz value) gets SAVING_FRAC_LOCKED; "unlocked", or no declaration, gets the larger SAVING_FRAC_UNLOCKED."""
+    lock = str((entry.get("env") or {}).get("clock_lock") or "unlocked").strip().lower()
+    return SAVING_FRAC_UNLOCKED if lock in ("unlocked", "none", "off", "0") else SAVING_FRAC_LOCKED
+
+
 def dispatch_rule(entry: dict, settings: dict) -> bool:
     """Spec 5.3 step 6: dispatch only kernels where torch takes >= min_kernel_us (below that the Python-side launch costs
-    as much as the kernel) and the winner saves >= max(min_saving_us, 2 %) (the study's tie margin). An entry without
-    `torch_us` (written outside lscli) is never dispatched."""
+    as much as the kernel) and the winner saves >= max(min_saving_us, saving_frac(entry) * torch_us) (the noise of the
+    short timing both were measured with). An entry without `torch_us` (written outside lscli) is never dispatched."""
     t, w = entry.get("torch_us"), entry.get("winner_us")
     if t is None or w is None or t < settings["min_kernel_us"]:
         return False
-    return t - w >= max(settings["min_saving_us"], 0.02 * t)
+    return t - w >= max(settings["min_saving_us"], saving_frac(entry) * t)
 
 
 def _env_id(paths) -> str:
