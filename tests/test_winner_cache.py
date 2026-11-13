@@ -113,6 +113,116 @@ def test_a_broken_cache_never_breaks_selection(tmp_path, fake_search):
     assert sel["choice"]["key"] == KEY and not sel["cached"]
 
 
+def test_a_cache_that_cannot_be_built_never_breaks_selection(tmp_path, fake_search, monkeypatch):
+    """`cache=True` builds the default cache inside select_kernel: reading the environment (NVML, the kernel source, the
+    library versions) can fail, and that is a cache problem like any other."""
+    monkeypatch.setenv("TUNE_WINNER_CACHE", str(tmp_path / "w.jsonl"))
+
+    def boom(**k):
+        raise FileNotFoundError("kernels/triton_matmul.py")
+    monkeypatch.setattr("tune.winner_cache.environment", boom)
+    monkeypatch.setattr(online, "model_ids", lambda ranker: None)
+    with pytest.warns(UserWarning, match="winner cache unavailable"):
+        sel = online.select_kernel(None, 64, 64, 64, cache=True, use_bundle=False, lt_n=0)
+    assert sel["choice"]["key"] == KEY and not sel["cached"] and not (tmp_path / "w.jsonl").exists()
+
+
+def test_damaged_bytes_and_wrong_types_cost_their_line_not_the_cache(tmp_path, fake_search, monkeypatch):
+    p = tmp_path / "w.jsonl"
+    WinnerCache(p, env=ENV).put(64, 64, 64, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})
+    good = p.read_bytes()
+    bad_type = json.dumps({"schema": 2, "env": ENV, "M": "x", "N": 8, "K": 8, "dtype": "fp16", "k": 3, "lt_n": 0}).encode()
+    p.write_bytes(b"\xff\xfe\x00 not utf-8\n" + bad_type + b"\n" + good)
+    wc = WinnerCache(p, env=ENV)                                                    # used to raise UnicodeDecodeError
+    assert len(wc) == 1 and wc.get(64, 64, 64, "fp16", k=3)["choice"]["key"] == KEY
+    monkeypatch.setenv("TUNE_WINNER_CACHE", str(p))
+    monkeypatch.setattr("tune.winner_cache.environment", lambda **k: dict(ENV))
+    monkeypatch.setattr(online, "model_ids", lambda ranker: None)
+    assert online.select_kernel(None, 64, 64, 64, cache=True, use_bundle=False, lt_n=0)["cached"]
+    assert wc.compact() == {"before": 3, "after": 1} and p.read_bytes() == good    # compaction drops the unreadable lines
+
+
+def test_default_cache_is_built_once_and_refreshed_when_the_file_changes(tmp_path, fake_search, monkeypatch):
+    """A cache hit through `cache=True` must not re-read and re-parse the whole file (it did, on every call)."""
+    p = tmp_path / "w.jsonl"
+    monkeypatch.setenv("TUNE_WINNER_CACHE", str(p))
+    monkeypatch.setattr("tune.winner_cache.environment", lambda **k: dict(ENV))
+    monkeypatch.setattr(online, "model_ids", lambda ranker: None)
+    loads = []                                                                       # the instances that (re)read the file
+    reload = WinnerCache.reload
+    monkeypatch.setattr(WinnerCache, "reload", lambda self: loads.append(self) or reload(self))
+    kw = dict(cache=True, use_bundle=False, lt_n=0)
+    sels = [online.select_kernel(None, 64, 64, 64, **kw) for _ in range(5)]
+    assert [s["cached"] for s in sels] == [False, True, True, True, True] and len(fake_search) == 1
+    mine = WinnerCache.default()
+    assert mine is WinnerCache.default() and loads == [mine]                         # one load: its own put is not a change
+    WinnerCache(p, env=ENV).put(128, 64, 64, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})   # "another process"
+    assert online.select_kernel(None, 128, 64, 64, **kw)["cached"] and loads.count(mine) == 2   # seen on the next call
+    assert online.select_kernel(None, 128, 64, 64, **kw)["cached"] and loads.count(mine) == 2
+    WinnerCache(p, env=ENV).compact()                                                # a rewrite (new inode) is a change too
+    assert online.select_kernel(None, 64, 64, 64, **kw)["cached"] and loads.count(mine) == 3
+    other = {**ENV, "driver": "600"}                                                 # another environment: another instance
+    monkeypatch.setattr("tune.winner_cache.environment", lambda **k: dict(other))
+    assert WinnerCache.default().env == other and not online.select_kernel(None, 64, 64, 64, **kw)["cached"]
+
+
+def test_refresh_sees_a_line_another_writer_appended_between_two_puts(tmp_path):
+    p = tmp_path / "w.jsonl"
+    a, b = WinnerCache(p, env=ENV), WinnerCache(p, env=ENV)
+    a.put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})
+    assert a.refresh() is False                                                      # its own line
+    b.put(9, 9, 9, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})    # b never read a's line ...
+    a.put(10, 10, 10, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})  # ... and a writes after b's
+    assert a.get(9, 9, 9, "fp16") is None and a.refresh() is True and a.get(9, 9, 9, "fp16") is not None
+    assert b.refresh() is True and len(b) == 3 and b.refresh() is False
+
+
+def _model(stem, text):
+    for ext in (".txt", ".json"):
+        (stem.parent / (stem.name + ext)).write_text(text + ext)
+    return stem
+
+
+def test_model_id_names_the_files_content(tmp_path):
+    from tune.winner_cache import model_id
+    a = model_id(_model(tmp_path / "lgbm_rank_v2", "trees"))
+    assert a.startswith("lgbm_rank_v2:") and len(a.split(":")[1]) == 12 and a == model_id(tmp_path / "lgbm_rank_v2")
+    assert model_id(_model(tmp_path / "lgbm_rank_v2", "other trees")) != a          # retrained under the same name
+    assert model_id(None) is None and model_id(tmp_path / "missing") is None
+
+
+def test_default_cache_declares_the_models_so_a_retrained_ranker_is_searched_again(tmp_path, fake_search, monkeypatch):
+    """`select_kernel(cache=True)` after a retrain: the old winner came from another model's proposals. It is soft-stale
+    (a miss by default), not served as current."""
+    import types
+    ranker = types.SimpleNamespace(stem=_model(tmp_path / "lgbm_rank_v2", "trees"), features="v2")
+    monkeypatch.setenv("TUNE_WINNER_CACHE", str(tmp_path / "w.jsonl"))
+    lt_stem = _model(tmp_path / "lt_rank", "lt")
+    monkeypatch.setattr("baselines.cublaslt_rank.default_stem", lambda: lt_stem)
+    monkeypatch.setattr("tune.router.default_stem", lambda: tmp_path / "no_router")
+    monkeypatch.setattr("tune.winner_cache.environment",
+                        lambda models=None, **k: {**ENV, **({"models": models} if models is not None else {})})
+    kw = dict(cache=True, use_bundle=False, lt_n=0)
+    a, b = online.select_kernel(ranker, 64, 64, 64, **kw), online.select_kernel(ranker, 64, 64, 64, **kw)
+    assert not a["cached"] and b["cached"] and len(fake_search) == 1
+    ids = json.loads((tmp_path / "w.jsonl").read_text())["env"]["models"]
+    assert ids == online.model_ids(ranker) and ids["triton"].startswith("lgbm_rank_v2:") and ids["router"] is None
+    assert ids["lt_rank"].startswith("lt_rank:")
+    _model(tmp_path / "lgbm_rank_v2", "retrained trees")
+    c = online.select_kernel(ranker, 64, 64, 64, **kw)
+    assert not c["cached"] and len(fake_search) == 2                                # searched again with the new model
+    old = WinnerCache(tmp_path / "w.jsonl", env={**ENV, "models": online.model_ids(ranker)})
+    assert old.get(64, 64, 64, "fp16", k=3)["stale"] == []                          # ... and that result is current
+    _model(tmp_path / "lt_rank", "retrained lt")                                    # any model of the set counts
+    stale = WinnerCache(tmp_path / "w.jsonl", env={**ENV, "models": online.model_ids(ranker)})
+    assert stale.get(64, 64, 64, "fp16", k=3) is None
+    assert stale.get(64, 64, 64, "fp16", k=3, allow_stale=True)["stale"] == ["models"]
+    # a cache the caller built keeps the caller's environment: nothing is added to it
+    mine = WinnerCache(tmp_path / "mine.jsonl", env=ENV)
+    online.select_kernel(ranker, 64, 64, 64, cache=mine, use_bundle=False, lt_n=0)
+    assert "models" not in json.loads((tmp_path / "mine.jsonl").read_text())["env"]
+
+
 def test_stale_cublaslt_winner_is_a_miss(tmp_path, fake_search, monkeypatch):
     wc = WinnerCache(tmp_path / "w.jsonl", env=ENV)
     wc.put(64, 64, 64, "fp16", k=3, lt_n=4, lt_knn=online.KNN_DEFAULT,
@@ -224,6 +334,7 @@ def test_router_is_on_only_when_the_bundle_does_not_serve_the_kernels(tmp_path, 
 # ---------------------------------------------------------------------------------------------- schema 2: staleness tiers
 
 ENV2 = {**ENV, "torch": "2.13.0", "cuda_runtime": "13.0", "vbios": "94.02", "kernel_src": "aaaa", "clock_lock": "1755"}
+SCOPED = {**ENV2, "env_id": "py-a"}     # one interpreter's entries: the scope in which `compact` prunes superseded lines
 LT_CHOICE = {"key": "h0_a1_t2_s3_sk1_r0_sw0_c0", "family": "cublaslt"}
 
 
@@ -271,7 +382,11 @@ def test_current_entry_wins_over_a_wider_stale_one_only_when_wide_enough(tmp_pat
     wc.put(8, 8, 8, "fp16", k=3, lt_n=16, choice={"key": KEY, "family": "triton"})
     assert wc.get(8, 8, 8, "fp16", k=3, lt_n=16, allow_stale=True)["choice"]["key"] == KEY
     assert wc.get(8, 8, 8, "fp16", k=5, lt_n=16, allow_stale=True)["choice"]["key"] == "old"
-    assert wc.get(8, 8, 8, "fp16", k=5, lt_n=16) is None and wc.stale_entries() == []
+    assert wc.get(8, 8, 8, "fp16", k=5, lt_n=16) is None
+    # the stale entry is still served (for k = 5), so it is still listed for a re-search ...
+    assert [(e["choice"]["key"], e["k"], e["stale"]) for e in wc.stale_entries()] == [("old", 5, ["driver"])]
+    wc.put(8, 8, 8, "fp16", k=5, lt_n=16, choice={"key": KEY, "family": "triton"})
+    assert wc.stale_entries() == [] and wc.get(8, 8, 8, "fp16", k=5, lt_n=16, allow_stale=True)["stale"] == []   # ... until redone
 
 
 def test_mark_verified_persists_for_the_same_environment_only(tmp_path):
@@ -286,11 +401,11 @@ def test_mark_verified_persists_for_the_same_environment_only(tmp_path):
 
 def test_compact_drops_re_searched_lines_and_keeps_unsearched_stale_ones(tmp_path):
     p = tmp_path / "w.jsonl"
-    old = {**ENV2, "driver": "590"}
+    old = {**SCOPED, "driver": "590"}
     WinnerCache(p, env=old).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": "old8", "family": "triton"})
     WinnerCache(p, env=old).put(9, 9, 9, "fp16", k=3, lt_n=0, choice={"key": "old9", "family": "triton"})
-    WinnerCache(p, env={**ENV2, "hw_id": "gpu-b"}).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": "b8", "family": "triton"})
-    wc = WinnerCache(p, env=ENV2)
+    WinnerCache(p, env={**SCOPED, "hw_id": "gpu-b"}).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": "b8", "family": "triton"})
+    wc = WinnerCache(p, env=SCOPED)
     wc.mark_verified(wc.get(9, 9, 9, "fp16", allow_stale=True))
     wc.put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": "new8", "family": "triton"})      # 8^3 re-searched here
     with open(p, "a") as f:
@@ -298,11 +413,11 @@ def test_compact_drops_re_searched_lines_and_keeps_unsearched_stale_ones(tmp_pat
     assert wc.compact() == {"before": 6, "after": 4}
     keys = [json.loads(x).get("choice", {}).get("key") for x in p.read_text().splitlines()]
     assert keys == ["old9", "b8", "new8", None]                                       # None: the verification line
-    again = WinnerCache(p, env=ENV2)
+    again = WinnerCache(p, env=SCOPED)
     assert again.get(8, 8, 8, "fp16")["choice"]["key"] == "new8"
     assert again.get(9, 9, 9, "fp16", allow_stale=True)["verified"]
     wc.put(10, 10, 10, "fp16", k=3, lt_n=0, choice={"key": KEY, "family": "triton"})        # writers still append after the rename
-    assert WinnerCache(p, env=ENV2).get(10, 10, 10, "fp16") is not None
+    assert WinnerCache(p, env=SCOPED).get(10, 10, 10, "fp16") is not None
 
 
 def test_select_kernel_serves_a_stale_entry_after_one_correctness_check(tmp_path, fake_search, monkeypatch):
@@ -332,13 +447,88 @@ def test_select_kernel_serves_a_stale_entry_after_one_correctness_check(tmp_path
 
 def test_compact_keeps_an_older_wider_stale_search(tmp_path):
     p = tmp_path / "w.jsonl"
-    WinnerCache(p, env={**ENV2, "driver": "590"}).put(8, 8, 8, "fp16", k=5, lt_n=16, choice={"key": "wide", "family": "triton"})
-    WinnerCache(p, env={**ENV2, "driver": "591"}).put(8, 8, 8, "fp16", k=3, lt_n=16, choice={"key": "narrow-old", "family": "triton"})
-    wc = WinnerCache(p, env=ENV2)
+    WinnerCache(p, env={**SCOPED, "driver": "590"}).put(8, 8, 8, "fp16", k=5, lt_n=16, choice={"key": "wide", "family": "triton"})
+    WinnerCache(p, env={**SCOPED, "driver": "591"}).put(8, 8, 8, "fp16", k=3, lt_n=16, choice={"key": "narrow-old", "family": "triton"})
+    wc = WinnerCache(p, env=SCOPED)
     wc.put(8, 8, 8, "fp16", k=3, lt_n=16, choice={"key": KEY, "family": "triton"})
     assert wc.compact() == {"before": 3, "after": 2}
     assert wc.get(8, 8, 8, "fp16", k=5, lt_n=16, allow_stale=True)["choice"]["key"] == "wide"
     assert wc.get(8, 8, 8, "fp16", k=3, lt_n=16)["choice"]["key"] == KEY
+
+
+def _keys(p):
+    return [json.loads(x).get("choice", {}).get("key") for x in p.read_text().splitlines()]
+
+
+def _put(p, env, key, M=8, **kw):
+    WinnerCache(p, env=env).put(M, 8, 8, "fp16", **{"k": 3, "lt_n": 16, **kw}, choice={"key": key, "family": "triton"})
+
+
+def test_compact_without_env_id_never_drops_another_environments_line(tmp_path):
+    """Two interpreters on one GPU sharing the file (torch 2.13 / 2.14), neither names itself: a line that is stale for
+    the compactor is the other one's current entry. Whichever searched last, both keep their winner."""
+    a, b = {**ENV2, "torch": "2.13.0"}, {**ENV2, "torch": "2.14.0"}
+    for first, second in ((a, b), (b, a)):
+        p = tmp_path / f"w{first['torch']}.jsonl"
+        _put(p, first, "first")
+        _put(p, second, "second")
+        assert WinnerCache(p, env=a).compact() == {"before": 2, "after": 2}
+        assert WinnerCache(p, env=first).get(8, 8, 8, "fp16", k=3, lt_n=16)["choice"]["key"] == "first"
+        assert WinnerCache(p, env=second).get(8, 8, 8, "fp16", k=3, lt_n=16)["choice"]["key"] == "second"
+
+
+def test_compact_from_a_process_that_declares_less_keeps_the_declared_entries(tmp_path):
+    """No declared clock lock means the clock is not compared, so a 1755 MHz line reads as current here; it is still
+    another environment's line and survives this process's compaction."""
+    p = tmp_path / "w.jsonl"
+    locked, undeclared = {**ENV2, "clock_lock": "1755"}, {**ENV2, "clock_lock": None}
+    for env in (locked, undeclared, {**locked, "env_id": "py-a"}, {**undeclared, "env_id": "py-a"}):
+        _put(p, env, f"lock-{env['clock_lock']}-{env.get('env_id')}")
+    for env in (undeclared, {**undeclared, "env_id": "py-a"}):
+        assert WinnerCache(p, env=env).compact() == {"before": 4, "after": 4}
+    assert _keys(p) == ["lock-1755-None", "lock-None-None", "lock-1755-py-a", "lock-None-py-a"]
+    assert WinnerCache(p, env={**locked, "env_id": "py-a"}).get(8, 8, 8, "fp16", k=3, lt_n=16)["choice"]["key"] == "lock-1755-py-a"
+    p2 = tmp_path / "w2.jsonl"                                # the two-line case of the review, no env_id anywhere
+    _put(p2, locked, "at-1755")
+    _put(p2, undeclared, "undeclared")
+    assert WinnerCache(p2, env=undeclared).compact() == {"before": 2, "after": 2}
+    assert WinnerCache(p2, env=locked).get(8, 8, 8, "fp16", k=3, lt_n=16)["choice"]["key"] == "at-1755"
+
+
+def test_compact_drops_exact_duplicates_everywhere_and_superseded_lines_only_in_its_own_scope(tmp_path):
+    p = tmp_path / "w.jsonl"
+    old_a, old_b = {**SCOPED, "driver": "590"}, {**SCOPED, "driver": "590", "env_id": "py-b"}
+    _put(p, {**ENV2, "driver": "590"}, "plain-old")          # no env_id: stale here, kept (nobody says whose it is)
+    _put(p, ENV2, "plain-1")
+    _put(p, ENV2, "plain-2")                                 # same environment as the line before: replaces it
+    _put(p, old_b, "b-old")                                  # another interpreter's scope: untouched
+    _put(p, {**SCOPED, "env_id": "py-b"}, "b-new")
+    _put(p, old_a, "a-old")                                  # this scope, stale, re-searched below: dropped
+    _put(p, SCOPED, "a-new")
+    wc = WinnerCache(p, env=SCOPED)
+    assert wc.compact() == {"before": 7, "after": 5}
+    assert _keys(p) == ["plain-old", "plain-2", "b-old", "b-new", "a-new"]
+    assert WinnerCache(p, env=ENV2).compact() == {"before": 5, "after": 5}      # a compactor without env_id prunes no scope
+
+
+def test_compact_keeps_a_stale_line_written_after_the_current_one(tmp_path):
+    """The interpreter was upgraded and searched again while this compactor still holds the old environment (a daemon's
+    cached copy): the newer line is the live one and must survive."""
+    p = tmp_path / "w.jsonl"
+    _put(p, SCOPED, "before-upgrade")
+    _put(p, {**SCOPED, "torch": "2.14.0"}, "after-upgrade")
+    assert WinnerCache(p, env=SCOPED).compact() == {"before": 2, "after": 2}
+    assert WinnerCache(p, env={**SCOPED, "torch": "2.14.0"}).get(8, 8, 8, "fp16", k=3, lt_n=16)["choice"]["key"] == "after-upgrade"
+    assert WinnerCache(p, env={**SCOPED, "torch": "2.14.0"}).compact() == {"before": 2, "after": 1}   # the upgraded side prunes
+    assert _keys(p) == ["after-upgrade"]
+
+
+def test_environment_env_id_is_only_stored_when_given(monkeypatch):
+    import tune.winner_cache as wc
+    for name in ("_nvml_handle", "hw_id"):
+        monkeypatch.setattr(f"tune.env.{name}", lambda *a: None)
+    monkeypatch.setattr("baselines.cublaslt.library_info", lambda: {"version": 1})
+    assert "env_id" not in wc.environment() and wc.environment(env_id="py-a")["env_id"] == "py-a"
 
 
 def test_a_put_after_a_torn_line_is_not_glued_onto_it(tmp_path):
