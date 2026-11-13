@@ -135,3 +135,49 @@ def test_no_ranker_is_a_cuBLASLt_only_search_stored_with_k0(fakes, tmp_path):
     assert e["k"] == 0 and e["lt_rank"] == 0 and e["lt_knn"] == 0
     none = online.select_kernel(online.LT_ONLY, 64, 64, 64, lt_n=0, cache=wc, use_bundle=False)
     assert none["choice"] is None and none["reason"] == "no_candidates"
+
+
+def test_measure_labels_cublaslt_rows_whatever_lt_n_says(fakes):
+    """`lt_n` is optional in `measure`: leaving it out must not turn the cuBLASLt candidates into Triton ones (`choose`
+    would stop considering them past the first k rows, or return a cuBLASLt key with family "triton")."""
+    log, ranker = fakes
+    lt, _ = online.propose_lt(64, 64, 64, torch.float16, 4, 0, 2)
+    tri, _ = online.propose_triton(ranker, 64, 64, 64, 3)
+    with_n = online.measure(64, 64, 64, torch.float16, lt, tri, lt_n=4)
+    without = online.measure(64, 64, 64, torch.float16, lt, tri)
+    assert [c.get("family") for c in with_n["candidates"]] == ["triton"] * 3 + ["cublaslt"] * 3 + ["cublaslt_rank"] * 2
+    assert [c.get("family") for c in without["candidates"]] == [None] * 3 + ["cublaslt"] * 3 + ["cublaslt_rank"] * 2
+    for k in (1, 3, 8):
+        a, b = online.choose(with_n["candidates"], k), online.choose(without["candidates"], k)
+        assert (a["key"], a["family"], a["rank"]) == (b["key"], b["family"], b["rank"]) and a["family"] == "cublaslt"
+    assert backend_for_family(online.choose(without["candidates"], 8)) == "cublaslt"
+    # a Triton-only pool keeps the row format written before cuBLASLt joined the search (no "family")
+    assert all("family" not in c for c in online.measure(64, 64, 64, torch.float16, [], tri)["candidates"])
+
+
+def backend_for_family(choice):
+    from tune.winner_cache import backend_for
+    return backend_for(choice, 64, 64, 64, torch.float16, 4).family
+
+
+def test_backends_from_keys_asks_for_as_many_heuristics_as_the_keys_name(fakes, monkeypatch):
+    log, ranker = fakes
+    lt, _ = online.propose_lt(64, 64, 64, torch.float16, 4, 0, 0)
+    keys = online.proposal_keys(lt)
+    asked = []
+    monkeypatch.setattr("baselines.cublaslt.candidates", lambda M, N, K, dtype, n:
+                        asked.append(n) or [_LT(f"h{i}_a{i}_t1_s1_sk1_r0_sw0_c0") for i in range(min(n, 3))])
+    back = online.backends_from_keys(keys, 64, 64, 64, torch.float16)              # no lt_n: the keys say how wide
+    assert [k for _, k, _, _ in back] == [k["key"] for k in keys] and len(back) == 3 and asked == [3]
+    assert [k for _, k, _, _ in online.backends_from_keys(keys + [{"family": "cublaslt", "key": "h15_a9_t1_s1_sk1_r0_sw0_c0"}],
+                                                          64, 64, 64, torch.float16)] == [k["key"] for k in keys]
+    assert asked == [3, 16]                                                        # one query per call, wide enough for h15
+    capped = online.backends_from_keys(keys, 64, 64, 64, torch.float16, lt_n=1)    # an explicit width still bounds it
+    assert [k[:2] for _, k, _, _ in capped] == ["h0"] and asked[-1] == 1
+    assert online.backends_from_keys([], 64, 64, 64) == [] and len(asked) == 3     # nothing to rebuild: no query
+
+
+def test_backends_from_keys_drops_a_malformed_key(fakes):
+    back = online.backends_from_keys([{"family": "triton", "key": KEYS[0]}, {"family": "triton", "key": "bm64_garbage"},
+                                      {"family": "cublaslt_rank", "key": "r0_a9_t3_s1_sk1_r0_sw0_c0"}], 64, 64, 64)
+    assert [(f, k) for f, k, _, _ in back] == [("triton", KEYS[0]), ("cublaslt_rank", "r0_a9_t3_s1_sk1_r0_sw0_c0")]
