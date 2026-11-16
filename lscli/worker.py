@@ -2,7 +2,8 @@
 cuBLASLt that will run it.
 
   <python> -m lscli.worker measure     one JSON request on stdin -> JSON lines on the protocol channel
-  <python> -m lscli.worker env         this interpreter's winner-cache environment
+  <python> -m lscli.worker env [--hw-id HW]   this interpreter's winner-cache environment (with --hw-id: no CUDA context;
+                                       an `error` line starting "needs CUDA" when that is not possible here)
   <python> -m lscli.worker verify --cache PATH [--env-extra JSON]   correctness gate over every entry served here
 
 Protocol channel: the worker's original stdout. Before anything else is imported, fd 1 is duplicated to a private
@@ -103,6 +104,52 @@ def environment(env_extra: dict | None = None) -> dict:
     from tune.winner_cache import environment as wc_env
     extra = dict(env_extra or {})
     env = wc_env(models=extra.pop("models", None), clock_lock=extra.pop("clock_lock", None))
+    return {**env, **extra}
+
+
+class NeedsCuda(RuntimeError):
+    """A CUDA-free environment probe cannot answer here; the daemon re-runs it with CUDA (gate open, gpu.lock held)."""
+
+
+def _proc_maps() -> str:
+    with open("/proc/self/maps") as f:
+        return f.read()
+
+
+def _mapped_cublaslt_version() -> int:
+    """cublasLtGetVersion() of the libcublasLt this process has mapped. `import torch` maps it with no CUDA context, and
+    it is the library `baselines.cublaslt.library_info` would bind (that one runs a matmul first to make torch load it)."""
+    import ctypes
+    import re
+    paths = sorted(set(re.findall(r"\S*libcublasLt\.so[\S]*", _proc_maps())))
+    if not paths:
+        raise NeedsCuda("libcublasLt is not loaded by `import torch` in this interpreter")
+    lib = ctypes.CDLL(paths[0])
+    lib.cublasLtGetVersion.restype = ctypes.c_size_t
+    return int(lib.cublasLtGetVersion())
+
+
+def static_environment(env_extra: dict | None, hw_id: str) -> dict:
+    """`environment(env_extra)` without a CUDA context (spec 4.1, environment probes): the same fields, with `hw_id`
+    given (cached per GPU by the daemon, `lscli/hwcache.py`) and the cuBLASLt version read from the mapped library.
+    Raises NeedsCuda when that is not possible, or if anything initialized CUDA after all."""
+    import torch
+    import triton
+    from tune.env import _nvml_handle, _safe
+    from tune.winner_cache import clock_lock_declared, kernel_src_hash
+    import pynvml
+    extra = dict(env_extra or {})
+    models, clock = extra.pop("models", None), extra.pop("clock_lock", None)
+    h = _nvml_handle()
+    env = {"hw_id": hw_id, "triton": triton.__version__, "cublaslt": _mapped_cublaslt_version(),
+           "driver": _safe(pynvml.nvmlSystemGetDriverVersion) if h else None,
+           "torch": torch.__version__, "cuda_runtime": torch.version.cuda,
+           "vbios": _safe(pynvml.nvmlDeviceGetVbiosVersion, h) if h else None,
+           "kernel_src": kernel_src_hash(), "clock_lock": clock_lock_declared(clock)}
+    if models is not None:
+        env["models"] = models
+    if torch.cuda.is_initialized():
+        raise NeedsCuda("CUDA was initialized while reading the environment")
     return {**env, **extra}
 
 
@@ -209,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("measure")
     e = sub.add_parser("env")
     e.add_argument("--env-extra", default="{}")
+    e.add_argument("--hw-id", help="this GPU's hw_id (lscli/hwcache.py): read the environment without a CUDA context")
     v = sub.add_parser("verify")
     v.add_argument("--cache", required=True)
     v.add_argument("--env-extra", default="{}")
@@ -222,11 +270,17 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("no request on stdin")
             res = measure_request(json.loads(line), proto)
         elif args.cmd == "env":
-            res = {"env": environment(json.loads(args.env_extra)), "python": sys.executable}
+            extra = json.loads(args.env_extra)
+            env = static_environment(extra, args.hw_id) if args.hw_id else environment(extra)
+            res = {"env": env, "python": sys.executable}
         else:
             res = verify(args.cache, json.loads(args.env_extra))
         proto.send({"op": "result", **res, "wall_s": time.perf_counter() - t0})
         return 0
+    except NeedsCuda as ex:  # not an error of the env: the daemon probes it again with CUDA, gated
+        from lscli.hwcache import NEEDS_CUDA
+        proto.send({"op": "error", "error": f"{NEEDS_CUDA}: {ex}"})
+        return 1
     except Exception as ex:  # report, never hang the daemon
         import traceback
         traceback.print_exc()

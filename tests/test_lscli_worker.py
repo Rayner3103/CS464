@@ -119,3 +119,36 @@ def test_cache_ls_rates_tiers_against_the_registered_env(tmp_path, monkeypatch, 
     (row,) = json.loads(capsys.readouterr().out)
     assert row["tier"] == "current" and row["env_id"] == eid
     assert cli.main(["cache", "compact"]) == 0 and cli.main(["cache", "verify"]) == 0
+
+
+@requires_cuda
+def test_env_with_hw_id_is_the_same_doc_without_a_cuda_context():
+    """`env --hw-id` (the daemon's probes once hw_id is cached) gives exactly the doc `env` gives with CUDA, and the
+    process never initializes CUDA nor appears as a compute process."""
+    extra = json.dumps({"clock_lock": "unlocked", "models": {"triton": "t:1"}, "env_id": "e1"})
+
+    def env(*argv):
+        r = subprocess.run([sys.executable, "-m", "lscli.worker", "env", "--env-extra", extra, *argv], cwd=REPO,
+                           capture_output=True, text=True)
+        return _lines(r.stdout)[-1]
+    cuda = env()["env"]
+    assert env("--hw-id", cuda["hw_id"])["env"] == cuda
+    code = ("import json, os, sys, pynvml, torch; from lscli.worker import static_environment; "
+            "e = static_environment({}, 'hw'); pynvml.nvmlInit(); h = pynvml.nvmlDeviceGetHandleByIndex(0); "
+            "print(json.dumps([torch.cuda.is_initialized(), "
+            "any(p.pid == os.getpid() for p in pynvml.nvmlDeviceGetComputeRunningProcesses(h)), e['cublaslt']]))")
+    init, listed, lt = json.loads(subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True,
+                                                 text=True).stdout.splitlines()[-1])
+    assert not init and not listed and lt == cuda["cublaslt"]
+
+
+def test_env_with_hw_id_says_needs_cuda_when_cublaslt_is_not_mapped(monkeypatch):
+    from lscli import hwcache, worker
+    monkeypatch.setattr(worker, "_proc_maps", lambda: "")
+    with pytest.raises(worker.NeedsCuda):
+        worker.static_environment({}, "hw")
+    out = []
+    monkeypatch.setattr(worker, "_channel", lambda: None)
+    monkeypatch.setattr(worker._Proto, "send", lambda self, obj: out.append(obj))
+    assert worker.main(["env", "--hw-id", "hw"]) == 1
+    assert out[-1]["op"] == "error" and out[-1]["error"].startswith(hwcache.NEEDS_CUDA)
