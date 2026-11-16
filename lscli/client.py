@@ -15,7 +15,8 @@ Per call:
      entry -> one correctness check per environment (`mark_verified`; skipped for shapes whose check would allocate more
      than VERIFY_MAX_BYTES in the user's process: torch is used and a re-search queued), dispatch, queue `stale` once;
      miss -> an inline `select_kernel` for shapes the usage record counts as frequent (once per process, needs lightgbm
-     and the models in client.json; the ranker is loaded once per process), otherwise torch + queue `miss` once.
+     and the models in client.json; the ranker is loaded once per process; torch.matmul is short-timed after the search
+     and stored as the entry's `torch_us`, as the daemon's worker does), otherwise torch + queue `miss` once.
      Decisions run outside the global lock with a per-shape guard: another thread meanwhile gets torch;
   4. dispatch rule: the entry's `torch_us` >= `min_kernel_us` and `torch_us - winner_us >= max(min_saving_us, f)`,
      f = 4 % of torch_us for an entry timed at stock clocks, 3 % under a declared clock lock (`saving_frac`).
@@ -218,10 +219,14 @@ class _Client:
             if self.ranker is None:
                 from analysis.learned import Ranker
                 self.ranker = Ranker.load(stem)
+            from lscli.worker import torch_time_us
             from tune.online import KPolicy, select_kernel
             pol = KPolicy(self.search["k"], self.search["k_frequent"], self.search["frequent_calls"])
+            # torch_us for the dispatch rule, timed after the search as the daemon's worker does: without it the
+            # entry would never be dispatched, and the daemon would still count the shape as searched
             sel = select_kernel(self.ranker, *key[:3], calls=int(calls), policy=pol, lt_n=self.search["lt_n"],
-                                dtype=dtype, cache=self.wc, use_bundle=False, serve_stale=True)
+                                dtype=dtype, cache=self.wc, use_bundle=False, serve_stale=True,
+                                extra=lambda: {"torch_us": torch_time_us(*key[:3], dtype), "lscli": True})
             return self.wc.get(*key, k=1, lt_n=0, allow_stale=True) if sel.get("choice") else None
         except Exception as e:                       # lightgbm / models missing in this env: behave as a miss
             self.inline_ok = False
