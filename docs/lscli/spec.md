@@ -24,7 +24,7 @@ implementation plan (branches, PRs, order of work) is [`plan.md`](plan.md). Anyt
 |---|---|---|---|
 | **client** (`lscli.enable()`, the patch; `src/` on the env's path via `lscli.pth`) | the user's own Python env | torch, triton, numpy, nvidia-ml-py (+ lightgbm / pandas for the optional inline search) | counts shapes, dispatches cached winners, falls back to torch, queues misses |
 | **worker** (`python -m lscli.worker`) | the user's interpreter, started by the daemon | same as the client | compiles, validates and times one proposed pool (`tune.online.measure`), writes the winner |
-| **daemon** (`lscli daemon run`, unit `lscli.service`) | `~/.local/share/lscli/venv` (pinned versions) | the repo's `requirements.txt` | idle gate, scheduler, Triton ranking and the router (CPU: LightGBM), training, model registry, cache compaction. The daemon process itself never creates a CUDA context |
+| **daemon** (`lscli daemon run`, unit `lscli.service`) | `~/.local/share/lscli/venv` (pinned versions) | the repo's `requirements.txt` | idle gate, scheduler, Triton ranking and the router (CPU: LightGBM), training, model registry, cache compaction. The daemon process itself never creates a CUDA context; its environment probes open one only with the gate open (section 4.1) |
 | **proposer** (`python -m lscli.propose`) | the daemon venv, started per search job | same as the daemon | the GPU-needing part of ranking: the learned cuBLASLt ranker's proposals (`propose_lt`), which build descriptors and call `cublasLtMatmulAlgoCheck` |
 | **CLI** (`lscli ...`) | the daemon venv (on `PATH` via `~/.local/bin/lscli`) | same as the daemon | user commands, section 6 |
 | **clock helper** (`/usr/local/libexec/lscli-clock`, optional) | root, via one sudoers rule | `nvidia-smi` | locks the SM clock around idle jobs and restores the state it found (section 4.6) |
@@ -212,6 +212,17 @@ outside the job appears. Utilization is not checked then, because the job itself
 A job's processes are the job's root process and all its descendants, found by walking `/proc/<pid>/task/*/children`
 each poll (sweep compile workers are spawned grandchildren). NVML reports host PIDs: processes in other PID namespaces
 (containers) may appear with PIDs that match nothing, and they count as foreign. This errs on the side of yielding.
+
+**Environment probes** (the environment doc of the daemon venv and of each registered env, section 3.6) open no CUDA
+context. A doc needs CUDA for two fields only: `hw_id` (SM count and memory from the device properties, which NVML
+cannot give exactly) and the cuBLASLt version. The worker reads the cuBLASLt version from the library `import torch`
+maps, with no context, and takes `hw_id` from `gpu_hw.json`, where it is stored per NVML UUID the first time it is
+computed (`lscli/hwcache.py`). Probes run at daemon start, once a day per env, after a model or config change and
+when a worker reports a different environment. A probe that needs CUDA runs only while the gate is open, under
+`gpu.lock`, like a job: the first probe of a GPU not yet in `gpu_hw.json`, an env whose worker cannot read the
+cuBLASLt version without a context, and any probe when NVML lists more than one GPU or `CUDA_VISIBLE_DEVICES` is set
+to anything but `0`. Until then the daemon has no `hw_id` (no models, no searches) or the env stays unknown (its
+requests stay queued). A search's own environment, measured in the job with CUDA, also refreshes `gpu_hw.json`.
 
 ### 4.2 Preemption
 
@@ -466,7 +477,7 @@ overhead.
 | `pause` / `resume` | `lscli pause [--for DURATION]`, `lscli resume` | Stop starting jobs (a running one is preempted) / clear the pause |
 | `prewarm` | `lscli prewarm (--shapes FILE \| MxNxK ...) [--dtype fp16] [--env ID]` | Queue shapes (`manual`); FILE is a shapes JSON (`suites/` format) |
 | `profile` | `lscli profile [--top N] [--layout NN\|NT]` | The usage record, hottest first |
-| `cache` | `lscli cache ls [--stale]` / `verify` / `compact` / `clear [--yes]` | List entries with tiers; run the correctness check on every entry served here; compact; delete the file. `ls` with one env, `verify` and `compact` start the env's worker (a CUDA context; `verify` runs every cached kernel): they hold `gpu.lock` while it runs, refuse while a daemon job holds it (`lscli pause` first), and ask before using a GPU that other processes are computing on (`--yes` answers; without a terminal they refuse) |
+| `cache` | `lscli cache ls [--stale]` / `verify` / `compact` / `clear [--yes]` | List entries with tiers; run the correctness check on every entry served here; compact; delete the file. `verify` starts the env's worker, which opens a CUDA context and runs every cached kernel; `ls` with one env and `compact` start it to read the environment, which needs no context once the GPU's `hw_id` is in `gpu_hw.json` (section 4.1, environment probes). With a context they hold `gpu.lock` while it runs, refuse while a daemon job holds it (`lscli pause` first), and ask before using a GPU that other processes are computing on (`--yes` answers; without a terminal they refuse); without one they do neither |
 | `train` | `lscli train status` / `start` / `retrain [--stages S,...]` | Training progress; allow training now (window ignored, gate still required); force stages |
 | `config` | `lscli config [KEY [VALUE]]` | Show / get / set a config key (`idle.window`, ...) and tell the daemon to reload. Setting rewrites `config.toml` in full from the validated config: comments are not kept and every default is written out (it no longer follows a changed default); a file with an unknown key is refused, not rewritten |
 | `logs` | `lscli logs [-f] [--job ID]` | Daemon or job log |

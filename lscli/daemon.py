@@ -7,8 +7,10 @@ process tree when it fails (spec 4.2), followed by `backoff_minutes` of backoff.
 
 The daemon process never creates a CUDA context (NVML only, LightGBM on the CPU). Everything that touches the GPU runs
 in a job: the cuBLASLt ranker's proposals (`python -m lscli.propose`, daemon venv) and the measurement
-(`<env python> -m lscli.worker measure`, the user's interpreter). Its own environment (hw_id) comes from a worker run
-under the daemon's interpreter at start.
+(`<env python> -m lscli.worker measure`, the user's interpreter). Environments (the daemon venv's, with its hw_id, and
+each registered env's) come from `lscli.worker env` runs that open no CUDA context once this GPU's hw_id is in
+`gpu_hw.json` (`lscli/hwcache.py`); a probe that needs a context (the first one on a GPU, or an env whose worker
+cannot read the cuBLASLt version without one) runs only with the gate open and gpu.lock held (`probe_gated`).
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-from lscli import __version__, config, control, envs, gate, jobs, models, scheduler, training, usage
+from lscli import __version__, config, control, envs, gate, hwcache, jobs, models, scheduler, training, usage
 from lscli import search_queue as queue
 from lscli.files import locked, read_json, write_json
 from lscli.paths import Paths
@@ -37,6 +39,7 @@ ENV_REFRESH_S = 86400.0
 ENV_RETRY_S = 600.0                  # a registered env whose probe failed is retried this often (not every tick)
 PROPOSE_TIMEOUT_S = 300.0
 HEARTBEAT_S = 5.0
+NEEDS_CUDA = object()                # `_worker_env` result: the CUDA-free probe cannot answer here, probe it gated
 
 
 class Daemon:
@@ -56,6 +59,7 @@ class Daemon:
         self.env_docs: dict[tuple, tuple[float, dict]] = {}
         self.env_failed: dict[str, float] = {}               # env id -> last failed probe
         self.unknown_envs: set[str] = set()                  # registered, but no environment yet (probe failed)
+        self.need_cuda: set[str] = set()                     # env ids ("daemon": this venv) waiting for a gated probe
         self.wcs: dict[str, tuple] = {}                      # env id -> (env doc, file stamp, WinnerCache)
         self.last_heartbeat = 0.0
         self.daemon_env: dict = {}
@@ -81,17 +85,67 @@ class Daemon:
         self.load_models()
 
     def resolve_hw(self) -> bool:
-        """Probe the daemon venv's environment (hw_id, versions) in a worker; retried on later ticks until it works
-        (the driver may not be ready at login). Returns True when it just became known."""
+        """Probe the daemon venv's environment (hw_id, versions) in a worker, with no CUDA context: only when this GPU's
+        hw_id is cached (`lscli/hwcache.py`). Otherwise the first gated probe learns it (`probe_gated`). Retried on later
+        ticks until it works (the driver may not be ready at login). Returns True when it just became known."""
         if self.hw_id:
             return False
-        doc = self._worker_env(self.python, {})
-        if not doc:
-            return False
-        self.daemon_env, self.hw_id = doc, doc.get("hw_id")
         if not self.identity.get("uuid"):
             self.identity = gate.gpu_identity()
-        return bool(self.hw_id)
+        hw = hwcache.known(self.paths, self.identity)
+        if hw is None:
+            self.need_cuda.add("daemon")
+            return False
+        doc = self._worker_env(self.python, {}, hw)
+        if doc is NEEDS_CUDA:
+            self.need_cuda.add("daemon")
+            return False
+        if not doc:
+            return False
+        self.daemon_env, self.hw_id = doc, hw
+        self.need_cuda.discard("daemon")
+        return True
+
+    def probe_gated(self) -> None:
+        """The environment probes that need a CUDA context: the daemon venv's while hw_id is unknown, and the envs whose
+        CUDA-free probe could not answer. Called only with the gate open; holds gpu.lock like a job (skipped if it is
+        held). A CUDA-measured hw_id is stored for later, CUDA-free probes."""
+        if not self.need_cuda:
+            return
+        lockf = open(self.paths.gpu_lock, "a")
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lockf.close()
+            return
+        try:
+            if "daemon" in self.need_cuda:
+                doc = self._worker_env(self.python, {})
+                if isinstance(doc, dict) and doc.get("hw_id"):
+                    self.need_cuda.discard("daemon")
+                    self.daemon_env, self.hw_id = doc, doc["hw_id"]
+                    if not self.identity.get("uuid"):
+                        self.identity = gate.gpu_identity()
+                    hwcache.remember(self.paths, self.identity, self.hw_id)
+                    self.load_models()
+            if not self.hw_id:
+                return
+            registry = envs.load(self.paths)
+            now = self.clock()
+            for eid in sorted(self.need_cuda - {"daemon"}):
+                self.need_cuda.discard(eid)
+                rec = registry.get(eid)
+                if rec is None:
+                    continue
+                doc = self._worker_env(rec["python"], self.env_extra(eid))
+                if isinstance(doc, dict):
+                    self.env_docs[self._env_key(eid, rec)] = (now, doc)
+                    self.env_failed.pop(eid, None)
+                else:
+                    self.env_failed[eid] = now
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+            lockf.close()
 
     def load_models(self) -> None:
         self.models = models.active(self.paths, self.hw_id)
@@ -105,16 +159,21 @@ class Daemon:
     def env_extra(self, eid: str) -> dict:
         return {**config.env_extra(self.cfg, self.models.ids() if self.models else None), "env_id": eid}
 
-    def _worker_env(self, python: str, extra: dict) -> dict | None:
+    def _worker_env(self, python: str, extra: dict, hw_id: str | None = None):
+        """The environment doc of `python` (a worker run): with `hw_id`, read without a CUDA context (NEEDS_CUDA when
+        that is not possible there); without, the worker opens one, so only `probe_gated` calls it that way."""
         from lscli.cli import source_dir
         try:
-            r = subprocess.run([python, "-m", "lscli.worker", "env", "--env-extra", json.dumps(extra)],
+            r = subprocess.run([python, "-m", "lscli.worker", "env", "--env-extra", json.dumps(extra),
+                                *(["--hw-id", hw_id] if hw_id else [])],
                                cwd=source_dir(self.paths), capture_output=True, text=True, timeout=300,
                                stdin=subprocess.DEVNULL)
             for line in reversed(r.stdout.splitlines()):
                 doc = json.loads(line)
                 if doc.get("op") == "result":
                     return doc["env"]
+                if doc.get("op") == "error" and str(doc.get("error", "")).startswith(hwcache.NEEDS_CUDA):
+                    return NEEDS_CUDA
         except (OSError, ValueError, subprocess.TimeoutExpired) as e:
             self.log.warning("environment of %s unavailable: %s", python, e)
         return None
@@ -123,10 +182,11 @@ class Daemon:
         return (eid, json.dumps(self.env_extra(eid), sort_keys=True), rec.get("updated"))
 
     def caches(self) -> dict:
-        """{env_id: WinnerCache in that env's environment}. An environment is probed (by running the env's interpreter)
-        once a day, when the env's record or the model set changed, or when a worker reported a different one; a failed
-        probe is retried after ENV_RETRY_S and the env is listed in `unknown_envs` (its requests stay queued). A cache
-        instance is kept per env and re-read only when winners.jsonl changed."""
+        """{env_id: WinnerCache in that env's environment}. An environment is probed (by running the env's interpreter,
+        with no CUDA context) once a day, when the env's record or the model set changed, or when a worker reported a
+        different one; a failed probe is retried after ENV_RETRY_S and the env is listed in `unknown_envs` (its requests
+        stay queued). Without a hw_id nothing is probed; an env whose probe needs CUDA waits for `probe_gated`, keeping
+        its last doc if it has one. A cache instance is kept per env and re-read only when winners.jsonl changed."""
         from tune.winner_cache import WinnerCache
         out, self.unknown_envs = {}, set()
         now = self.clock()
@@ -139,13 +199,19 @@ class Daemon:
             key = self._env_key(eid, rec)
             t, doc = self.env_docs.get(key, (0.0, None))
             if doc is None or now - t > ENV_REFRESH_S:
-                if now - self.env_failed.get(eid, -1e18) < ENV_RETRY_S:
+                if not self.hw_id or eid in self.need_cuda:
+                    pass                                     # waits for probe_gated (keeps an expired doc meanwhile)
+                elif now - self.env_failed.get(eid, -1e18) < ENV_RETRY_S:
                     doc = None
                 else:
-                    doc = self._worker_env(rec["python"], self.env_extra(eid))
-                    if doc is None:
+                    got = self._worker_env(rec["python"], self.env_extra(eid), self.hw_id)
+                    if got is NEEDS_CUDA:
+                        self.need_cuda.add(eid)
+                    elif got is None:
+                        doc = None
                         self.env_failed[eid] = now
                     else:
+                        doc = got
                         self.env_docs[key] = (now, doc)
                         self.env_failed.pop(eid, None)
             if doc is None:
@@ -181,7 +247,7 @@ class Daemon:
             "pid": os.getpid(), "version": __version__, "state": self.state, "since": self.since,
             "gate": {"open": not self.reasons, "reasons": self.reasons}, "job": self.job_info,
             "backoff_until": self.backoff_until, "paused_until": ctl.get("paused_until") if control.paused(ctl) else None,
-            "gpu": self.identity, "hw_id": self.hw_id,
+            "gpu": self.identity, "hw_id": self.hw_id, "probes_waiting": sorted(self.need_cuda),
             "models": {"source": self.models.source if self.models else None,
                        "ids": self.models.ids() if self.models else None,
                        "training": training.Training(self.paths, self.hw_id).summary() if self.hw_id else None},
@@ -347,6 +413,9 @@ class Daemon:
                            else "waiting")
             self.write_state()
             return None
+        if self.need_cuda:                                 # gate open: the probes that need a CUDA context
+            self.probe_gated()
+            caches = self.caches()
         task = self.next_task(caches)
         if task is None:
             self.set_state("waiting")
@@ -484,6 +553,8 @@ class Daemon:
             rec = envs.register(self.paths, rec["python"], {**rec, **fresh})[1]
         if env:
             self.env_docs[self._env_key(eid, rec)] = (self.clock(), env)
+            if hwcache.remember(self.paths, self.identity, env.get("hw_id")):   # measured with CUDA in the job
+                self.log.info("hw_id of GPU %s stored: %s", self.identity.get("uuid"), env.get("hw_id"))
 
     def clock_lock(self, action: str) -> None:
         """Lock / reset the SM clock through the optional helper (spec 4.6); a no-op without lock_mhz."""
