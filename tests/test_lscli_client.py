@@ -86,6 +86,39 @@ def test_hit_dispatches_the_winner_and_counts(home, monkeypatch):
 
 
 @requires_cuda
+@pytest.mark.parametrize("torch_us,dispatched", [(1000.0, True), (510.0, False)])
+def test_inline_search_stores_torch_us_so_its_winner_can_be_dispatched(home, monkeypatch, torch_us, dispatched):
+    """A frequent shape missing from the table is searched inline. Its entry must carry `torch_us` (timed after the
+    search, like the daemon's worker), or the dispatch rule never accepts it. Search and torch timing are faked; the
+    dispatch is real."""
+    import analysis.learned
+    import lscli.worker
+    import tune.online
+    calls = []
+
+    def fake_search(ranker, M, N, K, k, dtype, order, lt_n, **kw):
+        calls.append("search")
+        return {"rank_s": 0.0, "candidates": [{"config_key": KEY, "family": "triton", "valid": True, "failure_reason": None,
+                                              "compile_s": 0.1, "cold_us": 500.0, "time_s": 0.01}]}
+    monkeypatch.setattr(tune.online, "search_shape", fake_search)
+    monkeypatch.setattr(lscli.worker, "torch_time_us", lambda M, N, K, dtype: calls.append("torch") or torch_us)
+    monkeypatch.setattr(analysis.learned.Ranker, "load", staticmethod(lambda stem: object()))
+    from kernels.triton_matmul import TritonMatmul
+    orig = TritonMatmul.make_runner
+    monkeypatch.setattr(TritonMatmul, "make_runner", lambda self, a, b, out=None: calls.append("run") or orig(self, a, b, out))
+    assert client.enable()
+    st = client._STATE
+    st.doc = {**st.doc, "models": {"triton": "stem"}}
+    monkeypatch.setattr(st, "_frequent_calls", lambda key: 1e9)
+    a = torch.randn(1024, 1024, device="cuda", dtype=torch.float16)
+    torch.testing.assert_close(torch.matmul(a, a), client._ORIG["matmul"](a, a), rtol=1e-2, atol=1e-1)
+    assert calls[:2] == ["search", "torch"] and ("run" in calls) == dispatched
+    (row,) = [json.loads(x) for x in home.winners.read_text().splitlines()]
+    assert row["torch_us"] == torch_us and row["winner_us"] == 500.0 and row["choice"]["key"] == KEY
+    assert queue.pending(home)[0] == []                                             # found inline: nothing queued
+
+
+@requires_cuda
 def test_out_of_scope_calls_go_to_torch_untouched(home, monkeypatch):
     _put(home, 64, 64, 64)
     client.enable()
