@@ -82,6 +82,10 @@ def test_install_refuses_an_archive_with_links(tmp_path):
 def test_install_then_uninstall(tmp_path):
     home, env = _sandbox(tmp_path)
     url, digest = _archive(tmp_path, "good")
+    old_venv = home / ".local/share/lscli/venv/bin/python"            # a venv an older Python left behind
+    old_venv.parent.mkdir(parents=True)
+    old_venv.write_text("#!/bin/sh\necho 3.10\n")
+    old_venv.chmod(0o755)
     r = subprocess.run(["bash", str(REPO / "install/install.sh"), "--repo", str(REPO), "--ref", _clean_commit(),
                         "--python", sys.executable, "--reuse-site", sys.executable, "--no-clock-helper", "--no-linger",
                         "--yes", "--models-url", url, "--models-sha256", digest], env=env, capture_output=True, text=True,
@@ -89,6 +93,7 @@ def test_install_then_uninstall(tmp_path):
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
     lh = home / ".local/share/lscli"
     assert (lh / "src/.git").is_dir() and oct(lh.stat().st_mode & 0o777) == "0o700"
+    assert "echo 3.10" not in (lh / "venv/bin/python").read_text(errors="replace")    # rebuilt (it could not run -P)
     assert (home / ".config/lscli/config.toml").exists()
     unit = (home / ".config/systemd/user/lscli.service").read_text()
     assert f"Environment=LSCLI_HOME={lh}" in unit and f"ExecStart={lh}/venv/bin/python -m lscli daemon run" in unit
@@ -97,6 +102,13 @@ def test_install_then_uninstall(tmp_path):
     assert json.loads((lh / "models/zero_shot/MODELS.json").read_text())["source"] == "zero_shot"
     v = subprocess.run([str(home / ".local/bin/lscli"), "--version"], env=env, capture_output=True, text=True)
     assert v.returncode == 0 and "lscli" in v.stdout
+    # run from a directory with its own `lscli` package (a CS464 checkout): the installed lscli still runs
+    shadow = tmp_path / "checkout"
+    (shadow / "lscli").mkdir(parents=True)
+    (shadow / "lscli" / "__init__.py").write_text("raise SystemExit('imported the checkout')\n")
+    (shadow / "lscli" / "__main__.py").write_text("raise SystemExit('imported the checkout')\n")
+    v = subprocess.run([str(home / ".local/bin/lscli"), "--version"], env=env, capture_output=True, text=True, cwd=shadow)
+    assert v.returncode == 0 and "lscli" in v.stdout and "checkout" not in v.stderr, v.stderr
     st = subprocess.run([str(home / ".local/bin/lscli"), "--json", "status"], env=env, capture_output=True, text=True)
     assert json.loads(st.stdout)["daemon"]["running"] is False
     # re-running upgrades in place and keeps the data
@@ -114,6 +126,31 @@ def test_install_then_uninstall(tmp_path):
     u = subprocess.run([sys.executable, "-m", "lscli", "uninstall", "--yes", "--purge"], env={**env, "LSCLI_HOME": str(lh)},
                        capture_output=True, text=True, cwd=REPO)
     assert u.returncode == 0 and not lh.exists() and not (home / ".config/lscli").exists()
+
+
+def test_uninstall_recognizes_the_wrapper_with_and_without_the_cwd_fix():
+    from lscli.cli import is_our_wrapper
+    for text in ('#!/bin/sh\nexport LSCLI_HOME="/h"\nexec "/h/venv/bin/python" -P -m lscli "$@"\n',
+                 '#!/bin/sh\nexport LSCLI_HOME="/h"\nexec "/h/venv/bin/python" -m lscli "$@"\n'):
+        assert is_our_wrapper(text)
+    assert not is_our_wrapper('#!/bin/sh\nexec /usr/bin/python3 -m somethingelse "$@"\n')
+
+
+def test_cli_workers_run_in_the_source_directory(tmp_path, monkeypatch):
+    """`-m lscli.worker` puts the cwd first on sys.path: a worker the CLI starts from inside a checkout must not
+    import that checkout's lscli, so it runs where the daemon's workers run."""
+    from lscli import cli
+    from lscli.paths import Paths
+    monkeypatch.setenv("LSCLI_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    seen = {}
+
+    def run(argv, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"op": "result", "env": {}}) + "\n", stderr="")
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    assert cli._worker(Paths(), sys.executable, "env")["op"] == "result"
+    assert Path(seen["cwd"]) == cli.source_dir(Paths()) != tmp_path
 
 
 def test_install_preflight_rejects_unsupported_systems(tmp_path):

@@ -303,7 +303,7 @@ def test_cache_commands_that_use_the_gpu_hold_gpu_lock_and_ask_when_it_is_busy(p
     envs.register(paths, sys.executable, {"torch": "x"})
     calls = []
 
-    def worker(python, op, *argv, **kw):
+    def worker(_paths, python, op, *argv, **kw):
         with open(paths.gpu_lock, "a") as f:                        # held by the command for the whole worker run
             with pytest.raises(BlockingIOError):
                 fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -137,17 +137,16 @@ echo "at $(git -C "$SRC" rev-parse --short HEAD)"
 # ------------------------------------------------------------------ venv
 VENV="$LSCLI_HOME/venv"
 say "venv: $VENV"
+want="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
+have="$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
+# missing, broken, or made by another Python (an older install's 3.10 venv cannot run the launcher's `-P`): start over
+[[ "$have" == "$want" ]] || rm -rf "$VENV"
 if [[ -n "$REUSE_SITE" ]]; then
   [[ -x "$VENV/bin/python" ]] || "$PYTHON" -m venv --without-pip "$VENV"
   site="$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
   "$REUSE_SITE" -c 'import site; print("\n".join(site.getsitepackages()))' > "$site/lscli-reuse.pth"
 else
-  want="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-  have="$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
-  if [[ "$have" != "$want" ]]; then                  # missing, broken, or made by another Python: start over
-    rm -rf "$VENV"
-    "$PYTHON" -m venv "$VENV"
-  fi
+  [[ -x "$VENV/bin/python" ]] || "$PYTHON" -m venv "$VENV"
   "$VENV/bin/python" -m pip install --quiet --upgrade pip
   torch_pin="$(grep -E '^torch==' "$SRC/requirements.txt" | awk '{print $1}' || true)"
   [[ -n "$torch_pin" ]] || die "no torch== pin in $SRC/requirements.txt"
@@ -156,7 +155,7 @@ else
 fi
 site="$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 echo "$SRC" > "$site/lscli-src.pth"                 # the daemon venv runs lscli / tune / ... from src/
-"$VENV/bin/python" -c 'import torch, triton, lightgbm, lscli' || die "the venv cannot import its packages"
+"$VENV/bin/python" -P -c 'import torch, triton, lightgbm, lscli' || die "the venv cannot import its packages"
 
 # ------------------------------------------------------------------ models and kernels
 if [[ -n "$MODELS_URL" ]]; then
@@ -189,12 +188,14 @@ fi
 # ------------------------------------------------------------------ config, command, unit
 mkdir -p "$CONFIG_DIR" "$BIN_DIR" "$UNIT_DIR"
 [[ -f "$CONFIG_DIR/config.toml" ]] || \
-  LSCLI_CONFIG="$CONFIG_DIR/config.toml" "$VENV/bin/python" -c \
+  LSCLI_CONFIG="$CONFIG_DIR/config.toml" "$VENV/bin/python" -P -c \
     'import os; from lscli import config; open(os.environ["LSCLI_CONFIG"], "w").write(config.dumps(config.DEFAULTS))'
 cat > "$BIN_DIR/lscli" <<EOF
 #!/bin/sh
 export LSCLI_HOME="$LSCLI_HOME"
-exec "$VENV/bin/python" -m lscli "\$@"
+# -P: never put the caller's cwd on sys.path, or `lscli` run inside a CS464 checkout would import that checkout's
+# lscli instead of this install's
+exec "$VENV/bin/python" -P -m lscli "\$@"
 EOF
 chmod 755 "$BIN_DIR/lscli"
 sed -e "s|%h/.local/share/lscli|$LSCLI_HOME|g" \
@@ -227,7 +228,7 @@ if [[ $CLOCK_HELPER == yes ]]; then
   sudo chown root:root /etc/lscli/clock.conf && sudo chmod 0644 /etc/lscli/clock.conf
   sudo install -o root -g root -m 0440 "$tmp_sudo" /etc/sudoers.d/lscli
   rm -f "$tmp_sudo"
-  LSCLI_CONFIG="$CONFIG_DIR/config.toml" LSCLI_HOME="$LSCLI_HOME" "$VENV/bin/python" -m lscli config clock.lock_mhz "$CLOCK_MHZ" >/dev/null
+  LSCLI_CONFIG="$CONFIG_DIR/config.toml" LSCLI_HOME="$LSCLI_HOME" "$VENV/bin/python" -P -m lscli config clock.lock_mhz "$CLOCK_MHZ" >/dev/null
 fi
 
 # ------------------------------------------------------------------ linger + start

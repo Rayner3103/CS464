@@ -175,10 +175,12 @@ def cmd_prewarm(args, paths: Paths) -> int:
 
 
 # ------------------------------------------------------------------------------------------------------------ cache
-def _worker(python: str, *argv: str, timeout: float = 3600) -> dict:
-    """Run `python -m lscli.worker ...` and return its result line (raises on an error line or no result)."""
+def _worker(paths: Paths, python: str, *argv: str, timeout: float = 3600) -> dict:
+    """Run `python -m lscli.worker ...` and return its result line (raises on an error line or no result). It runs in
+    lscli's source directory, as the daemon's workers do: `-m` puts the cwd first on sys.path, so a worker started from
+    inside a CS464 checkout would otherwise import that checkout's lscli / harness."""
     r = subprocess.run([python, "-m", "lscli.worker", *argv], capture_output=True, text=True, timeout=timeout,
-                       stdin=subprocess.DEVNULL)
+                       stdin=subprocess.DEVNULL, cwd=source_dir(paths))
     for line in reversed(r.stdout.strip().splitlines()):
         try:
             doc = json.loads(line)
@@ -299,7 +301,7 @@ def _cache_action(args, paths: Paths, targets: dict) -> int:
         else:
             from tune.winner_cache import tier
             (eid, e), = targets.items()
-            env = _worker(e["python"], "env", "--env-extra", json.dumps(env_extra_for(paths, eid)))["env"]
+            env = _worker(paths, e["python"], "env", "--env-extra", json.dumps(env_extra_for(paths, eid)))["env"]
             doc = []
             for r in _raw_entries(paths):
                 t, fields = tier(r, env)
@@ -321,12 +323,12 @@ def _cache_action(args, paths: Paths, targets: dict) -> int:
         extra = json.dumps(env_extra_for(paths, eid))
         try:
             if args.action == "verify":
-                res = _worker(e["python"], "verify", "--cache", str(paths.winners), "--env-extra", extra)
+                res = _worker(paths, e["python"], "verify", "--cache", str(paths.winners), "--env-extra", extra)
                 failed += res["failed"]
                 results[eid] = {"checked": len(res["entries"]), "failed": res["failed"]}
             else:                                       # compact: each env's scope with its own environment as current
                 from tune.winner_cache import WinnerCache
-                env = _worker(e["python"], "env", "--env-extra", extra)["env"]
+                env = _worker(paths, e["python"], "env", "--env-extra", extra)["env"]
                 results[eid] = WinnerCache(paths.winners, env=env).compact()
         except (RuntimeError, OSError, subprocess.TimeoutExpired) as ex:
             results[eid] = {"error": str(ex)}
@@ -344,6 +346,12 @@ _FIND = ("import importlib.util, json, sys; out = {}\n"
          "    s = importlib.util.find_spec(n)\n"
          "    out[n] = (s.origin or (list(s.submodule_search_locations or []) or [None])[0]) if s else None\n"
          "print(json.dumps(out))")
+
+
+def is_our_wrapper(text: str) -> bool:
+    """The `~/.local/bin/lscli` install.sh writes: `exec ".../venv/bin/python" -P -m lscli "$@"` (before the cwd fix,
+    without `-P`), so uninstall removes it and nothing else of that name."""
+    return re.search(r'/venv/bin/python" (-P )?-m lscli "\$@"', text) is not None
 
 
 def source_dir(paths: Paths) -> Path:
@@ -617,7 +625,7 @@ def cmd_uninstall(args, paths: Paths) -> int:
         envs.unregister(paths, eid)
     wrapper = Path.home() / ".local" / "bin" / "lscli"
     try:                                               # only the wrapper install.sh writes
-        if wrapper.exists() and '/venv/bin/python" -m lscli "$@"' in wrapper.read_text(errors="replace"):
+        if wrapper.exists() and is_our_wrapper(wrapper.read_text(errors="replace")):
             wrapper.unlink()
             done.append(f"removed {wrapper}")
     except OSError:
