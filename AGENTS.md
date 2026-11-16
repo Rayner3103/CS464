@@ -338,6 +338,7 @@ Full training of the shipped selector on another GPU (rank v1 + v2, cuBLASLt ran
 4. Noise study for graph-amortized mode (second session plus a reboot) before relying on tiny-GEMM wins. The 3080's unlocked floor is measured (2026-11-13, 3 sessions, `analysis/noise_compare.py`; not straight after a cold boot, desktop idle only).
 5. Kernel-level fixes if differentiation matters: an aligned-copy or padded path for unaligned strides, and a fused or atomic split-K reduction.
 6. Not built yet: B4 (CUTLASS), per-candidate subprocess isolation with hang timeouts (plan 7.2), adaptive sampling.
+7. Retrain the RTX 3090's rank v2 with `analysis.learned.v2_hp` (#13's rule: the best regression entry of v1's CV search when v1 chose lambdarank, as the 3090's did); its shipped v2 used `875ba36`'s rule (v1's hyperparameters, objective forced to regression). Resolve `analysis/learned.py` to #13's rule when `learned-selector-cli` meets `learned-selectors` (`docs/lscli/plan.md` section 4).
 
 ## 10. Limitations of the shipped selector (prebuilt kernels and winner cache)
 

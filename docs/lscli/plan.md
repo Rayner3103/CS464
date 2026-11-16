@@ -97,5 +97,10 @@ rebased.
   longer refreshed ahead of use (a returning shape is re-searched through the miss queue and its counts restart from
   zero). Keeping every cached shape would not bound the growth: those are the shapes that accumulate. v1 keeps every
   shape.
+* Retrain the RTX 3090's rank v2 with #13's rule (`analysis.learned.v2_hp`). The 3090's v1 grid search chose
+  lambdarank, and its shipped v2 was fit with the rule of `875ba36` on `learned-selectors` (v1's hyperparameters, objective
+  forced to regression); #13 takes the best regression entry of that same search instead. The two rules agree on every
+  GPU whose v1 search chose regression (the 3080, the 2060 runs in `data/`). When `learned-selector-cli` is merged
+  into `learned-selectors`, resolve `analysis/learned.py` to #13's rule (decided 2026-11-16).
 * Noise floor for daemon conditions: done for stock clocks on the 3080, desktop idle (2026-11-13; the dispatch margin is
   4 % unlocked / 3 % locked). Open: other GPUs, measuring while the desktop is in use, graph timing under 50 µs.
