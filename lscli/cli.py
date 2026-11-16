@@ -371,6 +371,13 @@ def _cache_action(args, paths: Paths, targets: dict, docs: dict | None = None) -
 
 # ------------------------------------------------------------------------------------------------------------ enable-env
 PTH = "lscli.pth"
+_FIND_KIND = ("import importlib.util, json, sys; out = {}\n"     # name -> [location, namespace?] or None
+              "for n in sys.argv[1:]:\n"
+              "    s = importlib.util.find_spec(n)\n"
+              "    ns = s is not None and s.origin in (None, 'namespace')\n"
+              "    out[n] = None if s is None else [(list(s.submodule_search_locations or []) or [None])[0] if ns "
+              "else s.origin, ns]\n"
+              "print(json.dumps(out))")
 PACKAGES = ("lscli", "tune", "kernels", "baselines", "analysis")
 _SITE = "import sysconfig; print(sysconfig.get_paths()['purelib'])"
 _FIND = ("import importlib.util, json, sys; out = {}\n"
@@ -392,7 +399,10 @@ def source_dir(paths: Paths) -> Path:
 
 
 def _py(python: str, *argv: str, timeout: float = 120) -> str:
-    r = subprocess.run([python, *argv], capture_output=True, text=True, timeout=timeout)
+    """Run an inspection snippet in `python`, in the caller's cwd and environment, with LSCLI_PATCH=0 so an existing
+    lscli.pth never imports lscli (or a checkout's lscli) while we look."""
+    r = subprocess.run([python, *argv], capture_output=True, text=True, timeout=timeout,
+                       env={**os.environ, "LSCLI_PATCH": "0"})
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip()[-400:] or f"exit {r.returncode}")
     return r.stdout.strip().splitlines()[-1]
@@ -439,6 +449,27 @@ def cmd_enable_env(args, paths: Paths) -> int:
         print("lscli enable-env: the env already has packages named like lscli's ("
               + ", ".join(f"{n} at {o}" for n, o in clash.items()) + "); refusing to shadow them", file=sys.stderr)
         return EXIT_FAIL
+    # Again as a program started here would see it (spec 6): from the caller's cwd, with its PYTHONPATH and user site.
+    # A CS464 checkout reachable that way shadows lscli's copy, so it is a clash too, not something to register.
+    try:
+        here = json.loads(_py(python, "-c", _FIND_KIND, *PACKAGES))
+        cwd = os.getcwd()
+    except (RuntimeError, ValueError, OSError) as e:
+        print(f"lscli enable-env: cannot inspect {python} from the current directory: {e}", file=sys.stderr)
+        return EXIT_FAIL
+    outside = {n: v for n, v in here.items()
+               if v and v[0] and not any(Path(v[0]).resolve().is_relative_to(d) for d in ours)}
+    reach = {n: v[0] for n, v in outside.items() if not v[1]}
+    if reach:
+        print(f"lscli enable-env: started from {cwd}" + (" with PYTHONPATH set" if os.environ.get("PYTHONPATH") else "")
+              + ", " + ", ".join(f"{n} resolves to {o}" for n, o in reach.items()) + " instead of lscli's copy (a CS464 "
+              "checkout?). A program started the same way would mix the two: run enable-env, and your programs, from "
+              "another directory without the checkout on PYTHONPATH, and do not enable an interpreter a checkout is "
+              "developed with (spec section 9)", file=sys.stderr)
+        return EXIT_FAIL
+    for n, (where, _) in outside.items():              # a plain directory (no __init__.py), e.g. a data folder
+        print(f"lscli enable-env: note: {where} (a directory named {n}/ without __init__.py) will be shadowed by lscli's "
+              f"{n} package for programs of this env that import {n}", file=sys.stderr)
     missing = [m for m, mod in (("numpy", "numpy"), ("nvidia-ml-py", "pynvml"))
                if json.loads(_py(python, "-I", "-c", _FIND, mod)).get(mod) is None]
     if missing:
