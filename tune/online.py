@@ -364,7 +364,8 @@ _DTYPE_NAMES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
 def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, frequent: bool | None = None,
                   policy: KPolicy = KPolicy(), lt_n: int = 16, order: str = "diverse", dtype=torch.float16,
                   cache=True, use_bundle: bool = True, lt_knn: int | None = None, lt_rank: int = RANK_DEFAULT,
-                  router: bool | str = "auto", serve_stale: bool = False) -> dict:
+                  router: bool | str = "auto", serve_stale: bool = False,
+                  extra: dict | Callable[[], dict] | None = None) -> dict:
     """First-use kernel selection for one shape with the call-count-aware k policy. `calls` (expected launches) or
     `frequent` (explicit) come from the caller; the ranker cannot know them. Searches the policy's k Triton candidates
     plus cuBLASLt's heuristic top lt_n (0 = Triton only) plus, with lt_n > 0, the configs the deep searches of the lt_knn
@@ -394,7 +395,12 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
         `serve_stale=True` also returns a soft-stale entry (timed under another driver / torch / Triton / cuBLASLt / clock /
         model set on this GPU; `tune/winner_cache.py`): it is run once through the correctness gate in this environment
         (recorded, so later processes skip it; a failure is a miss), then served with reason "cached_stale" and `stale` =
-        the differing fields, so the caller can queue a re-search. Default False: a stale entry is a miss, as before."""
+        the differing fields, so the caller can queue a re-search. Default False: a stale entry is a miss, as before.
+        `extra`: caller fields added to the stored line (`WinnerCache.put(extra=...)`; lscli stores `torch_us` for its
+        dispatch rule). A zero-argument callable is called after the search, just before the line is written, so it can
+        time something in the same state the candidates were timed in (lscli times torch.matmul there, as its daemon's
+        worker does); if it raises, nothing is stored (warned) and the selection is still returned. Not called on a
+        cache hit or a skipped shape."""
     import warnings
     bundle_serves = False
     if use_bundle:
@@ -446,7 +452,8 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
     if wc is not None:
         try:
             wc.put(M, N, K, dname, k=k, lt_n=lt_n, lt_knn=lt_knn, lt_rank=lt_rank, choice=choice, candidates=r["candidates"], order=order,
-                   ranker=f"lgbm_rank/{getattr(ranker, 'features', None) or 'v1'}")
+                   ranker=f"lgbm_rank/{getattr(ranker, 'features', None) or 'v1'}",
+                   extra=extra() if callable(extra) and choice.get("key") is not None else extra)
         except Exception as e:
             warnings.warn(f"winner cache write failed ({type(e).__name__}: {e})")
     return {**out, "choice": choice, "candidates": r["candidates"]}
