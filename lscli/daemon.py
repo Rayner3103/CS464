@@ -306,24 +306,37 @@ class Daemon:
             if req.get("stages"):
                 if tr.state.get("status") != "done" or tr.run_dir is None:
                     self.log.warning("retrain of %s refused: no finished training to start from", req["stages"])
-                else:
+                else:                                       # seeded from the previous run: keeps its mode
                     tr.begin({"manual"}, list(req["stages"]), self.daemon_env, "requested: " + ", ".join(req["stages"]),
-                             request_t=req.get("t"))
+                             request_t=req.get("t"), mode=tr.mode())
             else:
                 tr.begin({"first"}, training.stages_for({"first"}, self._with_bundle()), self.daemon_env,
-                         "requested (lscli train retrain)", request_t=req.get("t"))
+                         "requested (lscli train retrain)", request_t=req.get("t"), mode=self.cfg["train"]["mode"])
         elif not tr.active() and tr.state.get("status") != "failed" and \
                 self.clock() - self.last_train_check >= TRAIN_CHECK_S:
             self.last_train_check = self.clock()
             self._refresh_daemon_env()                      # a Triton / cuBLASLt upgrade of the daemon venv shows here
-            ch = training.changes(training.trained_env(self.paths, self.hw_id), self.daemon_env)
+            want, last = self.cfg["train"]["mode"], tr.mode()
+            done = tr.state.get("status") == "done"
+            if done and last and last != want:            # another mode: a fresh run, never seeded from that one
+                ch, reason = {"first"}, f"train.mode changed: {last} -> {want}"
+            elif done and want == last == "smoke":          # a smoke run activates nothing: do not loop on it
+                ch, reason = set(), ""
+            else:
+                ch = training.changes(training.trained_env(self.paths, self.hw_id), self.daemon_env)
+                reason = "no models for this GPU" if "first" in ch else "changed: " + ", ".join(sorted(ch))
             if ch:
-                tr.begin(ch, training.stages_for(ch, self._with_bundle()), self.daemon_env,
-                         "no models for this GPU" if "first" in ch else "changed: " + ", ".join(sorted(ch)))
+                tr.begin(ch, training.stages_for(ch, self._with_bundle()), self.daemon_env, reason,
+                         mode=want if "first" in ch else last or want)
         if not tr.active():
             self._clear_train_now()                         # nothing to train: `train start` does not linger
             return None
         stage = tr.next_stage()
+        if stage is None and tr.mode() == "smoke":          # a plumbing check: its fits are meaningless
+            tr.finish(activated=False)
+            self.log.info("training run %s done (smoke mode): models not activated", tr.state["run"])
+            self._clear_train_now()
+            return None
         if stage is None:                                    # every stage stamped: activate the new models
             try:
                 env = tr.state.get("env") or self.daemon_env  # the environment the stages ran under
@@ -370,7 +383,7 @@ class Daemon:
         script = Path(os.environ.get("LSCLI_TRAIN_SCRIPT") or src / "pipeline" / "train_best.sh")
         argv = ["bash", str(script)]
         argv += ["--resume", str(run)] if (run / "mode").exists() else \
-            ["--run-dir", str(run), "--full" if self.cfg["train"]["mode"] == "full" else "--quick"]
+            ["--run-dir", str(run), f"--{tr.mode() or self.cfg['train']['mode']}"]
         mhz = self.cfg["clock"]["lock_mhz"]
         argv += ["--skip-install", "--skip-validation", "--only", stage]
         argv += ["--clock-lock", str(mhz)] if mhz else ["--clock-lock", "none", "--allow-unlocked"]

@@ -13,7 +13,9 @@ shape and `--only` skips stamped stages. The outputs of the stages that do not r
 written again); everything else is copied, so the new run cannot change the old one through a shared inode.
 
 When `package` finishes, the run's models become this GPU's model set (`models/<hw_id>/`, swapped in atomically), with
-the training environment recorded for the next comparison.
+the training environment recorded for the next comparison. A run records its train_best mode (`train.mode`: full,
+quick, or smoke, a plumbing check whose fits are meaningless). A smoke run is never activated. A finished run in
+another mode than the configured one counts as untrained: the daemon starts a fresh run in the new mode.
 """
 from __future__ import annotations
 
@@ -163,7 +165,15 @@ class Training:
         done = self.done()
         return next((s for s in self.state["stages"] if s not in done), None)
 
-    def begin(self, change: set[str], stages: list[str], env: dict, reason: str, request_t: float | None = None) -> None:
+    def mode(self) -> str | None:
+        """The train_best mode of the current run (the state, or the `mode` file train_best writes for older runs)."""
+        if self.state.get("mode"):
+            return self.state["mode"]
+        d = self.run_dir
+        return (d / "mode").read_text().strip() or None if d and (d / "mode").exists() else None
+
+    def begin(self, change: set[str], stages: list[str], env: dict, reason: str, request_t: float | None = None,
+              mode: str | None = None) -> None:
         """Start a training run for `stages` (run in train_best order) in a new run directory, seeded from the previous
         one unless this is a full training. The number is one past every existing directory: a lost state file must
         never make it reuse (and delete) a finished run."""
@@ -174,6 +184,7 @@ class Training:
         seed(prev if "first" not in change else None, new, stages)
         self.state = {"run": n, "stages": [s for s in STAGES if s in set(stages)], "change": sorted(change),
                       "reason": reason, "env": env, "status": "running", "started": time.time(), "failures": {},
+                      "mode": mode,
                       "previous": self.state.get("run"),
                       "request_t": request_t if request_t is not None else self.state.get("request_t")}
         self.save()
@@ -190,8 +201,9 @@ class Training:
         if self.state.get("failures", {}).pop(stage, None) is not None:
             self.save()
 
-    def finish(self) -> None:
+    def finish(self, activated: bool = True) -> None:
         self.state["status"] = "done"
+        self.state["activated"] = activated
         self.state["finished"] = time.time()
         self.save()
 
@@ -200,7 +212,8 @@ class Training:
         stages = self.state.get("stages") or []
         return {"run": self.state.get("run"), "status": self.state.get("status", "none"), "reason": self.state.get("reason"),
                 "stage": self.next_stage(), "done": sum(1 for s in stages if s in done), "total": len(stages),
-                "failures": self.state.get("failures", {}), "dir": str(self.run_dir) if self.run_dir else None}
+                "failures": self.state.get("failures", {}), "dir": str(self.run_dir) if self.run_dir else None,
+                "mode": self.mode(), "activated": self.state.get("activated")}
 
 
 def activate(paths, hw_id: str, run_dir: Path, trained_env: dict) -> Path:

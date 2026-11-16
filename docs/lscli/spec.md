@@ -87,7 +87,7 @@ lock_mhz = 0                # 0 = measure at stock clocks; > 0 must equal the he
 
 [train]
 enabled = true
-mode = "full"               # "full" | "quick" (train_best.sh modes)
+mode = "full"               # "full" | "quick" | "smoke" (train_best.sh modes; smoke: a plumbing check, never activated)
 ```
 
 ### 3.2 Usage log `profile/<pid>-<t0>.jsonl` (client-written, every 30 s and at exit)
@@ -288,8 +288,8 @@ program first runs them.
   with the source's architecture (they are refused elsewhere, as in `select_kernel`). The zero-shot Triton rankers are
   used on any GPU.
 * **First training.** The daemon runs `pipeline/train_best.sh --run-dir train/<hw_id>/1 --skip-install
-  --skip-validation [--clock-lock MHZ | --clock-lock none --allow-unlocked] --full|--quick --only <stage>`
-  (`--full` or `--quick` from `train.mode`; later stages use `--resume train/<hw_id>/1 --only <stage>`). That is one stage per job, in the script's order: `preflight`, `env`, `check`,
+  --skip-validation [--clock-lock MHZ | --clock-lock none --allow-unlocked] --full|--quick|--smoke --only <stage>`
+  (the mode from `train.mode`, recorded with the run; later stages use `--resume train/<hw_id>/1 --only <stage>`). That is one stage per job, in the script's order: `preflight`, `env`, `check`,
   `roofline`, `tune_sweep`, `heldout_sweep`, `selectors`, `train_v1`, `tail_sweep`, `train_v2`, `lt_screen`,
   `lt_fit`, `tune_stage2_cold`, `tune_stage2_graph`, `router_fit`, `bundle` (only when the daemon venv's Triton
   matches a registered env), `package`, `summary`.
@@ -298,6 +298,12 @@ program first runs them.
   * It takes `src/pipeline/.lock` itself. The daemon does not hold that lock; its own jobs hold `gpu.lock`.
   * When `package` finishes, `models/` of the run is copied into `models/<hw_id>/` and activated. Every existing
     entry then becomes `superseded` (soft-stale by `models`).
+  * **Modes.** `smoke` (train_best's plumbing check: a handful of shapes per stage, still hours of GPU time) runs
+    every stage, but its models are never activated (`lscli status`: "done (smoke: models not activated)"), and a
+    finished smoke run is not repeated. A finished run whose mode differs from `train.mode` counts as untrained: the
+    next check starts a fresh, unseeded run in the configured mode. A run in progress keeps its mode; a change takes
+    effect when it ends. Retraining after an environment change (below) and `lscli train retrain --stages` keep the
+    previous run's mode.
   * `heldout_sweep` only screens the held-out shapes that `selectors` / `tune topk` need. No fit sees them.
 * **Retraining after an environment change.** The daemon compares the active `trained_env` with the daemon venv's
   environment once a day:

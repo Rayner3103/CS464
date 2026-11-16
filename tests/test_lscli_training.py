@@ -4,13 +4,14 @@ whole first training, a retraining after a cuBLASLt change, CPU stages under a b
 seconds without a GPU. The real script's stages were not run here (hours of GPU)."""
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
 
-from lscli import gate, training
+from lscli import cli, gate, training
 from lscli.files import write_json
 from lscli.paths import Paths
 
@@ -22,7 +23,7 @@ ENV = {"hw_id": HW, "triton": "3.7.1", "cublaslt": 130101, "driver": "595.99.02"
 FAKE = r"""#!/usr/bin/env bash
 RUN=""; STAGE=""; MODE=""
 while [[ $# -gt 0 ]]; do
-  case "$1" in --run-dir|--resume) RUN="$2"; shift ;; --only) STAGE="$2"; shift ;; --full) MODE=full ;; --quick) MODE=quick ;; esac
+  case "$1" in --run-dir|--resume) RUN="$2"; shift ;; --only) STAGE="$2"; shift ;; --full) MODE=full ;; --quick) MODE=quick ;; --smoke) MODE=smoke ;; esac
   shift
 done
 # like train_best.sh: hold pipeline/.lock for the whole run, refuse a busy GPU in preflight, print a lot through tee
@@ -188,6 +189,43 @@ def test_first_training_then_retraining_after_a_cublaslt_change(home):
     for _ in range(3):                                   # done: no further training starts by itself
         d.tick()
     assert training.Training(home, HW).state["run"] == 2
+
+
+def test_smoke_has_the_stages_train_best_lists():
+    """The daemon's stage list is train_best's, minus `install` and the `validate_*` stages it always skips
+    (`--skip-install --skip-validation`); the list is the same in every mode."""
+    out = subprocess.run(["bash", str(REPO / "pipeline/train_best.sh"), "--smoke", "--list-stages"], capture_output=True,
+                         text=True, check=True).stdout.split()
+    assert [s for s in out if s != "install" and not s.startswith("validate_")] == list(training.STAGES)
+
+
+@needs_ranker
+def test_a_smoke_run_is_never_activated_and_a_mode_change_starts_a_fresh_run(home):
+    """smoke: every stage runs, nothing is activated, and the finished run is not repeated. Changing train.mode then
+    starts an unseeded run in the new mode, which is activated as usual."""
+    d = _daemon(home)
+    d.cfg["train"]["mode"] = "smoke"
+    tr = lambda: training.Training(home, HW)                                     # noqa: E731
+    assert _run_until(d, lambda: tr().state.get("status") == "done")
+    run1 = home.train / HW / "1"
+    assert run1.joinpath("mode").read_text().strip() == "smoke"                  # train_best got --smoke
+    assert run1.joinpath("ran.txt").read_text().split() == training.stages_for({"first"}, False)
+    assert not (home.models / HW).exists() and d.models is None                  # nothing activated
+    s = tr().summary()
+    assert s["mode"] == "smoke" and s["activated"] is False
+    assert cli._training_line(s).startswith("training: done (smoke: models not activated")
+    for _ in range(3):                                                           # not repeated
+        d.last_train_check = 0
+        d.tick()
+    assert tr().state["run"] == 1
+    d.cfg["train"]["mode"] = "full"                                              # the user switches to a real run
+    d.last_train_check = 0
+    assert _run_until(d, lambda: d.models is not None and d.models.source == "native")
+    run2 = home.train / HW / "2"
+    assert tr().state["run"] == 2 and tr().state["reason"] == "train.mode changed: smoke -> full"
+    assert run2.joinpath("mode").read_text().strip() == "full"
+    assert run2.joinpath("ran.txt").read_text().split() == training.stages_for({"first"}, False)   # unseeded
+    assert tr().summary()["activated"] is True
 
 
 @needs_ranker

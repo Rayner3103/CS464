@@ -48,6 +48,8 @@ def _training_line(tr: dict) -> str:
         failed = ", ".join(tr.get("failures") or {})
         return (f"training: failed{f' at {failed}' if failed else ''} (run {tr['run']}, {count}; "
                 f"see `lscli train status`)")
+    if status == "done" and tr.get("mode") == "smoke":      # a plumbing check: never activated
+        return f"training: done (smoke: models not activated; run {tr['run']}, {count})"
     return f"training: {status} (run {tr['run']}, {count})"
 
 
