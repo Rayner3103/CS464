@@ -191,6 +191,50 @@ def _raw_entries(paths: Paths) -> list[dict]:
     return list(rows.values())
 
 
+def _gpu_processes() -> list[int] | None:
+    """PIDs of the compute processes on any GPU (NVML); None when NVML cannot tell."""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            return [p.pid for i in range(pynvml.nvmlDeviceGetCount())
+                    for p in pynvml.nvmlDeviceGetComputeRunningProcesses(pynvml.nvmlDeviceGetHandleByIndex(i))]
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:                               # no driver / no NVML: nothing to check against
+        return None
+
+
+def _claim_gpu(args, paths: Paths, uses: str):
+    """Guard for the cache commands that start an env's worker: reading the environment opens a CUDA context (~128 MiB
+    for 1-2 s) and `verify` also runs every cached kernel. Nothing else stops them, so: hold `gpu.lock` for the whole
+    command (the daemon skips its jobs while it is held; a held lock is a daemon job on the GPU now, which our CUDA
+    context would preempt, or another cache command: refuse), and when other processes are computing on the GPU ask first (`--yes`
+    answers; without a terminal, refuse). Returns (lock file or None, exit code)."""
+    import fcntl
+    lockf = open(paths.ensure().gpu_lock, "a")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lockf.close()
+        print(f"lscli cache {args.action}: gpu.lock is held (a daemon job on the GPU, or another lscli cache command); "
+              "retry later, or `lscli pause` first if the daemon is running a job", file=sys.stderr)
+        return None, EXIT_FAIL
+    busy = [p for p in (_gpu_processes() or []) if p != os.getpid()]
+    if busy and not args.yes:
+        msg = (f"lscli cache {args.action}: the GPU is in use (pids {', '.join(map(str, busy))}) and this {uses}, "
+               "which can disturb a measurement running there")
+        if not sys.stdin.isatty():
+            lockf.close()
+            print(msg + "; pass --yes to go ahead", file=sys.stderr)
+            return None, EXIT_USAGE
+        print(msg + ". Continue? [y/N] ", end="", file=sys.stderr, flush=True)
+        if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+            lockf.close()
+            return None, EXIT_FAIL
+    return lockf, EXIT_OK
+
+
 def cmd_cache(args, paths: Paths) -> int:
     if args.action == "clear":
         if not args.yes:
@@ -204,10 +248,27 @@ def cmd_cache(args, paths: Paths) -> int:
     except KeyError as e:
         print(f"lscli cache: {e}", file=sys.stderr)
         return EXIT_FAIL
+    if args.action == "ls" and args.stale and args.env is None and len(targets) != 1:
+        print("lscli cache ls --stale: tiers are relative to one env; pass --env ID", file=sys.stderr)
+        return EXIT_USAGE
+    if args.action != "ls" and not targets:
+        print("lscli cache: no registered env (lscli enable-env PYTHON)", file=sys.stderr)
+        return EXIT_FAIL
+    lockf = None
+    if args.action != "ls" or len(targets) == 1:       # a worker runs: it puts a CUDA context on the GPU
+        lockf, code = _claim_gpu(args, paths, "runs every cached kernel on it" if args.action == "verify"
+                                 else "opens a CUDA context on it")
+        if lockf is None:
+            return code
+    try:
+        return _cache_action(args, paths, targets)
+    finally:
+        if lockf is not None:
+            lockf.close()
+
+
+def _cache_action(args, paths: Paths, targets: dict) -> int:
     if args.action == "ls":
-        if args.stale and args.env is None and len(targets) != 1:
-            print("lscli cache ls --stale: tiers are relative to one env; pass --env ID", file=sys.stderr)
-            return EXIT_USAGE
         if args.env is None and len(targets) != 1:
             rows = _raw_entries(paths)      # no single env to rate tiers against: list the lines as stored
             doc = [{**{k: r[k] for k in ("M", "N", "K", "dtype")}, "key": r["choice"]["key"], "family": r["choice"].get("family"),
@@ -233,9 +294,6 @@ def cmd_cache(args, paths: Paths) -> int:
                          f"{f(d['torch_us'])}  {d['key']}" + (f"  ({', '.join(d['stale'])})" if d.get("stale") else ""))
         _out(args, doc, "\n".join(lines) if doc else "no entries")
         return EXIT_OK
-    if not targets:
-        print("lscli cache: no registered env (lscli enable-env PYTHON)", file=sys.stderr)
-        return EXIT_FAIL
     results, failed = {}, 0
     for eid, e in targets.items():
         extra = json.dumps(env_extra_for(paths, eid))
@@ -283,7 +341,9 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("action", choices=("ls", "verify", "compact", "clear"))
     k.add_argument("--env", help="env id or interpreter path")
     k.add_argument("--stale", action="store_true", help="ls: only entries that are not current")
-    k.add_argument("--yes", action="store_true", help="clear: confirm")
+    k.add_argument("--yes", action="store_true", help="clear: confirm; ls --env / verify / compact: go ahead even "
+                   "when other processes are using the GPU (these start the env's worker, which opens a CUDA context; "
+                   "verify runs every cached kernel)")
     k.set_defaults(fn=cmd_cache)
     return ap
 

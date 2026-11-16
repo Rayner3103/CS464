@@ -258,6 +258,60 @@ def test_cache_ls_raw_and_clear(paths, capsys):
     assert run("cache", "clear", "--yes") == 0 and not paths.winners.exists()
 
 
+class _Stdin:
+    def __init__(self, tty, answer=""):
+        self.tty, self.answer = tty, answer
+
+    def isatty(self):
+        return self.tty
+
+    def readline(self):
+        return self.answer
+
+
+def test_cache_commands_that_use_the_gpu_hold_gpu_lock_and_ask_when_it_is_busy(paths, monkeypatch, capsys):
+    """`cache verify` / `compact` / `ls` with one env start the env's worker (a CUDA context; verify runs kernels): they
+    hold gpu.lock, refuse while a daemon job holds it, and ask before using a GPU other processes are computing on."""
+    import fcntl
+    envs.register(paths, sys.executable, {"torch": "x"})
+    calls = []
+
+    def worker(python, op, *argv, **kw):
+        with open(paths.gpu_lock, "a") as f:                        # held by the command for the whole worker run
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        calls.append(op)
+        return {"entries": [], "failed": 0} if op == "verify" else {"env": {"hw_id": "g", "env_id": "x"}}
+    monkeypatch.setattr(cli, "_worker", worker)
+    monkeypatch.setattr(cli, "_gpu_processes", lambda: [])
+    assert run("cache", "verify") == 0 and run("cache", "compact") == 0 and run("cache", "ls") == 0
+    assert calls == ["verify", "env", "env"]
+
+    with open(paths.gpu_lock, "a") as held:                         # a daemon job is on the GPU
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert run("cache", "verify") == cli.EXIT_FAIL and run("cache", "ls", "--yes") == cli.EXIT_FAIL
+    assert "lscli pause" in capsys.readouterr().err and len(calls) == 3
+
+    monkeypatch.setattr(cli, "_gpu_processes", lambda: [4242])      # someone else is computing on the GPU
+    monkeypatch.setattr(sys, "stdin", _Stdin(tty=False))
+    assert run("cache", "verify") == cli.EXIT_USAGE and "--yes" in capsys.readouterr().err
+    monkeypatch.setattr(sys, "stdin", _Stdin(tty=True, answer="n\n"))
+    assert run("cache", "compact") == cli.EXIT_FAIL and "4242" in capsys.readouterr().err
+    assert len(calls) == 3
+    monkeypatch.setattr(sys, "stdin", _Stdin(tty=True, answer="y\n"))
+    assert run("cache", "verify") == 0 and calls[-1] == "verify"
+    monkeypatch.setattr(sys, "stdin", _Stdin(tty=False))
+    assert run("cache", "compact", "--yes") == 0 and calls[-1] == "env"
+
+
+def test_cache_ls_of_raw_lines_never_touches_the_gpu(paths, monkeypatch):
+    def no(*a, **k):
+        raise AssertionError("no GPU guard / worker for a raw listing")
+    monkeypatch.setattr(cli, "_claim_gpu", no)
+    monkeypatch.setattr(cli, "_worker", no)
+    assert run("cache", "ls") == 0                                  # no registered env: the lines as stored
+
+
 def test_compact_is_scoped_by_env_id(tmp_path):
     from tune.winner_cache import WinnerCache
     p = tmp_path / "w.jsonl"

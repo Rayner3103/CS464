@@ -110,6 +110,7 @@ def test_cache_ls_rates_tiers_against_the_registered_env(tmp_path, monkeypatch, 
     paths = Paths().ensure()
     eid, _ = envs.register(paths, sys.executable, {"torch": "x"})
     monkeypatch.chdir(REPO)
+    monkeypatch.setattr(cli, "_gpu_processes", lambda: [])     # tiers, not the busy-GPU prompt (no tty under pytest)
     p = _start("measure")
     req = _request(paths.winners)
     req["env_extra"]["env_id"] = eid
