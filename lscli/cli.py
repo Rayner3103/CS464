@@ -328,9 +328,14 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--version", action="version", version=f"lscli {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status", help="daemon state, gate, queue, profile").set_defaults(fn=cmd_status)
-    c = sub.add_parser("config", help="show / get / set a config key")
-    c.add_argument("key", nargs="?")
-    c.add_argument("value", nargs="?")
+    c = sub.add_parser("config", help="show / get / set a config key",
+                       description="Show the config, get one KEY, or set KEY to VALUE. Setting validates the whole config "
+                       "and rewrites config.toml from the validated values: every key is written out (defaults "
+                       "included, so they no longer follow a changed default), in a fixed order, and comments and "
+                       "formatting are not kept. A file with an unknown key or section is refused, not rewritten.")
+    c.add_argument("key", nargs="?", help="section.name, e.g. idle.window")
+    c.add_argument("value", nargs="?", help="new value; rewrites config.toml in full (comments dropped, defaults "
+                   "written out)")
     c.set_defaults(fn=cmd_config)
     sub.add_parser("envs", help="registered interpreters").set_defaults(fn=cmd_envs)
     p = sub.add_parser("profile", help="the usage record, hottest first")
