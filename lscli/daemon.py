@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-from lscli import __version__, config, control, envs, gate, hwcache, jobs, models, scheduler, training, usage
+from lscli import __version__, config, control, envs, gate, guard, hwcache, jobs, models, scheduler, training, usage
 from lscli import search_queue as queue
 from lscli.files import locked, read_json, write_json
 from lscli.paths import Paths
@@ -60,6 +60,8 @@ class Daemon:
         self.clock_locked = False                            # the helper lock this daemon set and has not reset
         self.env_docs: dict[tuple, tuple[float, dict]] = {}
         self.env_failed: dict[str, float] = {}               # env id -> last failed probe
+        self.env_blocked: dict[str, tuple] = {}              # env id -> (env key, message): the runtime guard refused
+        self.probe_error: str | None = None                  # the last worker `env` probe's error line, if any
         self.unknown_envs: set[str] = set()                  # registered, but no environment yet (probe failed)
         self.need_cuda: set[str] = set()                     # env ids ("daemon": this venv) waiting for a gated probe
         self.wcs: dict[str, tuple] = {}                      # env id -> (env doc, file stamp, WinnerCache)
@@ -90,7 +92,7 @@ class Daemon:
         """Probe the daemon venv's environment (hw_id, versions) in a worker, with no CUDA context: only when this GPU's
         hw_id is cached (`lscli/hwcache.py`). Otherwise the first gated probe learns it (`probe_gated`). Retried on later
         ticks until it works (the driver may not be ready at login). Returns True when it just became known."""
-        if self.hw_id:
+        if self.hw_id or "daemon" in self.env_blocked:
             return False
         if not self.identity.get("uuid"):
             self.identity = gate.gpu_identity()
@@ -103,6 +105,9 @@ class Daemon:
             self.need_cuda.add("daemon")
             return False
         if not doc:
+            if (self.probe_error or "").startswith(guard.PREFIX):   # the daemon venv itself: no retry until restart
+                self.env_blocked["daemon"] = ((), self.probe_error)
+                self.log.error("the daemon venv's worker refused to run: %s", self.probe_error)
             return False
         self.daemon_env, self.hw_id = doc, hw
         self.need_cuda.discard("daemon")
@@ -165,6 +170,7 @@ class Daemon:
         """The environment doc of `python` (a worker run): with `hw_id`, read without a CUDA context (NEEDS_CUDA when
         that is not possible there); without, the worker opens one, so only `probe_gated` calls it that way."""
         from lscli.cli import source_dir
+        self.probe_error = None                          # this probe's error line only, never an earlier one's
         try:
             r = subprocess.run([python, "-m", "lscli.worker", "env", "--env-extra", json.dumps(extra),
                                 *(["--hw-id", hw_id] if hw_id else [])],
@@ -174,11 +180,28 @@ class Daemon:
                 doc = json.loads(line)
                 if doc.get("op") == "result":
                     return doc["env"]
-                if doc.get("op") == "error" and str(doc.get("error", "")).startswith(hwcache.NEEDS_CUDA):
-                    return NEEDS_CUDA
+                if doc.get("op") == "error":
+                    if str(doc.get("error", "")).startswith(hwcache.NEEDS_CUDA):
+                        return NEEDS_CUDA
+                    self.probe_error = str(doc.get("error"))
+                    self.log.warning("environment of %s unavailable: %s", python, self.probe_error)
+                    return None
         except (OSError, ValueError, subprocess.TimeoutExpired) as e:
             self.log.warning("environment of %s unavailable: %s", python, e)
         return None
+
+    def block_env(self, eid: str, message: str, key: tuple | None = None) -> None:
+        """The runtime guard refused env `eid` (spec 5.1): no probe or search for it until its record changes
+        (`lscli enable-env` again) or the daemon restarts; `lscli status` / `doctor` show the message."""
+        if key is None:
+            rec = envs.load(self.paths).get(eid)
+            if rec is None:
+                return
+            key = self._env_key(eid, rec)
+        if self.env_blocked.get(eid, (None,))[0] != key:
+            self.log.warning("env %s blocked until `lscli enable-env` runs again: %s", eid, message)
+        self.env_blocked[eid] = (key, message)
+        self.env_docs = {k: v for k, v in self.env_docs.items() if k[0] != eid}
 
     def _env_key(self, eid: str, rec: dict) -> tuple:
         return (eid, json.dumps(self.env_extra(eid), sort_keys=True), rec.get("updated"))
@@ -197,10 +220,18 @@ class Daemon:
             stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
         except OSError:
             stamp = None
-        for eid, rec in envs.load(self.paths).items():
+        registry = envs.load(self.paths)
+        self.env_blocked = {e: b for e, b in self.env_blocked.items() if e in registry or e == "daemon"}
+        for eid, rec in registry.items():
             key = self._env_key(eid, rec)
+            blocked = self.env_blocked.get(eid)
+            if blocked is not None and blocked[0] != key:   # its record (or the model set) changed: try again
+                self.env_blocked.pop(eid)
+                blocked = None
             t, doc = self.env_docs.get(key, (0.0, None))
-            if doc is None or now - t > ENV_REFRESH_S:
+            if blocked is not None:                          # the runtime guard refused it: no retry loop (spec 5.1)
+                doc = None
+            elif doc is None or now - t > ENV_REFRESH_S:
                 if not self.hw_id or eid in self.need_cuda:
                     pass                                     # waits for probe_gated (keeps an expired doc meanwhile)
                 elif now - self.env_failed.get(eid, -1e18) < ENV_RETRY_S:
@@ -212,6 +243,8 @@ class Daemon:
                     elif got is None:
                         doc = None
                         self.env_failed[eid] = now
+                        if (self.probe_error or "").startswith(guard.PREFIX):
+                            self.block_env(eid, self.probe_error, key)
                     else:
                         doc = got
                         self.env_docs[key] = (now, doc)
@@ -254,7 +287,8 @@ class Daemon:
             "models": {"source": self.models.source if self.models else None,
                        "ids": self.models.ids() if self.models else None,
                        "training": training.Training(self.paths, self.hw_id).summary() if self.hw_id else None},
-            "queue": {"pending": len(pend)}, "counters": self.counters, "updated": self.clock()})
+            "queue": {"pending": len(pend)}, "counters": self.counters, "updated": self.clock(),
+            "env_errors": {eid: msg for eid, (_, msg) in self.env_blocked.items()}})
 
     def set_state(self, s: str) -> None:
         if s != self.state:
@@ -515,6 +549,8 @@ class Daemon:
             if task.kind != "train":                       # a stage's failures are counted by the Training state
                 self.failures[task.key] = self.failures.get(task.key, 0) + 1
             self.log.warning("task %s failed: %s: %s", task, type(e).__name__, e)
+            if task.env_id and str(e).startswith(guard.PREFIX):
+                self.block_env(task.env_id, str(e))
         finally:
             self.clock_lock("reset")
             self.gate.job_ended(self.clock())

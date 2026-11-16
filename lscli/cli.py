@@ -73,6 +73,8 @@ def cmd_status(args, paths: Paths) -> int:
             lines.append(f"envs waiting for a probe with CUDA (gate open): {', '.join(waiting)}")
         if st.get("job"):
             lines.append(f"job: {st['job']}")
+        for eid, msg in (st.get("env_errors") or {}).items():
+            lines.append(f"env {eid}: blocked: {msg} (fix it, then `lscli enable-env` that interpreter again)")
         if (st.get("models") or {}).get("training"):
             lines.append(_training_line(st["models"]["training"]))
     else:
