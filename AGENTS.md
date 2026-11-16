@@ -269,6 +269,10 @@ Other findings to keep in mind:
   background `while kill -0 PID` loop.
 - Killing a `tune sweep` parent orphans its spawn compile workers (~218 MiB GPU context each). Kill them by PID. Never use `pkill -f`
   with a pattern that also matches your own shell command.
+- If the lscli daemon is installed on the machine (`lscli status`), run `lscli pause` before a measurement session and start
+  only once `lscli status` shows no job: a daemon job overlaps a process that starts during it by up to ~6 s (spec 4.2). When you lock
+  the SM clock yourself, run `lscli clock hold` first, then `sudo nvidia-smi -lgc 1755,1755`; otherwise the daemon's helper or its
+  unit's restart can reset your lock (spec 4.6). Afterwards: `sudo nvidia-smi -rgc`, `lscli clock release`, `lscli resume`.
 
 **Measurement discipline:**
 - Use the standard conditions and `--clock-lock 1755` for anything that goes into a report. Long runs belong in the background
