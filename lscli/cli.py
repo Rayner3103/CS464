@@ -34,6 +34,23 @@ def _ago(t: float | None) -> str:
 
 
 # ------------------------------------------------------------------------------------------------------------ status
+def _training_line(tr: dict) -> str:
+    """One status line from the daemon's `Training.summary()`. Its `stage` is the next stage only while a run is
+    running (None once it is done or failed), so the line is built from `status`: printing `stage` alone read
+    `training: None (17/17 stages)` for a finished run and hid a failed one."""
+    status = tr.get("status") or "none"
+    if not tr.get("run"):
+        return f"training: {status}"
+    count = f"{tr.get('done')}/{tr.get('total')} stages"
+    if status == "running" and tr.get("stage"):
+        return f"training: running stage {tr['stage']} (run {tr['run']}, {count})"
+    if status == "failed":                       # no failed stage: every stage ran, activating the models failed
+        failed = ", ".join(tr.get("failures") or {})
+        return (f"training: failed{f' at {failed}' if failed else ''} (run {tr['run']}, {count}; "
+                f"see `lscli train status`)")
+    return f"training: {status} (run {tr['run']}, {count})"
+
+
 def cmd_status(args, paths: Paths) -> int:
     st = control.read_state(paths)
     alive = control.daemon_alive(st)
@@ -50,8 +67,7 @@ def cmd_status(args, paths: Paths) -> int:
         if st.get("job"):
             lines.append(f"job: {st['job']}")
         if (st.get("models") or {}).get("training"):
-            tr = st["models"]["training"]
-            lines.append(f"training: {tr.get('stage')} ({tr.get('done')}/{tr.get('total')} stages)")
+            lines.append(_training_line(st["models"]["training"]))
     else:
         lines.append("daemon: not running" + (f" (last state {st.get('state')} {_ago(st.get('since'))})" if st else ""))
     if control.paused(ctl):

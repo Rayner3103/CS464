@@ -292,6 +292,22 @@ def test_train_cli(home, capsys):
     assert doc["status"] == "none" and doc["trained_env"] is None
 
 
+def test_status_training_line_follows_the_run_status():
+    """`lscli status` builds its training line from `status`: `stage` is None whenever no stage is running."""
+    from lscli.cli import _training_line
+    base = {"run": 2, "done": 5, "total": 17, "failures": {}}
+    assert _training_line({"status": "none", "run": None, "stage": None, "done": 0, "total": 0}) == "training: none"
+    assert _training_line({**base, "status": "running", "stage": "tune_sweep"}) == \
+        "training: running stage tune_sweep (run 2, 5/17 stages)"
+    assert _training_line({**base, "status": "done", "stage": None, "done": 17}) == "training: done (run 2, 17/17 stages)"
+    line = _training_line({**base, "status": "failed", "stage": None, "failures": {"train_v2": 2}})
+    assert line.startswith("training: failed at train_v2 (run 2, 5/17 stages") and "None" not in line
+    line = _training_line({**base, "status": "failed", "stage": None, "done": 17})     # the activation failed
+    assert line.startswith("training: failed (run 2, 17/17 stages") and "?" not in line
+    assert _training_line({**base, "status": "running", "stage": None, "done": 17}) == \
+        "training: running (run 2, 17/17 stages)"                                     # stages done, not activated yet
+
+
 @needs_ranker
 def test_requested_retraining_of_some_stages(home):
     from lscli import control
