@@ -111,6 +111,7 @@ The merge reads each log from its saved offset (only complete lines), so a log s
 incrementally; a log is deleted only when its process (the pid in its name) has exited and it was read to the end.
 The client resets its counters in a forked child (`os.register_at_fork`), so a DataLoader worker does not
 double-count its parent's calls.
+No shape is ever dropped: a decayed count only gets smaller (section 9).
 
 ### 3.4 `queue.jsonl`
 
@@ -520,3 +521,9 @@ night trains in whatever window it is awake for. Without linger, the service sto
   work from running at all.
 * The cuBLASLt ranker's proposals come from the daemon venv's cuBLASLt. A user env with another cuBLASLt build gets
   only the subset its library accepts.
+* `profile.json` keeps every shape it has ever seen: `usage.merge` decays a shape's `calls` but never removes it. A
+  workload with many distinct shapes (e.g. a sequence length in M that changes per batch) grows it by ~300 bytes per
+  shape. The daemon's merge (every minute) reads and rewrites the whole file even when no log has new lines, and
+  each client process loads it once. To start over, stop the daemon and delete `profile.json`: the logs still in
+  `profile/` are re-read from the start, and every decayed count restarts from zero (the frequent-call k = 5 policy
+  and profile-driven searches with it; the winner cache is not affected). Pruning is open work (plan section 4).
