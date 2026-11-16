@@ -9,7 +9,9 @@
 # Installs the learned-selector CLI and its daemon for THIS user: a git clone in $LSCLI_HOME/src, a venv with the pinned
 # versions, the zero-shot models, ~/.local/bin/lscli, the config, and a systemd --user unit. Needs no root, except for
 # the optional clock helper (asked; --clock-helper / --no-clock-helper). Re-running upgrades src/ and the venv and keeps
-# the data. Without a terminal (piped into bash with no /dev/tty) every question takes its default (no).
+# the data. Without a terminal (piped into bash with no /dev/tty) every question takes its default (no, except
+# background training: yes). The home gets a marker file (.lscli-home): an existing non-empty --home without it is
+# refused, unless it is an lscli home from before the marker (src/ a clone of --repo, and venv/), which gets one.
 set -euo pipefail
 
 REPO_URL="https://github.com/Rayner3103/CS464.git"
@@ -21,6 +23,7 @@ UNIT_DIR="$HOME/.config/systemd/user"
 PYTHON=""
 REUSE_SITE=""
 CLOCK_HELPER=ask
+TRAIN=ask
 CLOCK_MHZ=""
 LINGER=ask
 START=1
@@ -44,6 +47,8 @@ Usage: install.sh [options]
   --models-sha256 HEX
   --clock-helper          install the SM clock helper (sudo) without asking; --clock-mhz MHZ sets its clock
   --no-clock-helper
+  --train | --no-train    train this GPU's own models in idle time (asked on a fresh install, default yes; on a
+                          re-install the config is kept unless one of these is given)
   --linger | --no-linger  keep the daemon running when you are logged out (loginctl enable-linger)
   --no-start              install the unit but do not start it
   --yes                   answer every question with its default (non-interactive)
@@ -73,6 +78,8 @@ while [[ $# -gt 0 ]]; do
     --clock-helper) CLOCK_HELPER=yes ;;
     --no-clock-helper) CLOCK_HELPER=no ;;
     --clock-mhz) CLOCK_MHZ="${2:?}"; shift ;;
+    --train) TRAIN=yes ;;
+    --no-train) TRAIN=no ;;
     --linger) LINGER=yes ;;
     --no-linger) LINGER=no ;;
     --no-start) START=0 ;;
@@ -89,6 +96,18 @@ done
 [[ "$LSCLI_HOME" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "--home must be an absolute path of [A-Za-z0-9._/-] characters"
 LSCLI_HOME="$(mkdir -p "$LSCLI_HOME" && cd "$LSCLI_HOME" && pwd)"
 case "$LSCLI_HOME" in "$HOME"|/|"$(dirname "$HOME")") die "--home must be a directory of its own, not $LSCLI_HOME" ;; esac
+# Only an empty directory or an lscli home (the marker, or an install from before it) is ever chmod'ed, replaced in
+# part (src/, venv/) or later purged: never a directory of the user's own.
+MARKER="$LSCLI_HOME/.lscli-home"
+if [[ ! -f "$MARKER" && -n "$(ls -A "$LSCLI_HOME")" ]]; then
+  if [[ -d "$LSCLI_HOME/src/.git" && -x "$LSCLI_HOME/venv/bin/python" ]] \
+      && [[ "$(git -C "$LSCLI_HOME/src" remote get-url origin 2>/dev/null)" == "$REPO_URL" ]]; then
+    echo "note: $LSCLI_HOME is an lscli home from before the .lscli-home marker; adding it"
+  else
+    die "--home $LSCLI_HOME is not empty and is not an lscli home (no .lscli-home); choose a new or empty directory"
+  fi
+fi
+[[ -f "$MARKER" ]] || printf 'lscli home: created by install.sh; `lscli uninstall --purge` may delete this directory\n' > "$MARKER"
 chmod 700 "$LSCLI_HOME"
 
 # ------------------------------------------------------------------ preflight (exit 4: unsupported system)
@@ -139,7 +158,7 @@ VENV="$LSCLI_HOME/venv"
 say "venv: $VENV"
 want="$("$PYTHON" -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
 have="$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)"
-# missing, broken, or made by another Python (an older install's 3.10 venv cannot run the launcher's `-P`): start over
+# missing, broken, or made by another Python (an older install's 3.10 venv cannot run the launcher's `-I` (3.11+)): start over
 [[ "$have" == "$want" ]] || rm -rf "$VENV"
 if [[ -n "$REUSE_SITE" ]]; then
   [[ -x "$VENV/bin/python" ]] || "$PYTHON" -m venv --without-pip "$VENV"
@@ -155,7 +174,7 @@ else
 fi
 site="$("$VENV/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 echo "$SRC" > "$site/lscli-src.pth"                 # the daemon venv runs lscli / tune / ... from src/
-"$VENV/bin/python" -P -c 'import torch, triton, lightgbm, lscli' || die "the venv cannot import its packages"
+"$VENV/bin/python" -I -c 'import torch, triton, lightgbm, lscli' || die "the venv cannot import its packages"
 
 # ------------------------------------------------------------------ models and kernels
 if [[ -n "$MODELS_URL" ]]; then
@@ -187,15 +206,18 @@ fi
 
 # ------------------------------------------------------------------ config, command, unit
 mkdir -p "$CONFIG_DIR" "$BIN_DIR" "$UNIT_DIR"
-[[ -f "$CONFIG_DIR/config.toml" ]] || \
-  LSCLI_CONFIG="$CONFIG_DIR/config.toml" "$VENV/bin/python" -P -c \
+FRESH_CONFIG=0
+if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
+  FRESH_CONFIG=1
+  LSCLI_CONFIG="$CONFIG_DIR/config.toml" "$VENV/bin/python" -I -c \
     'import os; from lscli import config; open(os.environ["LSCLI_CONFIG"], "w").write(config.dumps(config.DEFAULTS))'
+fi
 cat > "$BIN_DIR/lscli" <<EOF
 #!/bin/sh
 export LSCLI_HOME="$LSCLI_HOME"
-# -P: never put the caller's cwd on sys.path, or `lscli` run inside a CS464 checkout would import that checkout's
-# lscli instead of this install's
-exec "$VENV/bin/python" -P -m lscli "\$@"
+# -I: never put the caller's cwd or PYTHONPATH on sys.path, or `lscli` run inside (or with PYTHONPATH pointing at) a
+# CS464 checkout would import that checkout's lscli instead of this install's
+exec "$VENV/bin/python" -I -m lscli "\$@"
 EOF
 chmod 755 "$BIN_DIR/lscli"
 sed -e "s|%h/.local/share/lscli|$LSCLI_HOME|g" \
@@ -228,8 +250,24 @@ if [[ $CLOCK_HELPER == yes ]]; then
   sudo chown root:root /etc/lscli/clock.conf && sudo chmod 0644 /etc/lscli/clock.conf
   sudo install -o root -g root -m 0440 "$tmp_sudo" /etc/sudoers.d/lscli
   rm -f "$tmp_sudo"
-  LSCLI_CONFIG="$CONFIG_DIR/config.toml" LSCLI_HOME="$LSCLI_HOME" "$VENV/bin/python" -P -m lscli config clock.lock_mhz "$CLOCK_MHZ" >/dev/null
+  LSCLI_CONFIG="$CONFIG_DIR/config.toml" LSCLI_HOME="$LSCLI_HOME" "$VENV/bin/python" -I -m lscli config clock.lock_mhz "$CLOCK_MHZ" >/dev/null
 fi
+
+# ------------------------------------------------------------------ background training
+lscli_config() { LSCLI_CONFIG="$CONFIG_DIR/config.toml" LSCLI_HOME="$LSCLI_HOME" "$VENV/bin/python" -I -m lscli config "$@"; }
+if [[ $TRAIN == ask && $FRESH_CONFIG == 1 ]]; then
+  cat <<TRAINNOTE
+Background training: in idle time (the [idle] window, GPU idle, on AC power) the daemon trains this GPU's own models
+with pipeline/train_best.sh, about 35 GPU-hours on an RTX 3080 for train.mode = full, in pieces; it stops as soon as
+anything else uses the GPU. Turn it off any time with: lscli config train.enabled false
+TRAINNOTE
+  ask "Train this GPU's models in idle time?" y && TRAIN=yes || TRAIN=no
+fi
+case "$TRAIN" in
+  yes) lscli_config train.enabled true >/dev/null ;;
+  no) lscli_config train.enabled false >/dev/null ;;
+esac
+echo "background training: $(lscli_config train.enabled 2>/dev/null | tr -d '[:space:]' | sed 's/^[Tt]rue$/on/; s/^[Ff]alse$/off/')"
 
 # ------------------------------------------------------------------ linger + start
 if [[ $LINGER == ask ]]; then

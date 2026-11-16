@@ -489,7 +489,7 @@ overhead.
 | `logs` | `lscli logs [-f] [--job ID]` | Daemon or job log |
 | `doctor` | `lscli doctor` | Checks: GPU and driver, systemd user session and linger, unit state, clock helper, versions of each registered env (and gcc + `Python.h`, which Triton's launcher needs), file permissions, models present, processes holding a CUDA context (they keep the gate closed) |
 | `daemon` | `lscli daemon run` (used by the unit) / `start` / `stop` / `restart` | Foreground loop / `systemctl --user` wrappers |
-| `uninstall` | `lscli uninstall [--purge] [--yes]` | Stop and remove the unit, restore the clock (section 4.6), remove the clock helper (sudo), `disable-env` every registered env, remove `~/.local/bin/lscli`; keep `$LSCLI_HOME` unless `--purge` |
+| `uninstall` | `lscli uninstall [--purge] [--yes]` | Stop and remove the unit, restore the clock (section 4.6), remove the clock helper (sudo), `disable-env` every registered env, remove `~/.local/bin/lscli`; keep `$LSCLI_HOME` unless `--purge`. `--purge` deletes only an lscli home (the `.lscli-home` marker, or an install from before it: section 8) and is checked before anything is removed; without `--yes` it asks you to type the path |
 
 Exit codes: `0` success, `1` failure, `2` usage error, `3` the daemon is needed but not running, `4` unsupported
 system (no NVIDIA GPU, no systemd user session).
@@ -548,13 +548,20 @@ curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/<tag>/install/inst
    * one GPU (with more: warn and use device 0).
 2. `git clone` the repo at `<tag>` into `$LSCLI_HOME/src`. It must be a clone, because `train_best.sh`'s `preflight`
    checks the history. Create `venv/` and install the pinned `requirements.txt` (torch from the cu130 index) and
-   `src` in editable mode. `$LSCLI_HOME` is created with mode 0700.
+   `src` in editable mode. `$LSCLI_HOME` is created with mode 0700 and gets a marker file, `.lscli-home`. An existing
+   `--home` that is not empty and has no marker is refused (it is left untouched), unless it is an install from before
+   the marker (`src/` a git clone whose origin is `--repo`, and `venv/bin/python`), which then gets the marker.
 3. Download the zero-shot models (GitHub release assets of `<tag>`) into `models/zero_shot/`. Their sha256 sums are
    **pinned in `install.sh`** itself, not fetched from the release. Unpack `kernels/bundle.tar.xz`.
    `install/pack_zero_shot.py` builds the archive and prints the hash to pin. Until an asset is published, the pin is
    empty and the installer skips this step: the daemon then trains this GPU's models first and selects nothing with a
    Triton ranker until they exist. `--models-url URL --models-sha256 HEX` installs another archive.
-4. Write `~/.config/lscli/config.toml` if absent. Link `~/.local/bin/lscli`. Install and start `lscli.service`
+4. Write `~/.config/lscli/config.toml` if absent. Write `~/.local/bin/lscli`, which runs the venv's python with `-I`
+   (neither the caller's cwd nor `PYTHONPATH` can put another tree's lscli first). Background training: on a fresh
+   install (no config yet), say what it costs (about 35 GPU-hours on an RTX 3080 for `full`, in idle time) and how to
+   turn it off, and ask "Train this GPU's models in idle time? [Y/n]" (default yes, also with `--yes` and without a
+   terminal; `--train` / `--no-train` set `train.enabled`, also on a re-install, which otherwise keeps the config).
+   Install and start `lscli.service`
    (`systemctl --user enable --now`). Run `loginctl enable-linger` when the user agrees (prompt; `--linger` /
    `--no-linger`).
 5. Clock helper: ask "install the clock helper (needs sudo)? [y/N]" (`--clock-helper` / `--no-clock-helper`).

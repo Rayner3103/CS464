@@ -374,9 +374,9 @@ _FIND = ("import importlib.util, json, sys; out = {}\n"
 
 
 def is_our_wrapper(text: str) -> bool:
-    """The `~/.local/bin/lscli` install.sh writes: `exec ".../venv/bin/python" -P -m lscli "$@"` (before the cwd fix,
-    without `-P`), so uninstall removes it and nothing else of that name."""
-    return re.search(r'/venv/bin/python" (-P )?-m lscli "\$@"', text) is not None
+    """The `~/.local/bin/lscli` install.sh writes: `exec ".../venv/bin/python" -I -m lscli "$@"` (earlier `-P`, and before
+    the cwd fix nothing), so uninstall removes it and nothing else of that name."""
+    return re.search(r'/venv/bin/python" (-[IP] )?-m lscli "\$@"', text) is not None
 
 
 def source_dir(paths: Paths) -> Path:
@@ -592,20 +592,32 @@ def cmd_doctor(args, paths: Paths) -> int:
 
 # ------------------------------------------------------------------------------------------------------------ uninstall
 CLOCK_FILES = ("/usr/local/libexec/lscli-clock", "/etc/sudoers.d/lscli", "/etc/lscli/clock.conf")
-_MARKERS = ("venv", "src", "state.json", "envs.json", "winners.jsonl", "client.json", "profile", "queue.jsonl")
+HOME_MARKER = ".lscli-home"                  # written by install.sh; `--purge` deletes only a home that has it
+LSCLI_REPO = "https://github.com/Rayner3103/CS464.git"   # install.sh's default --repo (the legacy-home check)
+
+
+def is_lscli_home(root: Path) -> bool:
+    """The marker install.sh writes, or an install from before it: src/ a git clone whose origin is lscli's repository,
+    and venv/bin/python (install.sh's own check for a re-install, which then adds the marker)."""
+    if (root / HOME_MARKER).is_file():
+        return True
+    if not ((root / "src" / ".git").is_dir() and os.access(root / "venv" / "bin" / "python", os.X_OK)):
+        return False
+    r = subprocess.run(["git", "-C", str(root / "src"), "remote", "get-url", "origin"], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == LSCLI_REPO
 
 
 def purge_refusal(root: Path) -> str | None:
-    """Why `--purge` must not delete `root` (None = safe): never /, $HOME or one of its ancestors, and only a
-    directory that looks like an lscli home."""
+    """Why `--purge` must not delete `root` (None = safe): never /, $HOME or one of its ancestors, and only an lscli
+    home (`is_lscli_home`: install.sh's marker, or an install from before it)."""
     root = root.resolve()
     home = Path.home().resolve()
     if root == Path("/") or root == home or root in home.parents:
         return "it is / or your home directory (or above it)"
     if not root.is_dir():
         return "not a directory"
-    if not any((root / m).exists() for m in _MARKERS):
-        return "it does not look like an lscli home"
+    if not is_lscli_home(root):
+        return f"it is not an lscli home (no {HOME_MARKER}, and not an install from before the marker)"
     return None
 
 
@@ -613,13 +625,23 @@ def cmd_uninstall(args, paths: Paths) -> int:
     """Spec 6: stop and remove the unit, reset the clock, remove the clock helper (sudo), remove every env's hook,
     remove ~/.local/bin/lscli; keep $LSCLI_HOME and the config unless --purge."""
     import shutil
+    if args.purge:                                     # checked before anything is removed
+        why = purge_refusal(paths.root)
+        if why:
+            print(f"lscli uninstall --purge: refusing to delete {paths.root}: {why}", file=sys.stderr)
+            return EXIT_FAIL
     if not args.yes:
-        what = "everything, including the usage record and models" if args.purge else "lscli (data kept)"
         try:
-            ans = input(f"Uninstall {what}? [y/N] ")
+            if args.purge:                             # deleting a directory: type its path, not just "y"
+                root = str(paths.root.resolve())
+                ans = input(f"Uninstall lscli and DELETE {root} (usage record, models, winners) and the config.\n"
+                            f"Type the path to confirm: ")
+                ok = ans.strip().rstrip("/") == root
+            else:
+                ok = input("Uninstall lscli (data kept)? [y/N] ").lower().startswith("y")
         except EOFError:
-            ans = ""
-        if not ans.lower().startswith("y"):
+            ok = False
+        if not ok:
             print("nothing done")
             return EXIT_FAIL
     done = []
@@ -658,10 +680,6 @@ def cmd_uninstall(args, paths: Paths) -> int:
     done.append("linger was left as it is (loginctl disable-linger $USER if you enabled it for lscli)")
     if args.purge:
         from lscli.paths import config_path
-        why = purge_refusal(paths.root)
-        if why:
-            print(f"lscli uninstall --purge: refusing to delete {paths.root}: {why}", file=sys.stderr)
-            return EXIT_FAIL
         shutil.rmtree(paths.root, ignore_errors=True)
         cfg = config_path()
         cfg.unlink(missing_ok=True)                    # the file only; its directory only when it is lscli's and empty
@@ -731,8 +749,9 @@ def build_parser() -> argparse.ArgumentParser:
     tn.set_defaults(fn=cmd_train)
     sub.add_parser("doctor", help="check the GPU, systemd, the daemon, the clock helper, envs and models").set_defaults(fn=cmd_doctor)
     un = sub.add_parser("uninstall", help="remove the unit, clock helper, env hooks and command (data kept unless --purge)")
-    un.add_argument("--purge", action="store_true", help="also delete $LSCLI_HOME and the config")
-    un.add_argument("--yes", action="store_true", help="do not ask")
+    un.add_argument("--purge", action="store_true", help="also delete $LSCLI_HOME (only an lscli home: install.sh's "
+                    ".lscli-home marker, or an install from before it) and the config; asks you to type the path")
+    un.add_argument("--yes", action="store_true", help="do not ask (and, with --purge, do not ask for the path)")
     un.set_defaults(fn=cmd_uninstall)
     k = sub.add_parser("cache", help="inspect / verify / compact / clear the winner cache")
     k.add_argument("action", choices=("ls", "verify", "compact", "clear"))

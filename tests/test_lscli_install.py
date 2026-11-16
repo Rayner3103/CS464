@@ -82,10 +82,13 @@ def test_install_refuses_an_archive_with_links(tmp_path):
 def test_install_then_uninstall(tmp_path):
     home, env = _sandbox(tmp_path)
     url, digest = _archive(tmp_path, "good")
-    old_venv = home / ".local/share/lscli/venv/bin/python"            # a venv an older Python left behind
-    old_venv.parent.mkdir(parents=True)
+    old_venv = home / ".local/share/lscli/venv/bin/python"            # an install from before the marker, whose venv
+    old_venv.parent.mkdir(parents=True)                                 # an older Python made
     old_venv.write_text("#!/bin/sh\necho 3.10\n")
     old_venv.chmod(0o755)
+    old_src = home / ".local/share/lscli/src"
+    subprocess.run(["git", "init", "-q", str(old_src)], check=True)
+    subprocess.run(["git", "-C", str(old_src), "remote", "add", "origin", str(REPO)], check=True)
     r = subprocess.run(["bash", str(REPO / "install/install.sh"), "--repo", str(REPO), "--ref", _clean_commit(),
                         "--python", sys.executable, "--reuse-site", sys.executable, "--no-clock-helper", "--no-linger",
                         "--yes", "--models-url", url, "--models-sha256", digest], env=env, capture_output=True, text=True,
@@ -93,6 +96,8 @@ def test_install_then_uninstall(tmp_path):
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
     lh = home / ".local/share/lscli"
     assert (lh / "src/.git").is_dir() and oct(lh.stat().st_mode & 0o777) == "0o700"
+    assert (lh / ".lscli-home").is_file() and "from before the .lscli-home marker" in r.stdout
+    assert "Background training:" in r.stdout and "background training: on" in r.stdout   # asked; --yes: default yes
     assert "echo 3.10" not in (lh / "venv/bin/python").read_text(errors="replace")    # rebuilt (it could not run -P)
     assert (home / ".config/lscli/config.toml").exists()
     unit = (home / ".config/systemd/user/lscli.service").read_text()
@@ -109,15 +114,20 @@ def test_install_then_uninstall(tmp_path):
     (shadow / "lscli" / "__main__.py").write_text("raise SystemExit('imported the checkout')\n")
     v = subprocess.run([str(home / ".local/bin/lscli"), "--version"], env=env, capture_output=True, text=True, cwd=shadow)
     assert v.returncode == 0 and "lscli" in v.stdout and "checkout" not in v.stderr, v.stderr
+    v = subprocess.run([str(home / ".local/bin/lscli"), "--version"], env={**env, "PYTHONPATH": str(shadow)},
+                       capture_output=True, text=True)                  # the same checkout on PYTHONPATH (-I)
+    assert v.returncode == 0 and "lscli" in v.stdout and "checkout" not in v.stderr, v.stderr
     st = subprocess.run([str(home / ".local/bin/lscli"), "--json", "status"], env=env, capture_output=True, text=True)
     assert json.loads(st.stdout)["daemon"]["running"] is False
     # re-running upgrades in place and keeps the data
     (lh / "keep.txt").write_text("data")
     r = subprocess.run(["bash", str(REPO / "install/install.sh"), "--repo", str(REPO), "--ref", _clean_commit(),
                         "--python", sys.executable, "--reuse-site", sys.executable, "--no-clock-helper", "--no-linger",
-                        "--yes", "--no-start"], env=env, capture_output=True, text=True, timeout=900, stdin=subprocess.DEVNULL)
+                        "--yes", "--no-start", "--no-train"], env=env, capture_output=True, text=True, timeout=900,
+                       stdin=subprocess.DEVNULL)
     assert r.returncode == 0, r.stderr[-2000:]
-    assert (lh / "keep.txt").exists()
+    assert (lh / "keep.txt").exists() and "Background training:" not in r.stdout     # a re-install does not ask
+    assert "background training: off" in r.stdout and "enabled = false" in (home / ".config/lscli/config.toml").read_text()
     u = subprocess.run([str(home / ".local/bin/lscli"), "uninstall", "--yes"], env=env, capture_output=True, text=True)
     assert u.returncode == 0, u.stderr
     assert not (home / ".config/systemd/user/lscli.service").exists() and not (home / ".local/bin/lscli").exists()
@@ -130,7 +140,8 @@ def test_install_then_uninstall(tmp_path):
 
 def test_uninstall_recognizes_the_wrapper_with_and_without_the_cwd_fix():
     from lscli.cli import is_our_wrapper
-    for text in ('#!/bin/sh\nexport LSCLI_HOME="/h"\nexec "/h/venv/bin/python" -P -m lscli "$@"\n',
+    for text in ('#!/bin/sh\nexport LSCLI_HOME="/h"\nexec "/h/venv/bin/python" -I -m lscli "$@"\n',
+                 '#!/bin/sh\nexport LSCLI_HOME="/h"\nexec "/h/venv/bin/python" -P -m lscli "$@"\n',
                  '#!/bin/sh\nexport LSCLI_HOME="/h"\nexec "/h/venv/bin/python" -m lscli "$@"\n'):
         assert is_our_wrapper(text)
     assert not is_our_wrapper('#!/bin/sh\nexec /usr/bin/python3 -m somethingelse "$@"\n')
@@ -254,13 +265,34 @@ def test_purge_refuses_home_and_foreign_dirs_and_removes_only_the_config_file(tm
         root.mkdir(exist_ok=True)
         monkeypatch.setenv("LSCLI_HOME", str(root))
         assert cli.main(["uninstall", "--yes", "--purge"]) == cli.EXIT_FAIL and root.exists()
+    unit = home / ".config" / "systemd" / "user" / "lscli.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\n")
+    proj = tmp_path / "proj"                                            # looks like one (src/, venv/) but is not
+    (proj / "venv").mkdir(parents=True)
+    (proj / "src").mkdir()
+    monkeypatch.setenv("LSCLI_HOME", str(proj))
+    assert cli.main(["uninstall", "--yes", "--purge"]) == cli.EXIT_FAIL and proj.exists()
+    assert "not an lscli home" in capsys.readouterr().err and unit.exists()      # refused before anything is removed
+    legacy = tmp_path / "legacy"                                        # an install from before the marker
+    subprocess.run(["git", "init", "-q", str(legacy / "src")], check=True)
+    subprocess.run(["git", "-C", str(legacy / "src"), "remote", "add", "origin", cli.LSCLI_REPO], check=True)
+    (legacy / "venv" / "bin").mkdir(parents=True)
+    (legacy / "venv" / "bin" / "python").write_text("#!/bin/sh\n")
+    (legacy / "venv" / "bin" / "python").chmod(0o755)
+    assert cli.purge_refusal(legacy) is None and cli.purge_refusal(proj) is not None
     lh = tmp_path / "lh"
-    (lh / "venv").mkdir(parents=True)
+    lh.mkdir()
+    (lh / ".lscli-home").write_text("lscli home\n")
     monkeypatch.setenv("LSCLI_HOME", str(lh))
+    for answer in ("y", str(tmp_path)):                                 # --purge without --yes: the path, typed
+        monkeypatch.setattr("builtins.input", lambda prompt, a=answer: a)
+        assert cli.main(["uninstall", "--purge"]) == cli.EXIT_FAIL and lh.exists() and unit.exists()
+    monkeypatch.setattr("builtins.input", lambda prompt: str(lh.resolve()) + "/")
     foreign = home / ".local" / "bin" / "lscli"
     foreign.parent.mkdir(parents=True)
     foreign.write_text("#!/bin/sh\necho my own lscli tool\n")
-    assert cli.main(["uninstall", "--yes", "--purge"]) == 0
+    assert cli.main(["uninstall", "--purge"]) == 0
     assert not lh.exists() and not (shared / "c.toml").exists() and (shared / "work.txt").exists()
     assert foreign.exists()                                                 # not install.sh's wrapper: left alone
 
@@ -271,6 +303,28 @@ def test_install_refuses_a_home_that_is_not_its_own(tmp_path):
         r = subprocess.run(["bash", str(REPO / "install/install.sh"), "--home", bad, "--check-only"], env=env,
                            capture_output=True, text=True)
         assert r.returncode != 0, bad
+    proj = home / "work" / "proj"                                       # a project of the user's: src/, venv/, files
+    (proj / "src").mkdir(parents=True)
+    (proj / "venv" / "bin").mkdir(parents=True)
+    (proj / "notes.txt").write_text("mine")
+    proj.chmod(0o755)
+    r = subprocess.run(["bash", str(REPO / "install/install.sh"), "--home", str(proj), "--check-only"], env=env,
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "not an lscli home" in r.stderr
+    assert not (proj / ".lscli-home").exists() and oct(proj.stat().st_mode & 0o777) == "0o755"   # left untouched
+    for name, make in (("empty", lambda d: None), ("legacy", None)):    # adopted: the marker is written
+        d = home / name
+        d.mkdir()
+        if make is None:
+            subprocess.run(["git", "init", "-q", str(d / "src")], check=True)
+            subprocess.run(["git", "-C", str(d / "src"), "remote", "add", "origin", "https://example.org/lscli.git"],
+                           check=True)
+            (d / "venv" / "bin").mkdir(parents=True)
+            (d / "venv" / "bin" / "python").write_text("#!/bin/sh\n")
+            (d / "venv" / "bin" / "python").chmod(0o755)
+        subprocess.run(["bash", str(REPO / "install/install.sh"), "--home", str(d), "--repo", "https://example.org/lscli.git",
+                        "--check-only"], env=env, capture_output=True, text=True)
+        assert (d / ".lscli-home").is_file(), name
 
 
 def test_pack_zero_shot(tmp_path):
