@@ -333,3 +333,111 @@ def test_a_process_that_appears_as_the_worker_finishes_voids_the_result(home, mo
     d = _daemon(home, lambda: gate.GpuSnapshot([424242] if late else [], 0, True, {424242: "late"}))
     d.tick()
     assert d.counters["preempted"] == 1 and not home.winners.exists()
+
+
+# ---------------------------------------------------------------------------------------------- environment probes
+def _held(lock) -> bool:
+    with open(lock, "a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+
+
+def _probing_daemon(home, monkeypatch, *, env_needs_cuda=False):
+    """A daemon whose `_worker_env` is faked: it records (interpreter, hw_id passed, gpu.lock held). hw_id None is the
+    CUDA probe; an env probe with an hw_id answers NEEDS_CUDA when `env_needs_cuda`."""
+    from lscli import daemon as dmod
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(gate, "gpu_identity", lambda index=0: {"uuid": "GPU-t", "name": "t", "count": 1})
+    envs.register(home, "/env/python", {"torch": "x"})
+    busy = {"on": True}
+    calls = []
+
+    def worker_env(python, extra, hw_id=None):
+        calls.append((python, hw_id, _held(home.gpu_lock)))
+        if hw_id is None:
+            return {"hw_id": "hwX", "where": "cuda", **extra}
+        if python == "/env/python" and env_needs_cuda:
+            return dmod.NEEDS_CUDA
+        return {"hw_id": hw_id, "where": "static", **extra}
+
+    def make():
+        d = dmod.Daemon(home, None, python="/daemon/python", battery=lambda: False,
+                        snapshot=lambda: gate.GpuSnapshot([4242] if busy["on"] else [], 0, True, {}))
+        monkeypatch.setattr(d, "_worker_env", worker_env)
+        d.start()
+        return d
+    return make, busy, calls
+
+
+def test_environment_probes_open_no_cuda_context_until_the_gate_opens(home, monkeypatch):
+    """First start on a GPU: no probe at all while the GPU is busy, then one CUDA probe under gpu.lock once the gate
+    opens; its hw_id is stored, and every later probe (env, restart) is CUDA-free even with the gate closed."""
+    make, busy, calls = _probing_daemon(home, monkeypatch)
+    d = make()
+    d.tick()
+    d.tick()
+    assert calls == [] and d.hw_id is None and "/env/python" not in str(d.env_docs)
+    st = json.loads(home.state.read_text())
+    assert st["hw_id"] is None and st["probes_waiting"] == ["daemon"]
+    busy["on"] = False
+    d.tick()
+    assert calls[0] == ("/daemon/python", None, True)                        # the CUDA probe holds gpu.lock
+    assert json.loads(home.gpu_hw.read_text()) == {"GPU-t": "hwX"} and d.hw_id == "hwX"
+    assert ("/env/python", "hwX", False) in calls and all(c[1] for c in calls[1:])   # then CUDA-free only
+    busy["on"] = True
+    calls.clear()
+    d2 = make()                                                              # a restart, GPU busy
+    d2.tick()
+    assert d2.hw_id == "hwX" and calls == [("/daemon/python", "hwX", False), ("/env/python", "hwX", False)]
+    eid = envs.env_id("/env/python")
+    d2._update_env(eid, envs.load(home)[eid], {"hw_id": "hwY"})             # a search measured it again with CUDA
+    assert json.loads(home.gpu_hw.read_text()) == {"GPU-t": "hwY"}
+
+
+def test_an_env_whose_probe_needs_cuda_waits_for_the_gate(home, monkeypatch):
+    write_json(home.gpu_hw, {"GPU-t": "hwX"})
+    make, busy, calls = _probing_daemon(home, monkeypatch, env_needs_cuda=True)
+    d = make()
+    d.tick()
+    d.tick()
+    eid = envs.env_id("/env/python")
+    assert eid in d.unknown_envs and eid in d.need_cuda and all(c[1] for c in calls)   # deferred, nothing with CUDA
+    assert calls.count(("/env/python", "hwX", False)) == 1                  # and not re-probed every tick
+    busy["on"] = False
+    d.tick()
+    assert ("/env/python", None, True) in calls and eid not in d.unknown_envs and not d.need_cuda
+
+
+def test_the_hw_id_cache_is_used_only_for_a_single_visible_gpu(home, monkeypatch):
+    from lscli import hwcache
+    one = {"uuid": "GPU-t", "count": 1}
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    assert hwcache.remember(home, one, "hwX") and not hwcache.remember(home, one, "hwX")
+    assert hwcache.known(home, one) == "hwX" and hwcache.known(home, {"uuid": "GPU-u", "count": 1}) is None
+    assert hwcache.known(home, {"uuid": "GPU-t", "count": 2}) is None
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    assert hwcache.known(home, one) == "hwX"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    assert hwcache.known(home, one) is None and not hwcache.remember(home, one, "hwZ")
+
+
+def test_the_training_refresh_of_the_daemon_env_is_cuda_free(home, monkeypatch):
+    """#6 refreshes the daemon venv's environment before training decisions: with the cached hw_id, never with CUDA."""
+    from lscli import daemon as dmod
+    d = dmod.Daemon(home, None, python="/daemon/python", battery=lambda: False,
+                    snapshot=lambda: gate.GpuSnapshot([4242], 0, True, {}))
+    calls = []
+    answer = {"doc": {"hw_id": "hwX", "triton": "new"}}
+    monkeypatch.setattr(d, "_worker_env", lambda python, extra, hw_id=None: calls.append(hw_id) or answer["doc"])
+    d._refresh_daemon_env()
+    assert calls == []                                                       # no hw_id yet: nothing to refresh
+    d.hw_id = "hwX"
+    d._refresh_daemon_env()
+    assert calls == ["hwX"] and d.daemon_env["triton"] == "new"
+    answer["doc"] = dmod.NEEDS_CUDA
+    d._refresh_daemon_env()
+    assert calls == ["hwX", "hwX"] and "daemon" in d.need_cuda and d.daemon_env["triton"] == "new"

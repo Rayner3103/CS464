@@ -64,6 +64,11 @@ def cmd_status(args, paths: Paths) -> int:
         gate = st.get("gate") or {}
         lines.append(f"daemon: {st.get('state')} since {_ago(st.get('since'))} (pid {st.get('pid')})")
         lines.append("gate: open" if gate.get("open") else "gate: closed - " + "; ".join(gate.get("reasons") or ["?"]))
+        if not st.get("hw_id"):
+            lines.append("hw_id: pending (its first probe needs a CUDA context and waits for the gate to open)")
+        waiting = [e for e in st.get("probes_waiting") or [] if e != "daemon"]
+        if waiting:
+            lines.append(f"envs waiting for a probe with CUDA (gate open): {', '.join(waiting)}")
         if st.get("job"):
             lines.append(f"job: {st['job']}")
         if (st.get("models") or {}).get("training"):
@@ -278,20 +283,38 @@ def cmd_cache(args, paths: Paths) -> int:
     if args.action != "ls" and not targets:
         print("lscli cache: no registered env (lscli enable-env PYTHON)", file=sys.stderr)
         return EXIT_FAIL
+    workers = args.action != "ls" or len(targets) == 1
+    docs = _static_envs(paths, targets) if workers and args.action != "verify" else {}
     lockf = None
-    if args.action != "ls" or len(targets) == 1:       # a worker runs: it puts a CUDA context on the GPU
+    if workers and (args.action == "verify" or any(d is None for d in docs.values())):   # a CUDA context on the GPU
         lockf, code = _claim_gpu(args, paths, "runs every cached kernel on it" if args.action == "verify"
                                  else "opens a CUDA context on it")
         if lockf is None:
             return code
     try:
-        return _cache_action(args, paths, targets)
+        return _cache_action(args, paths, targets, docs)
     finally:
         if lockf is not None:
             lockf.close()
 
 
-def _cache_action(args, paths: Paths, targets: dict) -> int:
+def _static_envs(paths: Paths, targets: dict) -> dict:
+    """{env_id: environment doc read with no CUDA context, or None when that is not possible} for `cache ls --env` and
+    `compact`: possible once this GPU's hw_id is cached (lscli/hwcache.py). A None is read with CUDA, under the lock."""
+    from lscli import gate, hwcache
+    hw = hwcache.known(paths, gate.gpu_identity())
+    out = {}
+    for eid, e in targets.items():
+        try:
+            out[eid] = _worker(paths, e["python"], "env", "--env-extra", json.dumps(env_extra_for(paths, eid)),
+                               "--hw-id", hw)["env"] if hw else None
+        except (RuntimeError, OSError, subprocess.TimeoutExpired):
+            out[eid] = None                 # "needs CUDA", or any other failure: the CUDA probe reports it
+    return out
+
+
+def _cache_action(args, paths: Paths, targets: dict, docs: dict | None = None) -> int:
+    docs = docs or {}
     if args.action == "ls":
         if args.env is None and len(targets) != 1:
             rows = _raw_entries(paths)      # no single env to rate tiers against: list the lines as stored
@@ -301,7 +324,7 @@ def _cache_action(args, paths: Paths, targets: dict) -> int:
         else:
             from tune.winner_cache import tier
             (eid, e), = targets.items()
-            env = _worker(paths, e["python"], "env", "--env-extra", json.dumps(env_extra_for(paths, eid)))["env"]
+            env = docs.get(eid) or _worker(paths, e["python"], "env", "--env-extra", json.dumps(env_extra_for(paths, eid)))["env"]
             doc = []
             for r in _raw_entries(paths):
                 t, fields = tier(r, env)
@@ -328,7 +351,7 @@ def _cache_action(args, paths: Paths, targets: dict) -> int:
                 results[eid] = {"checked": len(res["entries"]), "failed": res["failed"]}
             else:                                       # compact: each env's scope with its own environment as current
                 from tune.winner_cache import WinnerCache
-                env = _worker(paths, e["python"], "env", "--env-extra", extra)["env"]
+                env = docs.get(eid) or _worker(paths, e["python"], "env", "--env-extra", extra)["env"]
                 results[eid] = WinnerCache(paths.winners, env=env).compact()
         except (RuntimeError, OSError, subprocess.TimeoutExpired) as ex:
             results[eid] = {"error": str(ex)}
@@ -714,8 +737,9 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--env", help="env id or interpreter path")
     k.add_argument("--stale", action="store_true", help="ls: only entries that are not current")
     k.add_argument("--yes", action="store_true", help="clear: confirm; ls --env / verify / compact: go ahead even "
-                   "when other processes are using the GPU (these start the env's worker, which opens a CUDA context; "
-                   "verify runs every cached kernel)")
+                   "when other processes are using the GPU (these start the env's worker; verify opens a CUDA context and "
+                   "runs every cached kernel, ls --env / compact open one only until the daemon has stored this GPU's "
+                   "hw_id)")
     k.set_defaults(fn=cmd_cache)
     return ap
 

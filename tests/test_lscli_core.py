@@ -331,6 +331,35 @@ def test_cache_commands_that_use_the_gpu_hold_gpu_lock_and_ask_when_it_is_busy(p
     assert run("cache", "compact", "--yes") == 0 and calls[-1] == "env"
 
 
+def test_cache_ls_and_compact_need_no_lock_once_the_hw_id_is_cached(paths, monkeypatch, capsys):
+    """With this GPU's hw_id in gpu_hw.json, `ls --env` / `compact` read the environment CUDA-free (`--hw-id`): no
+    gpu.lock, no question, even on a busy GPU without a terminal. A worker that answers "needs CUDA" falls back to
+    the guarded CUDA read; `verify` always takes the guard."""
+    from lscli import gate, hwcache
+    from lscli.files import write_json
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(gate, "gpu_identity", lambda index=0: {"uuid": "GPU-t", "name": "t", "count": 1})
+    write_json(paths.gpu_hw, {"GPU-t": "hwX"})
+    envs.register(paths, sys.executable, {"torch": "x"})
+    calls, needs = [], {"cuda": False}
+
+    def worker(_paths, python, op, *argv, **kw):
+        static = "--hw-id" in argv
+        calls.append((op, static))
+        if static and needs["cuda"]:
+            raise RuntimeError(f"{hwcache.NEEDS_CUDA}: libcublasLt is not loaded")
+        return {"entries": [], "failed": 0} if op == "verify" else {"env": {"hw_id": "hwX", "env_id": "x"}}
+    monkeypatch.setattr(cli, "_worker", worker)
+    monkeypatch.setattr(cli, "_gpu_processes", lambda: [4242])                # someone else is computing
+    monkeypatch.setattr(sys, "stdin", _Stdin(tty=False))                      # and nobody could answer a question
+    assert run("cache", "ls") == 0 and run("cache", "compact") == 0
+    assert calls == [("env", True), ("env", True)]
+    assert run("cache", "verify") == cli.EXIT_USAGE and "--yes" in capsys.readouterr().err   # verify: guarded
+    needs["cuda"] = True
+    assert run("cache", "ls") == cli.EXIT_USAGE and calls[-1] == ("env", True)   # falls back to the guard
+    assert run("cache", "ls", "--yes") == 0 and calls[-2:] == [("env", True), ("env", False)]
+
+
 def test_cache_ls_of_raw_lines_never_touches_the_gpu(paths, monkeypatch):
     def no(*a, **k):
         raise AssertionError("no GPU guard / worker for a raw listing")
