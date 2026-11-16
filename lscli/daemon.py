@@ -341,8 +341,14 @@ class Daemon:
         return stage
 
     def _refresh_daemon_env(self) -> None:
-        doc = self._worker_env(self.python, {})
-        if doc:
+        """The daemon venv's environment again, CUDA-free with the known hw_id; a "needs CUDA" answer waits for
+        `probe_gated` (gate open, gpu.lock), which refreshes it. Nothing to refresh before hw_id is known."""
+        if not self.hw_id:
+            return
+        doc = self._worker_env(self.python, {}, self.hw_id)
+        if doc is NEEDS_CUDA:
+            self.need_cuda.add("daemon")
+        elif doc:
             self.daemon_env = doc
 
     def _clear_train_now(self) -> None:

@@ -423,3 +423,21 @@ def test_the_hw_id_cache_is_used_only_for_a_single_visible_gpu(home, monkeypatch
     assert hwcache.known(home, one) == "hwX"
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
     assert hwcache.known(home, one) is None and not hwcache.remember(home, one, "hwZ")
+
+
+def test_the_training_refresh_of_the_daemon_env_is_cuda_free(home, monkeypatch):
+    """#6 refreshes the daemon venv's environment before training decisions: with the cached hw_id, never with CUDA."""
+    from lscli import daemon as dmod
+    d = dmod.Daemon(home, None, python="/daemon/python", battery=lambda: False,
+                    snapshot=lambda: gate.GpuSnapshot([4242], 0, True, {}))
+    calls = []
+    answer = {"doc": {"hw_id": "hwX", "triton": "new"}}
+    monkeypatch.setattr(d, "_worker_env", lambda python, extra, hw_id=None: calls.append(hw_id) or answer["doc"])
+    d._refresh_daemon_env()
+    assert calls == []                                                       # no hw_id yet: nothing to refresh
+    d.hw_id = "hwX"
+    d._refresh_daemon_env()
+    assert calls == ["hwX"] and d.daemon_env["triton"] == "new"
+    answer["doc"] = dmod.NEEDS_CUDA
+    d._refresh_daemon_env()
+    assert calls == ["hwX", "hwX"] and "daemon" in d.need_cuda and d.daemon_env["triton"] == "new"
