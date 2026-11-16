@@ -77,6 +77,11 @@ def cmd_status(args, paths: Paths) -> int:
             lines.append(_training_line(st["models"]["training"]))
     else:
         lines.append("daemon: not running" + (f" (last state {st.get('state')} {_ago(st.get('since'))})" if st else ""))
+    held = control.clock_held(paths)
+    doc["clock_held"] = held is not None
+    if held is not None:
+        lines.append("clock: held" + (f" since {_ago(held['t'])}" if held.get("t") else "")
+                     + " (no GPU jobs, no clock changes; lscli clock release)")
     if control.paused(ctl):
         lines.append("paused" + (f" until {time.strftime('%H:%M', time.localtime(ctl['paused_until']))}"
                                  if ctl.get("paused_until") else ""))
@@ -520,6 +525,49 @@ def cmd_pause(args, paths: Paths) -> int:
     return EXIT_OK
 
 
+HOLD_WAIT_S = 30.0
+
+
+def _wait_no_job(paths: Paths, timeout: float) -> dict | None:
+    """Wait until the running daemon reports no job (its watcher preempts within ~1 s, then up to 5 s of SIGTERM grace,
+    then the clock reset); the job that is still running after `timeout`, else None."""
+    deadline = time.monotonic() + timeout
+    while True:
+        st = control.read_state(paths)
+        job = st.get("job") if st and control.daemon_alive(st) else None
+        if job is None or time.monotonic() >= deadline:
+            return job
+        time.sleep(0.5)
+
+
+def cmd_clock(args, paths: Paths) -> int:
+    """`lscli clock [hold | release]` (spec 4.6). NVML cannot report an `nvidia-smi -lgc` lock, so lscli cannot save
+    and restore one: the user declares it instead. Holding stops the daemon's GPU jobs and every clock change it would
+    make (helper lock / reset, and the unit's reset at start and stop) until release."""
+    if args.action == "hold":
+        doc = control.hold_clock(paths.ensure())
+        job = _wait_no_job(paths, HOLD_WAIT_S)          # a running job stops and resets its own lock first
+        if job is not None:
+            print(f"lscli clock hold: the daemon's job ({job.get('kind')}) has not stopped yet; wait until `lscli status` "
+                  "shows no job before locking the clock", file=sys.stderr)
+        _out(args, {"held": True, "job_running": job is not None, **doc},
+             "clock held: the daemon runs no GPU job and leaves the SM clock alone until `lscli clock release`. "
+             "Lock it yourself now, e.g. `sudo nvidia-smi -lgc 1755,1755`, and reset it (`sudo nvidia-smi -rgc`) "
+             "when done.")
+        return EXIT_OK if job is None else EXIT_FAIL
+    if args.action == "release":
+        was = control.clock_held(paths) is not None
+        control.release_clock(paths)
+        _out(args, {"held": False}, "clock released: the daemon locks / resets the clock around its GPU jobs again"
+             if was else "the clock was not held")
+        return EXIT_OK
+    held = control.clock_held(paths)
+    _out(args, {"held": held is not None, **(held or {})},
+         ("clock held" + (f" since {_ago(held['t'])}" if held.get("t") else "") + " (lscli clock release)")
+         if held is not None else "clock not held")
+    return EXIT_OK
+
+
 def cmd_resume(args, paths: Paths) -> int:
     control.resume(paths.ensure())
     _out(args, {"paused": False}, "resumed")
@@ -632,7 +680,7 @@ def purge_refusal(root: Path) -> str | None:
 
 
 def cmd_uninstall(args, paths: Paths) -> int:
-    """Spec 6: stop and remove the unit, reset the clock, remove the clock helper (sudo), remove every env's hook,
+    """Spec 6: stop and remove the unit, reset the clock (unless held), remove the clock helper (sudo), remove every env's hook,
     remove ~/.local/bin/lscli; keep $LSCLI_HOME and the config unless --purge."""
     import shutil
     if args.purge:                                     # checked before anything is removed
@@ -665,7 +713,11 @@ def cmd_uninstall(args, paths: Paths) -> int:
             subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
     helper = Path(CLOCK_FILES[0])
     if helper.exists():
-        reset = subprocess.run(["sudo", "-n", str(helper), "reset"], capture_output=True)
+        held = control.clock_held(paths) is not None   # the user's lock: leave it, as the daemon does
+        reset = subprocess.CompletedProcess([], 0) if held else subprocess.run(["sudo", "-n", str(helper), "reset"],
+                                                                               capture_output=True)
+        if held:
+            done.append("clock left as it is (held): reset it yourself when done (`sudo nvidia-smi -rgc`)")
         if reset.returncode != 0:                      # keep the helper: it is the user's way back to stock clocks
             done.append("clock reset FAILED; the clock helper was kept (run `sudo nvidia-smi -rgc`, then uninstall again)")
         else:
@@ -748,6 +800,11 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--for", dest="duration", help="e.g. 90m, 2h, 1d (default: until resume)")
     pa.set_defaults(fn=cmd_pause)
     sub.add_parser("resume", help="clear a pause").set_defaults(fn=cmd_resume)
+    ck = sub.add_parser("clock", help="hold the SM clock for a manual lock (no daemon GPU jobs, no clock changes) / release it",
+                        description="hold: the clock is yours (e.g. `sudo nvidia-smi -lgc` for a measurement); the daemon "
+                        "runs no GPU job and never locks or resets the clock until release. No argument: show the state.")
+    ck.add_argument("action", nargs="?", choices=("hold", "release"))
+    ck.set_defaults(fn=cmd_clock)
     lg = sub.add_parser("logs", help="daemon or job log")
     lg.add_argument("-f", "--follow", action="store_true")
     lg.add_argument("-n", "--lines", type=int, default=50)

@@ -75,6 +75,26 @@ def train_now(paths) -> dict:
     return doc
 
 
+def hold_clock(paths) -> dict:
+    """`lscli clock hold`: the SM clock is the user's (e.g. a manual `nvidia-smi -lgc` for a measurement). While the
+    flag file exists the daemon runs no GPU job and never calls the clock helper, and the unit skips its reset at start
+    and stop (spec 4.6). A file, not a control.json key, so the unit's shell can test it."""
+    doc = {"t": time.time()}
+    write_json(paths.clock_hold, doc)
+    return doc
+
+
+def release_clock(paths) -> None:
+    paths.clock_hold.unlink(missing_ok=True)
+
+
+def clock_held(paths) -> dict | None:
+    """The hold document, or None when the clock is not held. Any file there counts (an unreadable one too)."""
+    if not paths.clock_hold.exists():
+        return None
+    return read_json(paths.clock_hold, None) or {}
+
+
 def retrain(paths, stages: list[str] | None) -> dict:
     """`lscli train retrain`: a full retraining (stages None) or just these stages, in a new run directory."""
     doc = {**read_control(paths), "retrain": {"stages": stages, "t": time.time()}}

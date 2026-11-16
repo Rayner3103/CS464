@@ -18,6 +18,9 @@ from pathlib import Path
 
 
 # ------------------------------------------------------------------------------------------------------------ inputs
+CLOCK_HELD = "clock held by the user (lscli clock release)"   # GPU work waits; CPU training stages may run
+
+
 def in_window(window: str, now: _dt.datetime | None = None) -> bool:
     """`HH:MM-HH:MM` local time (may wrap midnight); "" = always. The end minute is excluded."""
     if not window:
@@ -223,7 +226,8 @@ class Gate:
         return foreign
 
     def reasons(self, *, snap: GpuSnapshot, now: float, local: _dt.datetime, battery: bool, paused: bool,
-                backoff_until: float | None, pipeline_locked: bool, own: set[int] | None = None) -> list[str]:
+                backoff_until: float | None, pipeline_locked: bool, own: set[int] | None = None,
+                clock_held: bool = False) -> list[str]:
         """Why the gate is closed ([] = open). `own` = the running job's process tree (None: no job runs)."""
         idle = self.cfg["idle"]
         foreign = self.observe(snap, now, own or set())
@@ -242,6 +246,8 @@ class Gate:
             out.append("on battery")
         if paused:
             out.append("paused")
+        if clock_held:
+            out.append(CLOCK_HELD)
         if backoff_until and now < backoff_until:
             out.append(f"backoff {int(backoff_until - now)}s after a preemption")
         if pipeline_locked:

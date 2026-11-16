@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from lscli import config, envs, gate, jobs, models, scheduler
+from lscli import config, control, envs, gate, jobs, models, scheduler
 from lscli import search_queue as queue
 from lscli.files import write_json
 from lscli.paths import Paths
@@ -164,7 +164,8 @@ def test_gate_opening_and_staying_open_rules():
     g2.job_ended(602)
     assert g2.reasons(snap=_snap(util=90), now=603, **kw) == []                     # our job's tail utilization
     for extra, word in ((dict(battery=True), "battery"), (dict(paused=True), "paused"),
-                        (dict(backoff_until=10_000), "backoff"), (dict(pipeline_locked=True), "pipeline")):
+                        (dict(backoff_until=10_000), "backoff"), (dict(pipeline_locked=True), "pipeline"),
+                        (dict(clock_held=True), "clock held")):
         assert any(word in r for r in g2.reasons(snap=_snap(), now=604, **{**kw, **extra})), word
     assert gate.Gate(cfg).reasons(snap=gate.GpuSnapshot([], None, ok=False), now=0, **kw)[0] == "NVML unavailable"
 
@@ -516,6 +517,127 @@ def test_a_process_that_appears_as_the_worker_finishes_voids_the_result(home, mo
     d = _daemon(home, lambda: gate.GpuSnapshot([424242] if late else [], 0, True, {424242: "late"}))
     d.tick()
     assert d.counters["preempted"] == 1 and not home.winners.exists()
+
+
+# ---------------------------------------------------------------------------------------------- clock hold
+@requires_cuda
+@pytest.mark.skipif(not Path(str(RANKER_2060) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
+def test_a_hold_that_lands_as_the_worker_finishes_voids_the_result(home, monkeypatch):
+    """The user is about to lock another clock: a winner timed under the daemon's policy must not be written."""
+    envs.register(home, sys.executable)
+    eid = envs.env_id(sys.executable)
+    hw = json.loads(subprocess.run([sys.executable, "-m", "lscli.worker", "env"], cwd=REPO, capture_output=True,
+                                   text=True).stdout.splitlines()[-1])["env"]["hw_id"]
+    _setup_models(home, hw)
+    queue.request(home, 1024, 1024, 1024, "fp16", eid, "miss")
+    orig = jobs.converse
+
+    def converse(job, req, **kw):
+        res = orig(job, req, **kw)
+        if "proposals" in req:                       # the measure worker just returned: the user holds the clock
+            control.hold_clock(home)
+        return res
+    monkeypatch.setattr(jobs, "converse", converse)
+    d = _daemon(home, lambda: gate.GpuSnapshot([], 0, True, {}))
+    d.tick()
+    assert d.counters["preempted"] == 1 and not home.winners.exists() and d.backoff_until is None
+
+
+def test_a_held_clock_stops_gpu_work_and_clock_changes(home, monkeypatch, tmp_path):
+    """`lscli clock hold` (spec 4.6): NVML cannot report a manual `nvidia-smi -lgc`, so the user declares it. While held
+    the gate is closed for GPU work (CPU training stages still run) and the daemon never locks; a job the hold preempts
+    ends with the daemon's own lock reset and without backoff, and nothing else resets the user's clock."""
+    from lscli import daemon as dmod, scheduler
+    from lscli.daemon import Daemon
+    (tmp_path / "c.toml").write_text('[idle]\nwindow = ""\ngpu_idle_minutes = 0\nrequire_ac = false\n'
+                                     'backoff_minutes = 1\n[clock]\nlock_mhz = 1500\n')
+    helper = tmp_path / "lscli-clock"
+    helper.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(dmod, "HELPER", helper)
+    calls = []
+    real_run = dmod.subprocess.run
+    monkeypatch.setattr(dmod.subprocess, "run", lambda argv, **kw: calls.append(argv[-1]) or
+                        subprocess.CompletedProcess(argv, 0, "", "") if argv[:2] == ["sudo", "-n"] else real_run(argv, **kw))
+    d = Daemon(home, None, snapshot=lambda: gate.GpuSnapshot([], 0, True, {}), battery=lambda: False)
+    d.clock_lock("lock")
+    d.clock_lock("reset")
+    assert calls == ["lock", "reset"]                                  # not held: the helper is used
+
+    control.hold_clock(home)
+    d.clock_lock("lock")
+    d.clock_lock("reset")
+    assert calls == ["lock", "reset"]                                  # held: no lock, and no reset of the user's clock
+    reasons = d.gate_reasons()
+    assert gate.CLOCK_HELD in reasons
+    assert gate.CLOCK_HELD not in d._remaining(reasons, "lt_fit") and gate.CLOCK_HELD in d._remaining(reasons, "tune_sweep")
+
+    control.release_clock(home)
+    d.clock_lock("lock")                                               # a job locks, then the user holds
+    control.hold_clock(home)
+
+    def preempted(task):                                               # the hold stops the search
+        d.reasons = [gate.CLOCK_HELD]
+        raise jobs.Preempted("held")
+    d.search = preempted
+    d.clock_lock = lambda action, _orig=d.clock_lock: _orig(action) if action == "reset" else None   # already locked
+    d.run_task(scheduler.Task(kind="search", M=64, N=64, K=64, env_id="e"))
+    assert d.counters["preempted"] == 1 and d.backoff_until is None
+    assert calls == ["lock", "reset", "lock", "reset"]                 # its own lock undone before the user locks
+    d.clock_lock("reset")
+    assert calls[-1] == "reset" and len(calls) == 4                    # and nothing after that
+
+    d.clock_locked = True                                              # a reset that fails keeps the lock in mind
+    monkeypatch.setattr(dmod.subprocess, "run", lambda argv, **kw: calls.append(argv[-1]) or
+                        subprocess.CompletedProcess(argv, 1, "", "sudo hiccup"))
+    d.clock_lock("reset")
+    assert d.clock_locked and calls[-1] == "reset"
+
+    control.release_clock(home)
+    assert gate.CLOCK_HELD not in d.gate_reasons()
+
+
+def test_clock_hold_waits_until_the_daemon_has_no_job(home, monkeypatch, capsys):
+    from lscli import cli
+    from lscli.files import write_json
+    write_json(home.state, {"pid": os.getpid(), "job": {"kind": "search"}})
+    monkeypatch.setattr(cli.control, "daemon_alive", lambda st: True)
+    reads = []
+
+    def read_state(paths):
+        reads.append(1)
+        return {"pid": 1, "job": {"kind": "search"} if len(reads) < 3 else None}
+    monkeypatch.setattr(cli.control, "read_state", read_state)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    assert cli.main(["clock", "hold"]) == 0 and len(reads) == 3
+    monkeypatch.setattr(cli.control, "read_state", lambda paths: {"pid": 1, "job": {"kind": "train"}})
+    monkeypatch.setattr(cli, "HOLD_WAIT_S", 0.0)
+    assert cli.main(["clock", "hold"]) == cli.EXIT_FAIL and "has not stopped" in capsys.readouterr().err
+
+
+def test_the_unit_skips_its_clock_reset_while_the_clock_is_held(tmp_path):
+    """ExecStartPre / ExecStopPost run through sh; with the hold file present they must not call the helper."""
+    import re
+    sh = (REPO / "install" / "install.sh").read_text()
+    assert 'sed -e "s|%h/.local/share/lscli|$LSCLI_HOME|g"' in sh                  # how install.sh writes the unit
+    lh = tmp_path / "custom-home"                                                 # a non-default --home
+    unit = re.sub("%h/.local/share/lscli", str(lh), (REPO / "install" / "lscli.service").read_text())
+    lines = [l.split("=", 1)[1] for l in unit.splitlines() if l.startswith(("ExecStartPre=", "ExecStopPost="))]
+    assert all(f"[ -e {lh}/clock.hold ]" in l for l in lines) and len(lines) == 2
+    assert len(lines) == 2
+    log = tmp_path / "log"
+    helper = tmp_path / "lscli-clock"
+    helper.write_text(f"#!/bin/sh\necho \"$1\" >> {log}\n")
+    helper.chmod(0o755)
+    home = tmp_path / "h"
+    lh.mkdir(parents=True)
+    for held in (False, True):
+        hold = lh / "clock.hold"
+        hold.write_text("{}") if held else hold.unlink(missing_ok=True)
+        for line in lines:
+            cmd = (line.lstrip("-").replace("%h", str(home)).replace("/usr/bin/sudo -n ", "")
+                   .replace("/usr/local/libexec/lscli-clock", str(helper)))
+            subprocess.run(cmd, shell=True, check=False)
+    assert log.read_text().split() == ["reset", "reset"]               # twice unheld, never held
 
 
 # ---------------------------------------------------------------------------------------------- environment probes

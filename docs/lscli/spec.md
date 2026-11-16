@@ -27,7 +27,7 @@ implementation plan (branches, PRs, order of work) is [`plan.md`](plan.md). Anyt
 | **daemon** (`lscli daemon run`, unit `lscli.service`) | `~/.local/share/lscli/venv` (pinned versions) | the repo's `requirements.txt` | idle gate, scheduler, Triton ranking and the router (CPU: LightGBM), training, model registry, cache compaction. The daemon process itself never creates a CUDA context; its environment probes open one only with the gate open (section 4.1) |
 | **proposer** (`python -m lscli.propose`) | the daemon venv, started per search job | same as the daemon | the GPU-needing part of ranking: the learned cuBLASLt ranker's proposals (`propose_lt`), which build descriptors and call `cublasLtMatmulAlgoCheck` |
 | **CLI** (`lscli ...`) | the daemon venv (on `PATH` via `~/.local/bin/lscli`) | same as the daemon | user commands, section 6 |
-| **clock helper** (`/usr/local/libexec/lscli-clock`, optional) | root, via one sudoers rule | `nvidia-smi` | locks the SM clock around idle jobs and restores the state it found (section 4.6) |
+| **clock helper** (`/usr/local/libexec/lscli-clock`, optional) | root, via one sudoers rule | `nvidia-smi` | locks the SM clock around idle jobs and resets it after; leaves it alone while the user holds it (section 4.6) |
 
 The client and the daemon never import each other at run time; they communicate only through the files in section 3.
 Nothing leaves the machine: there is no telemetry, and the usage record (shapes, interpreter paths) stays in
@@ -242,7 +242,7 @@ While a job runs, a watcher polls every second. When the gate closes (section 4.
 
 1. The job's process group gets SIGTERM, then SIGKILL after 5 s. Descendants that left the group (spawned compile
    workers) are killed by PID from the last descendant walk.
-2. If the daemon locked the clock, it is restored to the state found before the job (section 4.6).
+2. The clock is reset if the daemon locked it (never while the user holds it, section 4.6).
 3. The unit in flight is discarded. A search writes nothing: the daemon writes the winner only after the worker has
    finished and a final gate check passed. A training stage keeps only the shapes it completed (train_best stages are
    resumable per shape).
@@ -369,23 +369,30 @@ program first runs them.
   and accepts 300 MHz up to that maximum, with no leading zeros. It writes the root-owned `/etc/lscli/clock.conf` and sets
   `[clock] lock_mhz` to the same value.
 * With `lock_mhz > 0`, the daemon runs `sudo -n /usr/local/libexec/lscli-clock lock` before a GPU job and
-  `sudo -n /usr/local/libexec/lscli-clock restore` after it, on preemption and on exit.
-* **Restore, not reset.** `lock` first saves the clock state it finds (the SM clock lock in force, or none) to a
-  root-owned file under `/run/lscli-clock/`, then locks to `clock.conf`'s MHz. If a saved state already exists (an
-  earlier `lock` was never restored, e.g. after a crash), it keeps that one instead of saving lscli's own lock as
-  the previous state. If it cannot read the current state reliably, it saves `unknown`.
-* `restore` puts the saved state back and deletes the file: the previous lock is re-applied, or the clock is reset
-  (`nvidia-smi -rgc`) when none was in force. With no saved state, or one that is `unknown` or unreadable, it falls
-  back to the reset. A manual lock such as `nvidia-smi -lgc 1755,1755` therefore survives the daemon's jobs.
-* **Fail-safe.** The unit runs `restore` in `ExecStartPre` and `ExecStopPost`, so a crash or SIGKILL ends at the
-  saved baseline (or the reset, when none was saved) by the next start at the latest. `/run` is cleared at reboot,
-  as is any clock lock.
+  `sudo -n /usr/local/libexec/lscli-clock reset` after it, on preemption and on exit.
+* **A manual lock is held, not restored.** NVML has no getter for an `nvidia-smi -lgc` lock and `nvidia-smi` does
+  not show one: on the RTX 2060 (driver 595) a lock at 1500 MHz left NVML's reported SM clock range unchanged and an
+  idle locked GPU read the same 300 MHz as an unlocked one. lscli therefore cannot save the clock state it finds
+  and put it back. Instead the user declares it: `lscli clock hold` writes `$LSCLI_HOME/clock.hold`, and while that
+  file exists
+  * the gate stays closed for GPU work (reason `clock held by the user`); CPU-only training stages still run;
+  * the daemon never locks; a GPU job running when the hold arrives is preempted without backoff and resets the
+    lock it set, and `lscli clock hold` returns only once no daemon job runs (up to 30 s), so the user's own lock
+    always comes after that reset. A result whose final gate check sees the hold is discarded;
+  * nothing else resets the clock: not the daemon after that, not the unit's `ExecStartPre` / `ExecStopPost` (a
+    daemon restart does not end the lock), and not `lscli uninstall`.
+
+  `lscli clock release` deletes the file; from the next job on the daemon locks and resets again. Hold before
+  locking (`lscli clock hold`, then `sudo nvidia-smi -lgc 1755,1755`), and reset your own lock when done. One
+  narrow case is left: a daemon killed (SIGKILL, crash) between its own lock and its reset while the clock is held
+  leaves its lock in place, since the unit's reset is skipped; the user's own `-lgc` / `-rgc` replaces it.
+* **Fail-safe.** Without a hold, the unit runs `reset` in `ExecStartPre` and `ExecStopPost`, so a crash or SIGKILL
+  is cleaned up at the next start at the latest.
 * The helper:
   * is root-owned (0755) in root-owned directories;
   * uses an absolute `/usr/bin/nvidia-smi` and a scrubbed environment;
-  * takes exactly one argument, `lock` or `restore`;
-  * reads the MHz only from `clock.conf` and re-validates it, and re-validates a saved state the same way before
-    applying it.
+  * takes exactly one argument, `lock` or `reset`;
+  * reads the MHz only from `clock.conf` and re-validates it.
 * `/etc/sudoers.d/lscli` allows exactly those two command lines, for the installing user only, and is checked with
   `visudo -c`.
 * Without the helper, `lock_mhz` must be 0.
@@ -505,6 +512,7 @@ overhead.
 | `enable-env` | `lscli enable-env [PYTHON] [--no-deps]` (default: `python3` on `PATH`) | Needs torch + triton importable there. Refuses when a package named like lscli's (`lscli`, `tune`, `kernels`, `baselines`, `analysis`) is importable from anywhere but lscli's copy, checked both isolated (`python -I`) and from the caller's cwd with its `PYTHONPATH`, so a checkout reachable there is reported as a clash instead of being registered. pip-installs numpy / nvidia-ml-py if missing (`--no-deps`: fail instead). Writes `lscli.pth` into the env's site-packages: it puts `src/` on the path and runs the `LSCLI_PATCH` hook. Registers the env in `envs.json` and queues the shapes the profile already knows for it |
 | `disable-env` | `lscli disable-env PYTHON` | Remove `lscli.pth`; unregister |
 | `envs` | `lscli envs` | List registered interpreters and their versions |
+| `clock` | `lscli clock [hold \| release]` | Hold the SM clock for a manual lock: no daemon GPU job and no clock change (helper or unit) until release; no argument shows the state (section 4.6) |
 | `pause` / `resume` | `lscli pause [--for DURATION]`, `lscli resume` | Stop starting jobs (a running one is preempted) / clear the pause |
 | `prewarm` | `lscli prewarm (--shapes FILE \| MxNxK ...) [--dtype fp16] [--env ID]` | Queue shapes (`manual`); FILE is a shapes JSON (`suites/` format) |
 | `profile` | `lscli profile [--top N] [--layout NN\|NT]` | The usage record, hottest first |
@@ -514,7 +522,7 @@ overhead.
 | `logs` | `lscli logs [-f] [--job ID]` | Daemon or job log |
 | `doctor` | `lscli doctor` | Checks: GPU and driver, systemd user session and linger, unit state, clock helper, versions of each registered env (and gcc + `Python.h`, which Triton's launcher needs), file permissions, models present, processes holding a CUDA context (they keep the gate closed) |
 | `daemon` | `lscli daemon run` (used by the unit) / `start` / `stop` / `restart` | Foreground loop / `systemctl --user` wrappers |
-| `uninstall` | `lscli uninstall [--purge] [--yes]` | Stop and remove the unit, restore the clock (section 4.6), remove the clock helper (sudo), `disable-env` every registered env, remove `~/.local/bin/lscli`; keep `$LSCLI_HOME` unless `--purge`. `--purge` deletes only an lscli home (the `.lscli-home` marker, or an install from before it: section 8) and is checked before anything is removed; without `--yes` it asks you to type the path |
+| `uninstall` | `lscli uninstall [--purge] [--yes]` | Stop and remove the unit, reset the clock unless it is held (section 4.6), remove the clock helper (sudo), `disable-env` every registered env, remove `~/.local/bin/lscli`; keep `$LSCLI_HOME` unless `--purge`. `--purge` deletes only an lscli home (the `.lscli-home` marker, or an install from before it: section 8) and is checked before anything is removed; without `--yes` it asks you to type the path |
 
 Exit codes: `0` success, `1` failure, `2` usage error, `3` the daemon is needed but not running, `4` unsupported
 system (no NVIDIA GPU, no systemd user session).
