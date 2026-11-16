@@ -72,6 +72,14 @@ def _daemon(home):
     return Daemon(home, None, snapshot=lambda: gate.GpuSnapshot([], 0, True, {}), battery=lambda: False)
 
 
+def _hw_known(home, monkeypatch):
+    """This GPU's hw_id is cached, so the daemon's probes are the CUDA-free ones (lscli/hwcache.py)."""
+    from lscli.files import write_json
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(gate, "gpu_identity", lambda index=0: {"uuid": "GPU-t", "name": "t", "count": 1})
+    write_json(home.gpu_hw, {"GPU-t": "hwX"})
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setenv("LSCLI_HOME", str(tmp_path / "home"))
@@ -87,10 +95,11 @@ def test_the_daemon_blocks_a_refused_env_until_it_is_registered_again(home, monk
     from lscli import cli, control
     eid, _ = envs.register(home, sys.executable, {"torch": "x"})
     d = _daemon(home)
+    d.hw_id = "hwX"                                                       # env probes need a known hw_id
     probes = []
     msg = f"{guard.PREFIX}: tune resolves to /x/tune, not lscli's copy /src/tune"
 
-    def worker_env(python, extra):
+    def worker_env(python, extra, hw_id=None):
         probes.append(python)
         d.probe_error = msg
         return None
@@ -125,6 +134,7 @@ def test_a_probe_that_times_out_after_a_refused_one_does_not_inherit_its_error(h
     """The guard message belongs to the probe that printed it: a later probe failing another way is not blocked."""
     from lscli import daemon as dmod
     eid, _ = envs.register(home, sys.executable, {"torch": "x"})
+    _hw_known(home, monkeypatch)                                          # resolve_hw probes (CUDA-free)
     d = _daemon(home)
     msg = f"{guard.PREFIX}: tune resolves to /x/tune, not lscli's copy /src/tune"
     runs = []
@@ -137,5 +147,26 @@ def test_a_probe_that_times_out_after_a_refused_one_does_not_inherit_its_error(h
     monkeypatch.setattr(dmod.subprocess, "run", run)
     assert d.resolve_hw() is False and d.env_blocked["daemon"][1] == msg
     assert d.resolve_hw() is False and len(runs) == 1                      # the daemon venv is not probed again
+    d.hw_id = "hwX"                                                       # env probes need a known hw_id
     d.caches()
     assert len(runs) == 2 and eid not in d.env_blocked and eid in d.unknown_envs   # failed, retried later, not blocked
+
+
+def test_a_gated_probe_the_guard_refused_is_not_retried(home, monkeypatch):
+    """The first probe on a GPU needs CUDA and runs with the gate open; a guard refusal there blocks the daemon venv
+    (or the env) like a CUDA-free one: no probe every tick."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    monkeypatch.setattr(gate, "gpu_identity", lambda index=0: {"uuid": "GPU-t", "name": "t", "count": 1})
+    d = _daemon(home)
+    msg = f"{guard.PREFIX}: tune resolves to /x/tune, not lscli's copy /src/tune"
+    probes = []
+
+    def worker_env(python, extra, hw_id=None):
+        probes.append(hw_id)
+        d.probe_error = msg
+        return None
+    monkeypatch.setattr(d, "_worker_env", worker_env)
+    d.start()
+    for _ in range(3):
+        d.tick()
+    assert probes == [None] and "daemon" in d.env_blocked and not d.need_cuda and d.hw_id is None

@@ -105,12 +105,18 @@ class Daemon:
             self.need_cuda.add("daemon")
             return False
         if not doc:
-            if (self.probe_error or "").startswith(guard.PREFIX):   # the daemon venv itself: no retry until restart
-                self.env_blocked["daemon"] = ((), self.probe_error)
-                self.log.error("the daemon venv's worker refused to run: %s", self.probe_error)
+            self._block_daemon_if_refused()
             return False
         self.daemon_env, self.hw_id = doc, hw
         self.need_cuda.discard("daemon")
+        return True
+
+    def _block_daemon_if_refused(self) -> bool:
+        """The runtime guard refused the daemon venv's own worker: no retry until restart (spec 5.1)."""
+        if not (self.probe_error or "").startswith(guard.PREFIX):
+            return False
+        self.env_blocked["daemon"] = ((), self.probe_error)
+        self.log.error("the daemon venv's worker refused to run: %s", self.probe_error)
         return True
 
     def probe_gated(self) -> None:
@@ -126,9 +132,14 @@ class Daemon:
             lockf.close()
             return
         try:
+            if "daemon" in self.need_cuda and "daemon" in self.env_blocked:
+                self.need_cuda.discard("daemon")
             if "daemon" in self.need_cuda:
                 doc = self._worker_env(self.python, {})
-                if isinstance(doc, dict) and doc.get("hw_id"):
+                if not isinstance(doc, dict):
+                    if self._block_daemon_if_refused():
+                        self.need_cuda.discard("daemon")
+                elif doc.get("hw_id"):
                     self.need_cuda.discard("daemon")
                     self.daemon_env, self.hw_id = doc, doc["hw_id"]
                     if not self.identity.get("uuid"):
@@ -142,7 +153,7 @@ class Daemon:
             for eid in sorted(self.need_cuda - {"daemon"}):
                 self.need_cuda.discard(eid)
                 rec = registry.get(eid)
-                if rec is None:
+                if rec is None or eid in self.env_blocked:
                     continue
                 doc = self._worker_env(rec["python"], self.env_extra(eid))
                 if isinstance(doc, dict):
@@ -150,6 +161,8 @@ class Daemon:
                     self.env_failed.pop(eid, None)
                 else:
                     self.env_failed[eid] = now
+                    if (self.probe_error or "").startswith(guard.PREFIX):
+                        self.block_env(eid, self.probe_error)
         finally:
             fcntl.flock(lockf, fcntl.LOCK_UN)
             lockf.close()
