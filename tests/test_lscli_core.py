@@ -258,6 +258,26 @@ def test_cache_ls_raw_and_clear(paths, capsys):
     assert run("cache", "clear", "--yes") == 0 and not paths.winners.exists()
 
 
+def test_cache_ls_skips_damaged_lines(paths, monkeypatch, capsys):
+    """Lines that pass the key-field check but have no usable `choice` or `env` are skipped, not a traceback."""
+    from tune.winner_cache import SCHEMA, WinnerCache
+    env = {"hw_id": "g", "env_id": "e1"}
+    WinnerCache(paths.winners, env=env).put(8, 8, 8, "fp16", k=3, lt_n=0, choice={"key": "bm16_bn16_bk16_w1_s1_g1_sk1",
+                                            "family": "triton", "mode": "cold"})
+    base = {"schema": SCHEMA, "M": 16, "N": 16, "K": 16, "dtype": "fp16", "k": 3, "lt_n": 0, "env": env}
+    with paths.winners.open("a") as f:
+        for bad in ({}, {"choice": None}, {"choice": "bm16"}, {"choice": {"family": "triton"}},
+                    {"choice": {"key": "x"}, "env": "gpu"}):
+            f.write(json.dumps({**base, **bad}) + "\n")
+    assert run("--json", "cache", "ls") == 0                        # raw listing (no registered env)
+    assert [r["key"] for r in json.loads(capsys.readouterr().out)] == ["bm16_bn16_bk16_w1_s1_g1_sk1"]
+    envs.register(paths, sys.executable, {"torch": "x"})            # one env: tiers against its environment
+    monkeypatch.setattr(cli, "_gpu_processes", lambda: [])
+    monkeypatch.setattr(cli, "_worker", lambda *a, **k: {"env": env})
+    assert run("--json", "cache", "ls") == 0
+    assert [r["key"] for r in json.loads(capsys.readouterr().out)] == ["bm16_bn16_bk16_w1_s1_g1_sk1"]
+
+
 class _Stdin:
     def __init__(self, tty, answer=""):
         self.tty, self.answer = tty, answer

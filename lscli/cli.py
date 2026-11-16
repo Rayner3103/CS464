@@ -182,10 +182,16 @@ def env_extra_for(paths: Paths, eid: str) -> dict:
 
 
 def _raw_entries(paths: Paths) -> list[dict]:
+    """The stored entries, last line per (shape, environment). `_parse` checks only the key fields, so a damaged line
+    whose `choice` has no key, or whose `env` is not an object, is skipped here like an unreadable one (`cache ls`
+    reads both)."""
     from tune.winner_cache import WinnerCache
     rows = {}
     for r, _ in WinnerCache._parse(paths.winners.read_text().splitlines() if paths.winners.exists() else []):
         if r.get("kind") == "verified":
+            continue
+        choice, env = r.get("choice"), r.get("env")
+        if not (isinstance(choice, dict) and isinstance(choice.get("key"), str)) or not isinstance(env, (dict, type(None))):
             continue
         rows[(r["M"], r["N"], r["K"], r["dtype"], json.dumps(r.get("env"), sort_keys=True))] = r
     return list(rows.values())
