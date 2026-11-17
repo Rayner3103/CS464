@@ -24,7 +24,7 @@ implementation plan (branches, PRs, order of work) is [`plan.md`](plan.md). Anyt
 |---|---|---|---|
 | **client** (`lscli.enable()`, the patch; `src/` on the env's path via `lscli.pth`) | the user's own Python env | torch, triton, numpy, nvidia-ml-py (+ lightgbm / pandas for the optional inline search) | counts shapes, dispatches cached winners, falls back to torch, queues misses |
 | **worker** (`python -m lscli.worker`) | the user's interpreter, started by the daemon | same as the client | compiles, validates and times one proposed pool (`tune.online.measure`), writes the winner |
-| **daemon** (`lscli daemon run`, unit `lscli.service`) | `~/.local/share/lscli/venv` (pinned versions) | the repo's `requirements.txt` | idle gate, scheduler, Triton ranking and the router (CPU: LightGBM), training, model registry, cache compaction. The daemon process itself never creates a CUDA context |
+| **daemon** (`lscli daemon run`, unit `lscli.service`) | `~/.local/share/lscli/venv` (pinned versions) | the repo's `requirements.txt` | idle gate, scheduler, Triton ranking and the router (CPU: LightGBM), training, model registry, cache compaction. The daemon process itself never creates a CUDA context; its environment probes open one only with the gate open (section 4.1) |
 | **proposer** (`python -m lscli.propose`) | the daemon venv, started per search job | same as the daemon | the GPU-needing part of ranking: the learned cuBLASLt ranker's proposals (`propose_lt`), which build descriptors and call `cublasLtMatmulAlgoCheck` |
 | **CLI** (`lscli ...`) | the daemon venv (on `PATH` via `~/.local/bin/lscli`) | same as the daemon | user commands, section 6 |
 | **clock helper** (`/usr/local/libexec/lscli-clock`, optional) | root, via one sudoers rule | `nvidia-smi` | locks the SM clock around idle jobs and restores the state it found (section 4.6) |
@@ -122,9 +122,10 @@ No shape is ever dropped: a decayed count only gets smaller (section 9).
 `reason` is one of `manual` (`lscli prewarm`), `miss` (client fallback), `stale` (soft-stale entry served),
 `superseded` (new models), in that priority order. Duplicates are allowed: the daemon de-duplicates on (shape, dtype,
 env_id), keeping the most urgent reason, and drops requests a current cache entry already satisfies. It records how
-far it consumed in `queue.offset`. When everything is consumed it truncates the file **in place, under the same
-`flock` the appenders take** (the inode never changes, so no writer can append to an unlinked file), and resets the
-offset to 0.
+far it consumed in `queue.offset`. Once requests are done, it rewrites the file **in place, under the same `flock`
+the appenders take**, keeping only the requests that still need work. The inode never changes, so no writer can
+append to an unlinked file, and one request waiting for a slow re-search never holds up the others. A request of a
+registered env whose environment could not be probed yet is kept.
 
 ### 3.5 `envs.json`
 
@@ -212,6 +213,17 @@ A job's processes are the job's root process and all its descendants, found by w
 each poll (sweep compile workers are spawned grandchildren). NVML reports host PIDs: processes in other PID namespaces
 (containers) may appear with PIDs that match nothing, and they count as foreign. This errs on the side of yielding.
 
+**Environment probes** (the environment doc of the daemon venv and of each registered env, section 3.6) open no CUDA
+context. A doc needs CUDA for two fields only: `hw_id` (SM count and memory from the device properties, which NVML
+cannot give exactly) and the cuBLASLt version. The worker reads the cuBLASLt version from the library `import torch`
+maps, with no context, and takes `hw_id` from `gpu_hw.json`, where it is stored per NVML UUID the first time it is
+computed (`lscli/hwcache.py`). Probes run at daemon start, once a day per env, after a model or config change and
+when a worker reports a different environment. A probe that needs CUDA runs only while the gate is open, under
+`gpu.lock`, like a job: the first probe of a GPU not yet in `gpu_hw.json`, an env whose worker cannot read the
+cuBLASLt version without a context, and any probe when NVML lists more than one GPU or `CUDA_VISIBLE_DEVICES` is set
+to anything but `0`. Until then the daemon has no `hw_id` (no models, no searches) or the env stays unknown (its
+requests stay queued). A search's own environment, measured in the job with CUDA, also refreshes `gpu_hw.json`.
+
 ### 4.2 Preemption
 
 While a job runs, a watcher polls every second. When the gate closes (section 4.1):
@@ -219,8 +231,8 @@ While a job runs, a watcher polls every second. When the gate closes (section 4.
 1. The job's process group gets SIGTERM, then SIGKILL after 5 s. Descendants that left the group (spawned compile
    workers) are killed by PID from the last descendant walk.
 2. If the daemon locked the clock, it is restored to the state found before the job (section 4.6).
-3. The unit in flight is discarded. A search writes nothing, because the worker writes its winner only as its last
-   step and is killed before that. A training stage keeps only the shapes it completed (train_best stages are
+3. The unit in flight is discarded. A search writes nothing: the daemon writes the winner only after the worker has
+   finished and a final gate check passed. A training stage keeps only the shapes it completed (train_best stages are
    resumable per shape).
 4. `backoff_minutes` of backoff starts.
 
@@ -261,7 +273,9 @@ For a (shape, dtype, env_id):
 3. **Measurement**: `<env python> -m lscli.worker measure` (protocol in section 7) with all the proposal keys. The
    worker queries its own library's heuristic top `lt_n`, rebuilds the pool (`backends_from_keys`), short-times
    torch.matmul for the shape (`torch_us`), runs `tune.online.measure` (with the router round trip when a router is
-   active), and writes the winner to `winners.jsonl` with its own environment plus `env_extra`.
+   active), and returns the winner with its own environment plus `env_extra`. After the worker has exited, the daemon
+   checks the gate once more, then writes the winner to `winners.jsonl` (so a foreign process that appeared within
+   the last watch interval voids the result instead of storing it).
 
 The worker uses the user's normal `TRITON_CACHE_DIR`, so the kernels it compiles are already cached when the user's
 program first runs them.
@@ -443,7 +457,7 @@ overhead.
 | `pause` / `resume` | `lscli pause [--for DURATION]`, `lscli resume` | Stop starting jobs (a running one is preempted) / clear the pause |
 | `prewarm` | `lscli prewarm (--shapes FILE \| MxNxK ...) [--dtype fp16] [--env ID]` | Queue shapes (`manual`); FILE is a shapes JSON (`suites/` format) |
 | `profile` | `lscli profile [--top N] [--layout NN\|NT]` | The usage record, hottest first |
-| `cache` | `lscli cache ls [--stale]` / `verify` / `compact` / `clear [--yes]` | List entries with tiers; run the correctness check on every entry served here; compact; delete the file. `ls` with one env, `verify` and `compact` start the env's worker (a CUDA context; `verify` runs every cached kernel): they hold `gpu.lock` while it runs, refuse while a daemon job holds it (`lscli pause` first), and ask before using a GPU that other processes are computing on (`--yes` answers; without a terminal they refuse) |
+| `cache` | `lscli cache ls [--stale]` / `verify` / `compact` / `clear [--yes]` | List entries with tiers; run the correctness check on every entry served here; compact; delete the file. `verify` starts the env's worker, which opens a CUDA context and runs every cached kernel; `ls` with one env and `compact` start it to read the environment, which needs no context once the GPU's `hw_id` is in `gpu_hw.json` (section 4.1, environment probes). With a context they hold `gpu.lock` while it runs, refuse while a daemon job holds it (`lscli pause` first), and ask before using a GPU that other processes are computing on (`--yes` answers; without a terminal they refuse); without one they do neither |
 | `train` | `lscli train status` / `start` / `retrain [--stages S,...]` | Training progress; allow training now (window ignored, gate still required); force stages |
 | `config` | `lscli config [KEY [VALUE]]` | Show / get / set a config key (`idle.window`, ...) and tell the daemon to reload. Setting rewrites `config.toml` in full from the validated config: comments are not kept and every default is written out (it no longer follows a changed default); a file with an unknown key is refused, not rewritten |
 | `logs` | `lscli logs [-f] [--job ID]` | Daemon or job log |
@@ -474,8 +488,11 @@ It writes JSON lines to its **protocol channel**:
 * `{"op": "route", "t_lt_us": 41.2}` when `router` is true, after the cuBLASLt half is timed. The daemon answers on
   stdin with `{"skip": false, "p": 0.31, "threshold": 0.02}`. With no answer within `reply_timeout_s`, the worker
   does not skip.
-* `{"op": "result", "choice": {...}, "candidates": [...], "router": {...}, "torch_us": 812.0, "written": true,
-  "env": {...}}` as the last line. `env` is the worker's environment, used to update `envs.json`.
+* `{"op": "result", "choice": {...}, "candidates": [...], "router": {...}, "torch_us": 812.0, "written": false,
+  "env": {...}, "put": {...}}` as the last line:
+  * `env` is the worker's environment, used to update `envs.json` and the daemon's view of that env;
+  * `put` is the cache entry. The daemon writes it after its final gate check, so the daemon's requests carry
+    `"cache": null`. With a cache path (standalone use), the worker writes it itself.
 * `{"op": "error", "error": "..."}` for any failure (the exit status is non-zero too).
 
 The channel is the worker's original stdout. At start-up the worker duplicates fd 1 to a private descriptor, then
