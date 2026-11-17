@@ -182,10 +182,12 @@ def cmd_prewarm(args, paths: Paths) -> int:
 
 
 # ------------------------------------------------------------------------------------------------------------ cache
-def _worker(python: str, *argv: str, timeout: float = 3600) -> dict:
-    """Run `python -m lscli.worker ...` and return its result line (raises on an error line or no result)."""
+def _worker(paths: Paths, python: str, *argv: str, timeout: float = 3600) -> dict:
+    """Run `python -m lscli.worker ...` and return its result line (raises on an error line or no result). It runs in
+    lscli's source directory, as the daemon's workers do: `-m` puts the cwd first on sys.path, so a worker started from
+    inside a CS464 checkout would otherwise import that checkout's lscli / harness."""
     r = subprocess.run([python, "-m", "lscli.worker", *argv], capture_output=True, text=True, timeout=timeout,
-                       stdin=subprocess.DEVNULL)
+                       stdin=subprocess.DEVNULL, cwd=source_dir(paths))
     for line in reversed(r.stdout.strip().splitlines()):
         try:
             doc = json.loads(line)
@@ -306,7 +308,7 @@ def _static_envs(paths: Paths, targets: dict) -> dict:
     out = {}
     for eid, e in targets.items():
         try:
-            out[eid] = _worker(e["python"], "env", "--env-extra", json.dumps(env_extra_for(paths, eid)),
+            out[eid] = _worker(paths, e["python"], "env", "--env-extra", json.dumps(env_extra_for(paths, eid)),
                                "--hw-id", hw)["env"] if hw else None
         except (RuntimeError, OSError, subprocess.TimeoutExpired):
             out[eid] = None                 # "needs CUDA", or any other failure: the CUDA probe reports it
@@ -324,7 +326,7 @@ def _cache_action(args, paths: Paths, targets: dict, docs: dict | None = None) -
         else:
             from tune.winner_cache import tier
             (eid, e), = targets.items()
-            env = docs.get(eid) or _worker(e["python"], "env", "--env-extra", json.dumps(env_extra_for(paths, eid)))["env"]
+            env = docs.get(eid) or _worker(paths, e["python"], "env", "--env-extra", json.dumps(env_extra_for(paths, eid)))["env"]
             doc = []
             for r in _raw_entries(paths):
                 t, fields = tier(r, env)
@@ -346,12 +348,12 @@ def _cache_action(args, paths: Paths, targets: dict, docs: dict | None = None) -
         extra = json.dumps(env_extra_for(paths, eid))
         try:
             if args.action == "verify":
-                res = _worker(e["python"], "verify", "--cache", str(paths.winners), "--env-extra", extra)
+                res = _worker(paths, e["python"], "verify", "--cache", str(paths.winners), "--env-extra", extra)
                 failed += res["failed"]
                 results[eid] = {"checked": len(res["entries"]), "failed": res["failed"]}
             else:                                       # compact: each env's scope with its own environment as current
                 from tune.winner_cache import WinnerCache
-                env = docs.get(eid) or _worker(e["python"], "env", "--env-extra", extra)["env"]
+                env = docs.get(eid) or _worker(paths, e["python"], "env", "--env-extra", extra)["env"]
                 results[eid] = WinnerCache(paths.winners, env=env).compact()
         except (RuntimeError, OSError, subprocess.TimeoutExpired) as ex:
             results[eid] = {"error": str(ex)}
@@ -369,6 +371,12 @@ _FIND = ("import importlib.util, json, sys; out = {}\n"
          "    s = importlib.util.find_spec(n)\n"
          "    out[n] = (s.origin or (list(s.submodule_search_locations or []) or [None])[0]) if s else None\n"
          "print(json.dumps(out))")
+
+
+def is_our_wrapper(text: str) -> bool:
+    """The `~/.local/bin/lscli` install.sh writes: `exec ".../venv/bin/python" -I -m lscli "$@"` (earlier `-P`, and before
+    the cwd fix nothing), so uninstall removes it and nothing else of that name."""
+    return re.search(r'/venv/bin/python" (-[IP] )?-m lscli "\$@"', text) is not None
 
 
 def source_dir(paths: Paths) -> Path:
@@ -574,6 +582,119 @@ def cmd_train(args, paths: Paths) -> int:
     return EXIT_OK
 
 
+# ------------------------------------------------------------------------------------------------------------ doctor
+def cmd_doctor(args, paths: Paths) -> int:
+    from lscli import doctor
+    rows = doctor.checks(paths)
+    _out(args, rows, doctor.report(rows))
+    return doctor.exit_code(rows)
+
+
+# ------------------------------------------------------------------------------------------------------------ uninstall
+CLOCK_FILES = ("/usr/local/libexec/lscli-clock", "/etc/sudoers.d/lscli", "/etc/lscli/clock.conf")
+HOME_MARKER = ".lscli-home"                  # written by install.sh; `--purge` deletes only a home that has it
+LSCLI_REPO = "https://github.com/Rayner3103/CS464.git"   # install.sh's default --repo (the legacy-home check)
+
+
+def is_lscli_home(root: Path) -> bool:
+    """The marker install.sh writes, or an install from before it: src/ a git clone whose origin is lscli's repository,
+    and venv/bin/python (install.sh's own check for a re-install, which then adds the marker)."""
+    if (root / HOME_MARKER).is_file():
+        return True
+    if not ((root / "src" / ".git").is_dir() and os.access(root / "venv" / "bin" / "python", os.X_OK)):
+        return False
+    r = subprocess.run(["git", "-C", str(root / "src"), "remote", "get-url", "origin"], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == LSCLI_REPO
+
+
+def purge_refusal(root: Path) -> str | None:
+    """Why `--purge` must not delete `root` (None = safe): never /, $HOME or one of its ancestors, and only an lscli
+    home (`is_lscli_home`: install.sh's marker, or an install from before it)."""
+    root = root.resolve()
+    home = Path.home().resolve()
+    if root == Path("/") or root == home or root in home.parents:
+        return "it is / or your home directory (or above it)"
+    if not root.is_dir():
+        return "not a directory"
+    if not is_lscli_home(root):
+        return f"it is not an lscli home (no {HOME_MARKER}, and not an install from before the marker)"
+    return None
+
+
+def cmd_uninstall(args, paths: Paths) -> int:
+    """Spec 6: stop and remove the unit, reset the clock, remove the clock helper (sudo), remove every env's hook,
+    remove ~/.local/bin/lscli; keep $LSCLI_HOME and the config unless --purge."""
+    import shutil
+    if args.purge:                                     # checked before anything is removed
+        why = purge_refusal(paths.root)
+        if why:
+            print(f"lscli uninstall --purge: refusing to delete {paths.root}: {why}", file=sys.stderr)
+            return EXIT_FAIL
+    if not args.yes:
+        try:
+            if args.purge:                             # deleting a directory: type its path, not just "y"
+                root = str(paths.root.resolve())
+                ans = input(f"Uninstall lscli and DELETE {root} (usage record, models, winners) and the config.\n"
+                            f"Type the path to confirm: ")
+                ok = ans.strip().rstrip("/") == root
+            else:
+                ok = input("Uninstall lscli (data kept)? [y/N] ").lower().startswith("y")
+        except EOFError:
+            ok = False
+        if not ok:
+            print("nothing done")
+            return EXIT_FAIL
+    done = []
+    unit = Path.home() / ".config" / "systemd" / "user" / "lscli.service"
+    if shutil.which("systemctl"):
+        subprocess.run(["systemctl", "--user", "disable", "--now", "lscli.service"], capture_output=True)
+    if unit.exists():
+        unit.unlink()
+        done.append(f"removed {unit}")
+        if shutil.which("systemctl"):
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    helper = Path(CLOCK_FILES[0])
+    if helper.exists():
+        reset = subprocess.run(["sudo", "-n", str(helper), "reset"], capture_output=True)
+        if reset.returncode != 0:                      # keep the helper: it is the user's way back to stock clocks
+            done.append("clock reset FAILED; the clock helper was kept (run `sudo nvidia-smi -rgc`, then uninstall again)")
+        else:
+            r = subprocess.run(["sudo", "rm", "-f", *CLOCK_FILES])        # may ask for a password: the only root step
+            subprocess.run(["sudo", "rmdir", "/etc/lscli"], capture_output=True)
+            done.append("removed the clock helper" if r.returncode == 0 else "could NOT remove the clock helper (sudo)")
+    for eid, rec in list(envs.load(paths).items()):
+        try:
+            site = Path(_py(rec["python"], "-c", _SITE))
+            (site / PTH).unlink(missing_ok=True)
+            done.append(f"removed {site / PTH}")
+        except (RuntimeError, OSError) as e:
+            done.append(f"env {eid}: could not remove its hook ({e})")
+        envs.unregister(paths, eid)
+    wrapper = Path.home() / ".local" / "bin" / "lscli"
+    try:                                               # only the wrapper install.sh writes
+        if wrapper.exists() and is_our_wrapper(wrapper.read_text(errors="replace")):
+            wrapper.unlink()
+            done.append(f"removed {wrapper}")
+    except OSError:
+        pass
+    done.append("linger was left as it is (loginctl disable-linger $USER if you enabled it for lscli)")
+    if args.purge:
+        from lscli.paths import config_path
+        shutil.rmtree(paths.root, ignore_errors=True)
+        cfg = config_path()
+        cfg.unlink(missing_ok=True)                    # the file only; its directory only when it is lscli's and empty
+        try:
+            if cfg.parent.name == "lscli":
+                cfg.parent.rmdir()
+        except OSError:
+            pass
+        done.append(f"removed {paths.root} and {cfg}")
+    else:
+        done.append(f"kept {paths.root} (lscli uninstall --purge removes it)")
+    _out(args, {"done": done}, "\n".join(done))
+    return EXIT_OK
+
+
 # ------------------------------------------------------------------------------------------------------------ main
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="lscli", description="learned-selector CLI (docs/lscli/spec.md)")
@@ -626,6 +747,12 @@ def build_parser() -> argparse.ArgumentParser:
     tn.add_argument("action", choices=("status", "start", "retrain"))
     tn.add_argument("--stages", help="retrain: comma-separated train_best stages (default: everything)")
     tn.set_defaults(fn=cmd_train)
+    sub.add_parser("doctor", help="check the GPU, systemd, the daemon, the clock helper, envs and models").set_defaults(fn=cmd_doctor)
+    un = sub.add_parser("uninstall", help="remove the unit, clock helper, env hooks and command (data kept unless --purge)")
+    un.add_argument("--purge", action="store_true", help="also delete $LSCLI_HOME (only an lscli home: install.sh's "
+                    ".lscli-home marker, or an install from before it) and the config; asks you to type the path")
+    un.add_argument("--yes", action="store_true", help="do not ask (and, with --purge, do not ask for the path)")
+    un.set_defaults(fn=cmd_uninstall)
     k = sub.add_parser("cache", help="inspect / verify / compact / clear the winner cache")
     k.add_argument("action", choices=("ls", "verify", "compact", "clear"))
     k.add_argument("--env", help="env id or interpreter path")

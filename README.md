@@ -3,6 +3,21 @@
 Phase 1 sets the baselines before any ML. The full plan is in [`plan.md`](plan.md), the measurement protocol in
 [`docs/methodology.md`](docs/methodology.md), and the latest findings in [`reports/week1.md`](reports/week1.md).
 
+## lscli: the selector as a background service
+
+`lscli` puts the learned selector to work on one machine. It learns which GEMM shapes your programs run, trains this
+GPU's own models when the machine is idle, and searches those shapes ahead of time, so a program finds its kernel
+already chosen. Install it (Linux, systemd, one NVIDIA GPU, no root):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/learned-selector-cli/install/install.sh | bash
+lscli enable-env $(command -v python3)      # the env your programs use
+LSCLI_PATCH=1 python train.py               # or: import lscli; lscli.enable()
+lscli status                                # lscli doctor if it does nothing
+```
+
+Specification: [`docs/lscli/spec.md`](docs/lscli/spec.md); implementation plan: [`docs/lscli/plan.md`](docs/lscli/plan.md).
+
 ## Layout
 
 ```
@@ -11,6 +26,8 @@ kernels/     parameterized Triton GEMM family + config space / pruning rules
 baselines/   B0 roofline, B1 torch.matmul (cuBLAS), B5 Triton tutorial kernel
 suites/      shape suites (versioned JSON; regenerate with `python -m suites.generate`)
 analysis/    report generation (plots + tables)
+lscli/       the lscli CLI, client patch, daemon, training orchestration (docs/lscli/spec.md)
+install/     lscli installer, systemd unit, clock helper, zero-shot model packer
 tests/       unit tests (`python -m pytest`)
 data/<hw>/   results + env.json (gitignored)
 reports/     write-ups and figures
