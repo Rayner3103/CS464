@@ -31,7 +31,8 @@ from lscli.files import locked, read_json, write_json
 from lscli.paths import Paths
 
 TICK_S = 5.0
-GPU_REASONS = ("compute process", "GPU idle", "NVML unavailable")   # what a CPU-only training stage may ignore
+HELPER = Path("/usr/local/libexec/lscli-clock")                      # the optional root clock helper (spec 4.6)
+GPU_REASONS = ("compute process", "GPU idle", "NVML unavailable", gate.CLOCK_HELD)   # what a CPU-only stage may ignore
 TRAIN_CHECK_S = 86400.0
 MERGE_EVERY_S = 60.0
 COMPACT_EVERY_S = 86400.0
@@ -56,6 +57,7 @@ class Daemon:
         self.since = clock()
         self.backoff_until: float | None = None
         self.failures: dict[tuple, int] = {}
+        self.clock_locked = False                            # the helper lock this daemon set and has not reset
         self.env_docs: dict[tuple, tuple[float, dict]] = {}
         self.env_failed: dict[str, float] = {}               # env id -> last failed probe
         self.unknown_envs: set[str] = set()                  # registered, but no environment yet (probe failed)
@@ -238,7 +240,8 @@ class Daemon:
         locked = lock.exists() and gate.lock_held(lock, exclude=own or frozenset())   # our own train_best holds it
         return self.gate.reasons(snap=snap, now=self.clock(), local=self.local_now(), battery=self.battery(),
                                  paused=control.paused(control.read_control(self.paths), self.clock()),
-                                 backoff_until=self.backoff_until, pipeline_locked=locked, own=own)
+                                 backoff_until=self.backoff_until, pipeline_locked=locked, own=own,
+                                 clock_held=control.clock_held(self.paths) is not None)
 
     def write_state(self, **extra) -> None:
         pend, _ = queue.pending(self.paths)
@@ -505,7 +508,7 @@ class Daemon:
             self.failures.pop(task.key, None)
         except jobs.Preempted:
             self.counters["preempted"] += 1
-            if not self.stop and not any(r == "paused" for r in self.reasons):   # a pause or stop is not a busy GPU
+            if not self.stop and not any(r in ("paused", gate.CLOCK_HELD) for r in self.reasons):   # not a busy GPU
                 self.backoff_until = self.clock() + self.cfg["idle"]["backoff_minutes"] * 60
         except Exception as e:                             # JobError or anything unexpected: count it, never loop on it
             self.counters["failed"] += 1
@@ -569,7 +572,7 @@ class Daemon:
         # the idle clock (one search per gpu_idle_minutes instead of back to back). A foreign process still counts.
         self.gate.job_ended(self.clock())
         late = self.gate_reasons(own=set())
-        if any(r.startswith("compute process") for r in late):
+        if any(r.startswith("compute process") or r == gate.CLOCK_HELD for r in late):   # a hold: the user's clock next
             self.reasons = late
             raise jobs.Preempted()
         from lscli.worker import write_entry
@@ -591,16 +594,25 @@ class Daemon:
                 self.log.info("hw_id of GPU %s stored: %s", self.identity.get("uuid"), env.get("hw_id"))
 
     def clock_lock(self, action: str) -> None:
-        """Lock / reset the SM clock through the optional helper (spec 4.6); a no-op without lock_mhz."""
+        """Lock / reset the SM clock through the optional helper (spec 4.6); a no-op without lock_mhz. While the user
+        holds the clock (`lscli clock hold`) the daemon never locks, and it resets only a lock it set itself: a job the
+        hold preempted ends with its own lock undone. `lscli clock hold` returns once no job runs, so the user's own
+        lock always comes after that reset."""
         if not self.cfg["clock"]["lock_mhz"]:
             return
-        helper = Path("/usr/local/libexec/lscli-clock")
-        if not helper.exists():
-            self.log.warning("clock.lock_mhz is set but %s is missing", helper)
+        if action == "lock" and control.clock_held(self.paths) is not None:
+            self.log.info("clock lock skipped: the clock is held (lscli clock release)")
             return
-        r = subprocess.run(["sudo", "-n", str(helper), action], capture_output=True, text=True)
+        if action == "reset" and not self.clock_locked and control.clock_held(self.paths) is not None:
+            return                                         # not ours to reset: the user's clock
+        if not HELPER.exists():
+            self.log.warning("clock.lock_mhz is set but %s is missing", HELPER)
+            return
+        r = subprocess.run(["sudo", "-n", str(HELPER), action], capture_output=True, text=True)
         if r.returncode != 0:
             self.log.warning("clock %s failed: %s", action, r.stderr.strip()[-200:])
+        elif action in ("lock", "reset"):                   # a failed call leaves the clock (and so the flag) as it was
+            self.clock_locked = action == "lock"
 
     # ------------------------------------------------------------------------------------------------ main loop
     def run(self) -> int:

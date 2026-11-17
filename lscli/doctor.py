@@ -73,6 +73,8 @@ def checks(paths) -> list[dict]:
     else:
         add("OK" if not mhz else "FAIL", "clock helper", "not installed" + (f" but clock.lock_mhz = {mhz}" if mhz else ""),
             "" if not mhz else "lscli config clock.lock_mhz 0, or install the helper")
+    if control.clock_held(paths) is not None:
+        add("OK", "clock hold", "held: the daemon runs no GPU job and leaves the clock alone", "lscli clock release when done")
     mode = paths.root.stat().st_mode & 0o777 if paths.root.exists() else None
     add("OK" if mode == 0o700 else "WARN", "home permissions", f"{paths.root} {oct(mode) if mode is not None else 'missing'}",
         "" if mode == 0o700 else f"chmod 700 {paths.root} (it holds your usage record)")

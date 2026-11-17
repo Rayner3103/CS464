@@ -198,6 +198,33 @@ def test_uninstall_removes_env_hooks(tmp_path, monkeypatch):
     assert not (site / "lscli.pth").exists() and envs.load(Paths()) == {}
 
 
+def test_clock_hold_command_and_an_uninstall_that_leaves_a_held_clock(tmp_path, monkeypatch, capsys):
+    from lscli import cli, control
+    from lscli.paths import Paths
+    home, env = _sandbox(tmp_path)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", env["PATH"])
+    monkeypatch.setenv("FAKE_LOG", env["FAKE_LOG"])
+    monkeypatch.setenv("LSCLI_HOME", str(tmp_path / "lh"))
+    monkeypatch.setenv("LSCLI_CONFIG", str(tmp_path / "c.toml"))
+    assert cli.main(["clock"]) == 0 and "not held" in capsys.readouterr().out
+    assert cli.main(["clock", "hold"]) == 0 and control.clock_held(Paths()) is not None
+    capsys.readouterr()
+    assert cli.main(["status"]) == 0 and "clock: held" in capsys.readouterr().out
+    assert cli.main(["--json", "clock"]) == 0 and json.loads(capsys.readouterr().out)["held"] is True
+    helper = tmp_path / "lscli-clock"
+    helper.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(cli, "CLOCK_FILES", (str(helper), str(tmp_path / "sudoers"), str(tmp_path / "conf")))
+    sudo = []
+    real_run = cli.subprocess.run
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **kw: sudo.append(argv) or subprocess.CompletedProcess(argv, 0)
+                        if argv[0] == "sudo" else real_run(argv, **kw))
+    assert cli.main(["uninstall", "--yes"]) == 0
+    assert "clock left as it is" in capsys.readouterr().out
+    assert not any(a[-1] == "reset" for a in sudo) and any(a[:3] == ["sudo", "rm", "-f"] for a in sudo)
+    assert cli.main(["clock", "release"]) == 0 and control.clock_held(Paths()) is None
+
+
 def test_doctor_reports_and_flags_a_lock_without_helper(tmp_path, monkeypatch, capsys):
     from lscli import cli
     home, env = _sandbox(tmp_path)

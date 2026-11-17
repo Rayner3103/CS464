@@ -32,6 +32,7 @@ class Paths:
     queue = property(lambda s: s.root / "queue.jsonl")
     queue_offset = property(lambda s: s.root / "queue.offset")
     gpu_lock = property(lambda s: s.root / "gpu.lock")
+    clock_hold = property(lambda s: s.root / "clock.hold")
     gpu_hw = property(lambda s: s.root / "gpu_hw.json")
     envs = property(lambda s: s.root / "envs.json")
     models = property(lambda s: s.root / "models")
