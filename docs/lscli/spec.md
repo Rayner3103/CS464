@@ -416,7 +416,8 @@ program first runs them.
   * the client does not patch and warns once, naming the package and both paths;
   * the worker exits with an `error` before it touches CUDA. The daemon records a failed probe or search: no winner
     is written, and the env is not retried until its record changes (`lscli enable-env` again) or the daemon
-    restarts, so there is no retry loop. `lscli status` and `lscli doctor` name the env and the package.
+    restarts, so there is no retry loop (a refusal of the daemon venv's own worker stops its probes until the
+    daemon restarts). `lscli status` and `lscli doctor` name the env and the package.
   This makes a mixed import impossible whatever the cwd.
 
 ### 5.2 Which calls are dispatched

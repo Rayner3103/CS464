@@ -263,6 +263,13 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     proto = _Proto(_channel())
     t0 = time.perf_counter()
+    from lscli import guard
+    bad = guard.mismatches()
+    if bad:                                          # spec 5.1: refuse before any harness import or CUDA call
+        msg = guard.describe(bad)
+        print(f"lscli.worker: {msg}", file=sys.stderr)
+        proto.send({"op": "error", "error": msg, "guard": bad})
+        return 1
     try:
         if args.cmd == "measure":
             line = proto.readline()

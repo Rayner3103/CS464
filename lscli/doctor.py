@@ -57,6 +57,10 @@ def checks(paths) -> list[dict]:
     holders = [f"{p} ({snap.names.get(p, '?')})" for p in snap.pids if p not in own]
     add("OK" if not holders else "WARN", "CUDA contexts", ", ".join(holders) if holders else "none",
         "these processes keep the idle gate closed while they hold a CUDA context (an idle Jupyter kernel counts)" if holders else "")
+    for eid, msg in ((st or {}).get("env_errors") or {}).items():
+        add("WARN", f"env {eid}", f"blocked by the runtime guard: {msg}",
+            "run that program from outside the CS464 checkout or drop the checkout from PYTHONPATH, then "
+            "`lscli enable-env` that interpreter again")
     cfg = config.load()
     mhz = cfg["clock"]["lock_mhz"]
     if HELPER.exists():

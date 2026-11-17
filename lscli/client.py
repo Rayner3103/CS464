@@ -370,12 +370,21 @@ def enabled() -> bool:
 
 
 def enable(paths=None) -> bool:
-    """Patch torch for the rest of the process. Returns False (and patches nothing) when LSCLI_DISABLE=1."""
+    """Patch torch for the rest of the process. Returns False (and patches nothing) when LSCLI_DISABLE=1, or when a
+    harness package resolves outside lscli's source directory (the runtime guard, warned once)."""
     global _STATE
     if os.environ.get("LSCLI_DISABLE") == "1":
         return False
     if _STATE is not None:
         return True
+    from lscli import guard
+    bad = guard.mismatches()
+    if bad:                                          # spec 5.1: never mix lscli with another tree's harness
+        if not getattr(enable, "_warned", False):
+            warnings.warn(f"lscli: not patching torch ({guard.describe(bad)}); run from outside the checkout or "
+                          "drop it from PYTHONPATH", stacklevel=2)
+            enable._warned = True
+        return False
     import torch.nn.functional as F
     c = _Client(paths)
     _ORIG.update(matmul=torch.matmul, mm=torch.mm, t_matmul=torch.Tensor.matmul, t_mm=torch.Tensor.mm,
