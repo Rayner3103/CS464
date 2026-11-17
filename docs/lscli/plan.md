@@ -87,5 +87,11 @@ rebased.
   byte-identical (the `kernel_src` hash; Triton cache keys and bundle hits, confirmed with `python -m tune bundle
   verify`), copy the data the harness finds relative to the repo root (snapshot models, suites, the bundle archive),
   and rewrite ~200 imports and 3 `-m` spawns.
+* Pruning the usage profile (spec section 9): drop shapes whose decayed `calls` is below a floor and whose
+  `last_seen` is older than a few half-lives, keeping queued shapes; or cap the profile at the hottest N shapes. The
+  scheduler plans stale / superseded / widen re-searches from the profile, so a dropped shape's cache entry is no
+  longer refreshed ahead of use (a returning shape is re-searched through the miss queue and its counts restart from
+  zero). Keeping every cached shape would not bound the growth: those are the shapes that accumulate. v1 keeps every
+  shape.
 * Noise floor for daemon conditions: done for stock clocks on the 3080, desktop idle (2026-11-13; the dispatch margin is
   4 % unlocked / 3 % locked). Open: other GPUs, measuring while the desktop is in use, graph timing under 50 µs.

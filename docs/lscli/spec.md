@@ -111,6 +111,7 @@ The merge reads each log from its saved offset (only complete lines), so a log s
 incrementally; a log is deleted only when its process (the pid in its name) has exited and it was read to the end.
 The client resets its counters in a forked child (`os.register_at_fork`), so a DataLoader worker does not
 double-count its parent's calls.
+No shape is ever dropped: a decayed count only gets smaller (section 9).
 
 ### 3.4 `queue.jsonl`
 
@@ -131,7 +132,8 @@ offset to 0.
 {"3f2a91c0d4e5": {"python": "/home/u/miniconda3/envs/llm/bin/python", "prefix": "/home/u/miniconda3/envs/llm",
                   "torch": "2.13.0+cu130", "triton": "3.7.1", "cuda_runtime": "13.0", "registered": 1762560000.0}}
 ```
-`env_id` = first 12 hex of sha256 of the interpreter's real path. Written by `lscli enable-env`; the worker reports its
+`env_id` = first 12 hex of sha256 of the interpreter's absolute path, **not** resolved: a venv's `bin/python` is a
+symlink to the base interpreter, and resolving it would lose the venv. Written by `lscli enable-env`; the worker reports its
 versions with every result and the daemon updates the record when they changed.
 
 ### 3.6 Winner cache `winners.jsonl`
@@ -144,7 +146,10 @@ adds (`env_extra`, written to `client.json` so the client and the worker declare
   user's program runs at. Entries timed under one policy are soft-stale under another, for the client as well, because
   the client declares the policy from `client.json`;
 * `models`: `{"triton": <id>, "lt_rank": <id>, "router": <id>, "source": "native" | "zero_shot"}` from `MODELS.json`
-  (an absent model is `null`).
+  (an absent model is `null`);
+* `env_id`: the registered env that timed it. Another env's winner is soft-stale here: served after the correctness
+  check, then re-searched in this env. `env_id` also scopes `compact()`, so compacting with one env's environment
+  never drops another env's lines.
 
 lscli entries also carry `torch_us` (torch.matmul's short cold time for the shape, measured by the worker in the same
 session) for the client's dispatch rule (section 5.3).
@@ -414,9 +419,9 @@ reason.
 | `pause` / `resume` | `lscli pause [--for DURATION]`, `lscli resume` | Stop starting jobs (a running one is preempted) / clear the pause |
 | `prewarm` | `lscli prewarm (--shapes FILE \| MxNxK ...) [--dtype fp16] [--env ID]` | Queue shapes (`manual`); FILE is a shapes JSON (`suites/` format) |
 | `profile` | `lscli profile [--top N] [--layout NN\|NT]` | The usage record, hottest first |
-| `cache` | `lscli cache ls [--stale]` / `verify` / `compact` / `clear [--yes]` | List entries with tiers; run the correctness check on every entry served here; compact; delete the file |
+| `cache` | `lscli cache ls [--stale]` / `verify` / `compact` / `clear [--yes]` | List entries with tiers; run the correctness check on every entry served here; compact; delete the file. `ls` with one env, `verify` and `compact` start the env's worker (a CUDA context; `verify` runs every cached kernel): they hold `gpu.lock` while it runs, refuse while a daemon job holds it (`lscli pause` first), and ask before using a GPU that other processes are computing on (`--yes` answers; without a terminal they refuse) |
 | `train` | `lscli train status` / `start` / `retrain [--stages S,...]` | Training progress; allow training now (window ignored, gate still required); force stages |
-| `config` | `lscli config [KEY [VALUE]]` | Show / get / set a config key (`idle.window`, ...) and tell the daemon to reload |
+| `config` | `lscli config [KEY [VALUE]]` | Show / get / set a config key (`idle.window`, ...) and tell the daemon to reload. Setting rewrites `config.toml` in full from the validated config: comments are not kept and every default is written out (it no longer follows a changed default); a file with an unknown key is refused, not rewritten |
 | `logs` | `lscli logs [-f] [--job ID]` | Daemon or job log |
 | `doctor` | `lscli doctor` | Checks: GPU and driver, systemd user session and linger, unit state, clock helper, versions of each registered env (and gcc + `Python.h`, which Triton's launcher needs), file permissions, models present, processes holding a CUDA context (they keep the gate closed) |
 | `daemon` | `lscli daemon run` (used by the unit) / `start` / `stop` / `restart` | Foreground loop / `systemctl --user` wrappers |
@@ -516,3 +521,9 @@ night trains in whatever window it is awake for. Without linger, the service sto
   work from running at all.
 * The cuBLASLt ranker's proposals come from the daemon venv's cuBLASLt. A user env with another cuBLASLt build gets
   only the subset its library accepts.
+* `profile.json` keeps every shape it has ever seen: `usage.merge` decays a shape's `calls` but never removes it. A
+  workload with many distinct shapes (e.g. a sequence length in M that changes per batch) grows it by ~300 bytes per
+  shape. The daemon's merge (every minute) reads and rewrites the whole file even when no log has new lines, and
+  each client process loads it once. To start over, stop the daemon and delete `profile.json`: the logs still in
+  `profile/` are re-read from the start, and every decayed count restarts from zero (the frequent-call k = 5 policy
+  and profile-driven searches with it; the winner cache is not affected). Pruning is open work (plan section 4).

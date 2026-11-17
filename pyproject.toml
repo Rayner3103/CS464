@@ -6,9 +6,10 @@ requires-python = ">=3.10"
 
 [project.scripts]
 tune = "tune.cli:main"
+lscli = "lscli.cli:main"
 
 [tool.setuptools]
-packages = ["tune", "kernels", "baselines"]
+packages = ["tune", "kernels", "baselines", "lscli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
