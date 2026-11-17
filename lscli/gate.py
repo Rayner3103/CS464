@@ -48,27 +48,67 @@ def on_battery(sys_root: str | os.PathLike = "/sys/class/power_supply") -> bool:
     return False
 
 
-def lock_held(path: str | os.PathLike, locks: str = "/proc/locks", exclude=frozenset()) -> bool:
+def lock_held(path: str | os.PathLike, locks: str = "/proc/locks", exclude=frozenset(), proc: str = "/proc") -> bool:
     """True when a process outside `exclude` holds a flock on `path` (train_best.sh's pipeline/.lock). Read from
     /proc/locks, never by trying the lock: a probe that took it, even for a microsecond, could make a concurrent
-    `flock -n` fail. `exclude` = the running job's tree: the daemon's own train_best run holds that lock."""
+    `flock -n` fail. `exclude` = the running job's tree: the daemon's own train_best run holds that lock.
+
+    The pid /proc/locks gives is the process that TOOK the lock, not the one holding it: train_best.sh does
+    `exec 9>.lock; flock -n 9`, so the pid is the short-lived `flock` child, already gone, never in the job's tree. A
+    lock is therefore also ours when a process in `exclude` holds it through one of its own fds (/proc/<pid>/fdinfo lists
+    a lock on the open file description that owns it). /proc/locks and the fds are read one after the other, so a job
+    that releases the lock and exits in between would look foreign: a foreign reading counts only when a second one
+    agrees."""
+    return _foreign_lock(path, locks, exclude, proc) and _foreign_lock(path, locks, exclude, proc)
+
+
+def _foreign_lock(path, locks: str, exclude, proc: str) -> bool:
     try:
         st = os.stat(path)
         text = Path(locks).read_text()
     except OSError:
         return False
     want = (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+    ours = None
     for line in text.splitlines():
         parts = line.split()
         if len(parts) < 6 or parts[1] == "->":                 # "->" lines are waiters, not holders
             continue
         try:
             maj, mnr, ino = parts[5].split(":")
-            if (int(maj, 16), int(mnr, 16), int(ino)) == want and int(parts[4]) not in exclude:
-                return True
+            if (int(maj, 16), int(mnr, 16), int(ino)) != want or int(parts[4]) in exclude:
+                continue
         except ValueError:
             continue
+        if ours is None:
+            ours = _fd_locks(exclude, want, proc)
+        if tuple(parts[1:]) not in ours:
+            return True
     return False
+
+
+def _fd_locks(pids, want: tuple[int, int, int], proc: str = "/proc") -> set[tuple[str, ...]]:
+    """The locks on file `want` (major, minor, inode) that the processes `pids` hold through their own fds, as the
+    fields of their /proc/locks lines after the ordinal (/proc/<pid>/fdinfo/<fd>: `lock:\t1: FLOCK ADVISORY WRITE ...`)."""
+    out: set[tuple[str, ...]] = set()
+    for pid in pids:
+        fd_dir = Path(proc) / str(pid) / "fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                st = os.stat(fd_dir / fd)
+                if (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino) != want:
+                    continue
+                info = (Path(proc) / str(pid) / "fdinfo" / fd).read_text()
+            except OSError:
+                continue
+            for ln in info.splitlines():
+                if ln.startswith("lock:"):
+                    out.add(tuple(ln.split()[2:]))
+    return out
 
 
 def descendants(pid: int, proc: str = "/proc") -> set[int]:
@@ -92,12 +132,39 @@ def descendants(pid: int, proc: str = "/proc") -> set[int]:
     return out
 
 
+def _always_alive(pid: int) -> bool:          # a snapshot built by hand (tests): every listed pid runs
+    return True
+
+
 @dataclass
 class GpuSnapshot:
     pids: list[int]                 # compute processes on the GPU (NVML, host PIDs)
     util: int | None                # percent, None when NVML cannot tell
     ok: bool = True                 # False: NVML unavailable (the gate stays closed)
     names: dict = field(default_factory=dict)
+    # Asked again when the gate decides, i.e. AFTER the job's tree was walked: a job child that NVML listed and that
+    # exited between the snapshot and the walk is in neither, and must not look foreign. The sweep's compile pool
+    # (max_tasks_per_child=1) replaces a worker every chunk, so this race preempted tune_sweep within seconds, every time.
+    alive: object = field(default=_always_alive, repr=False, compare=False)
+
+
+def alive(pid: int, proc: str | os.PathLike = "/proc") -> bool:
+    """False once `pid` is exiting or has exited: no /proc entry, a zombie / dead state, or no memory left (empty cmdline
+    and an all-zero statm: the kernel drops a process's memory as it starts to exit, before it is a zombie; a live
+    process that blanked its argv still has memory). NVML still lists a process while its CUDA context is torn down: a
+    job's short-lived child (a sweep compile worker) seen there and reaped before the job's tree was walked looked
+    foreign and preempted the job. A process on its way out uses no GPU, whoever it belonged to. Assumes the daemon sees
+    the host's pids (a per-user service, not a container): a pid it cannot see counts as exited."""
+    d = Path(proc, str(pid))
+    try:
+        stat = (d / "stat").read_text()
+        if stat[stat.rindex(")") + 2:][:1] in ("Z", "X", "x"):
+            return False
+        if (d / "cmdline").read_bytes().strip(b"\0"):
+            return True
+        return any(v != "0" for v in (d / "statm").read_text().split())
+    except (OSError, ValueError):
+        return False
 
 
 def gpu_snapshot(index: int = 0) -> GpuSnapshot:
@@ -109,14 +176,14 @@ def gpu_snapshot(index: int = 0) -> GpuSnapshot:
         util = pynvml.nvmlDeviceGetUtilizationRates(h).gpu
     except Exception:
         return GpuSnapshot([], None, ok=False)
-    pids = [int(p.pid) for p in procs]
+    pids = [pid for pid in (int(p.pid) for p in procs) if alive(pid)]
     names = {}
     for p in pids:
         try:
             names[p] = Path(f"/proc/{p}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()[:120]
         except OSError:
             names[p] = "?"
-    return GpuSnapshot(pids, util, True, names)
+    return GpuSnapshot(pids, util, True, names, alive=alive)
 
 
 def gpu_identity(index: int = 0) -> dict:
@@ -147,7 +214,7 @@ class Gate:
 
     def observe(self, snap: GpuSnapshot, now: float, own: set[int] = frozenset()) -> list[int]:
         """Update the idle clock; returns the foreign compute PIDs."""
-        foreign = [p for p in snap.pids if p not in own]
+        foreign = [p for p in snap.pids if p not in own and snap.alive(p)]   # after `own` was walked
         util_busy = (not own and now >= self.grace_until and snap.util is not None
                      and snap.util >= self.cfg["idle"]["gpu_util_max"])
         busy = not snap.ok or bool(foreign) or util_busy

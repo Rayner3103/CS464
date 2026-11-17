@@ -29,6 +29,7 @@ done
 # like train_best.sh: hold pipeline/.lock for the whole run, refuse a busy GPU in preflight, print a lot through tee
 exec 9>"$LSCLI_HOME/src/pipeline/.lock"
 flock -n 9 || { echo "another pipeline run holds pipeline/.lock" >&2; exit 7; }
+sleep "${FAKE_HOLD_S:-0}"                                       # a stage that outlasts the watcher's polls
 if [[ "$STAGE" == preflight && -f "$FAKE_BUSY" ]]; then echo "GPU busy" >&2; exit 8; fi
 head -c 200000 /dev/zero | tr '\0' 'x' | fold -w 100 | tee /dev/null
 if [[ "$STAGE" == "$FAKE_FAIL_STAGE" ]]; then exit 1; fi
@@ -263,8 +264,9 @@ def test_preflight_waits_for_an_idle_gpu(home, tmp_path):
 
 
 @needs_ranker
-def test_our_own_train_best_lock_does_not_preempt_it_but_a_manual_run_blocks_training(home):
+def test_our_own_train_best_lock_does_not_preempt_it_but_a_manual_run_blocks_training(home, monkeypatch):
     import subprocess
+    monkeypatch.setenv("FAKE_HOLD_S", "2.5")             # the watcher polls each second while the stage holds the lock
     lock = home.src / "pipeline" / ".lock"
     holder = subprocess.Popen(["flock", str(lock), "sleep", "4"])          # someone runs train_best.sh by hand
     time.sleep(0.3)
@@ -382,3 +384,98 @@ def test_a_lost_state_file_never_reuses_a_run_directory(home):
     (home.train / HW / "1" / "precious").write_text("30 h of sweeps")
     training.Training(home, HW).begin({"first"}, ["preflight"], ENV, "test")
     assert (home.train / HW / "1" / "precious").exists() and training.Training(home, HW).state["run"] == 2
+
+
+@pytest.mark.parametrize("resolves", [True, False])
+def test_train_best_re_resolves_an_empty_hw_id_left_by_a_killed_stage(tmp_path, resolves):
+    """The real pipeline/train_best.sh (stand-in `python` on PATH): a stage killed between creating and writing hw_id
+    (a daemon preemption) left it empty, and every later --resume died with "could not determine the hardware id"."""
+    import subprocess
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "python").write_text("#!/bin/sh\necho fakehw_sm00\n" if resolves else "#!/bin/sh\nexit 1\n")
+    (bin_ / "python").chmod(0o755)
+    (bin_ / "nvidia-smi").write_text("#!/bin/sh\n")                      # no compute process: the pytest process itself
+    (bin_ / "nvidia-smi").chmod(0o755)                                   # may hold a CUDA context from earlier tests
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "mode").write_text("quick\n")
+    (run / "hw_id").write_text("")
+    r = subprocess.run(["bash", str(REPO / "pipeline" / "train_best.sh"), "--resume", str(run), "--skip-install",
+                        "--skip-validation", "--only", "env", "--clock-lock", "none", "--allow-unlocked"],
+                       cwd=REPO, env={**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}"},
+                       capture_output=True, text=True, timeout=120)
+    if resolves:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (run / "hw_id").read_text() == "fakehw_sm00\n" and (run / "stamps" / "env.done").exists()
+    else:
+        assert r.returncode != 0 and "could not determine the hardware id" in r.stdout + r.stderr
+        assert (run / "hw_id").read_text() == ""                       # never written empty by this run
+    assert (run / "mode").read_text() == "quick\n" and not list(run.glob("*.tmp.*"))
+
+
+# ---------------------------------------------------------------------------------------------- the real train_best
+HW_3080 = "rtx3080_sm86_68sms_10gb"
+DATA_3080 = Path(os.environ.get("LSCLI_TEST_DATA_3080", str(REPO / "data" / HW_3080)))
+TAIL_INPUTS = ("env.json", "lgbm_rank.txt", "lgbm_rank.json", "learned_search.json", "lgbm_rank_cv_scores.npz",
+               "sweep_screen", "sweep_screen_tail", "sweep_screen_heldout", "lt_screen",
+               "results_lock1755_tune477.jsonl", "results_lock1755_tune477_graph.jsonl")
+TAIL = ("train_v2", "lt_fit", "router_fit", "package", "summary")
+
+
+@pytest.mark.skipif(os.environ.get("LSCLI_SLOW_TESTS") != "1", reason="slow (~7 min of CPU): set LSCLI_SLOW_TESTS=1")
+@pytest.mark.skipif(not all((DATA_3080 / f).exists() for f in TAIL_INPUTS),
+                    reason=f"needs the 3080's GPU-stage outputs in {DATA_3080} (LSCLI_TEST_DATA_3080)")
+def test_the_real_train_best_finishes_a_training_under_the_daemon_and_its_models_are_activated(home, monkeypatch):
+    """The review's missing evidence (#11): the REAL pipeline/train_best.sh, run by the daemon one stage per job, taking
+    its own pipeline/.lock, through to activated models. The GPU stages are pre-stamped and their outputs are a copy of
+    this machine's 3080 run; the daemon runs the CPU stages (train_v2, lt_fit, router_fit, package, summary) while the
+    GPU is busy, so no GPU stage can start and the real fits run (~7 min)."""
+    import shutil
+    monkeypatch.delenv("LSCLI_TRAIN_SCRIPT")                                  # the daemon's default: src/pipeline/
+    shutil.rmtree(home.src)
+    home.src.symlink_to(REPO)                                                # src/ = this checkout (lscli + harness)
+    env = json.loads((DATA_3080 / "env.json").read_text())
+    denv = {"hw_id": HW_3080, "triton": env.get("triton", "3.7.1"), "cublaslt": 130101, "driver": "595.99.02",
+            "kernel_src": "x", "torch": "2.13.0"}
+    d = _daemon(home, snapshot=lambda: gate.GpuSnapshot([4242], 0, True, {4242: "someone else"}), env=denv)
+    d.hw_id = HW_3080
+    d.load_models()                                                          # none yet for this GPU
+    d.cfg["train"]["mode"] = "quick"
+    tr = training.Training(home, HW_3080)
+    tr.begin({"first"}, training.stages_for({"first"}, False), denv, "test: the real tail", mode="quick")
+    run = tr.run_dir
+    data = run / "data" / HW_3080
+    data.mkdir(parents=True)
+    for f in TAIL_INPUTS:
+        (shutil.copytree if (DATA_3080 / f).is_dir() else shutil.copy2)(DATA_3080 / f, data / f)
+    (run / "mode").write_text("quick\n")
+    (run / "hw_id").write_text(HW_3080 + "\n")
+    (run / "stamps").mkdir()
+    for s in tr.state["stages"]:
+        if s not in TAIL:
+            (run / "stamps" / f"{s}.done").write_text("pre-stamped by the test\n")
+    lock = REPO / "pipeline" / ".lock"
+    lock.touch()
+    done = lambda: training.Training(home, HW_3080).state.get("status") == "done"   # noqa: E731
+    assert _run_until(d, done, n=len(TAIL) + 2)
+    st = training.Training(home, HW_3080)
+    assert st.state["activated"] is True and st.summary()["done"] == st.summary()["total"]
+    assert {s for s in TAIL} <= st.done() and d.counters["preempted"] == 0 and not st.state.get("failures")
+    jobs_logs = sorted(p.name for p in (home.logs / "jobs").glob("*-train-*.log"))
+    assert [n.split("-train-")[1][:-4] for n in jobs_logs] == list(TAIL)        # one daemon job per stage, in order
+    for s in TAIL:
+        assert (run / "logs" / f"{s}.log").exists()                           # written by train_best itself
+    for stem in ("lgbm_rank_v2", "lt_rank", "router"):
+        assert (data / f"{stem}.txt").exists() and (run / "models" / f"{stem}.txt").exists()
+    assert json.loads((data / "lt_rank.json").read_text())["hw_id"] == HW_3080 and (run / "SUMMARY.md").exists()
+    doc = json.loads((home.models / HW_3080 / "MODELS.json").read_text())
+    assert doc["source"] == "native" and set(doc["models"]) == {"triton", "lt_rank", "router"}
+    assert doc["models"]["triton"]["stem"] == "lgbm_rank_v2" and doc["run"] == str(run)
+    assert d.models is not None and d.models.source == "native"
+    assert json.loads(home.client.read_text())["env_extra"]["models"]["source"] == "native"
+    assert not gate.lock_held(lock)                                           # train_best's lock went with it
+    for _ in range(2):                                                        # done: nothing else starts
+        d.last_train_check = 0
+        d.tick()
+    assert training.Training(home, HW_3080).state["run"] == 1

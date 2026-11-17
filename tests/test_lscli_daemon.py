@@ -71,6 +71,76 @@ def test_lock_held_reads_proc_locks_and_never_takes_the_lock(tmp_path):
     assert fails == 0
 
 
+
+def test_lock_held_counts_the_jobs_own_flock_taken_by_a_flock_child(tmp_path):
+    """train_best.sh: `exec 9>.lock; flock -n 9`: /proc/locks names the `flock` child (gone at once), not the job; the
+    daemon preempted its own training stage as "another train_best.sh run holds pipeline/.lock"."""
+    p = tmp_path / ".lock"
+    p.touch()
+    ours = subprocess.Popen(["bash", "-c", 'exec 9>"$1"; flock -n 9 || exit 1; exec sleep 5', "_", str(p)])
+    try:
+        deadline = time.monotonic() + 3
+        while not gate.lock_held(p) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert gate.lock_held(p)                                         # a foreign run, seen from outside
+        assert not gate.lock_held(p, exclude={ours.pid})                 # the job's own run
+        assert not gate.lock_held(p, exclude=frozenset(gate.descendants(ours.pid)))
+    finally:
+        ours.kill()
+        ours.wait()
+    assert not gate.lock_held(p)                                         # `exec sleep`: nothing orphaned keeps it
+    # a foreign holder while the job has the file open WITHOUT the lock (its own `flock -n` is about to fail): foreign
+    foreign = subprocess.Popen(["flock", str(p), "sleep", "5"])
+    loser = subprocess.Popen(["bash", "-c", 'exec 9>"$1"; exec sleep 5', "_", str(p)])
+    try:
+        deadline = time.monotonic() + 3
+        while not gate.lock_held(p) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert gate.lock_held(p, exclude={loser.pid})
+    finally:
+        for q in (foreign, loser):
+            q.kill()
+            q.wait()
+
+
+def test_an_exited_process_is_not_a_compute_process(tmp_path):
+    """NVML lists a process while its CUDA context is torn down: a zombie (or a reaped pid) must not preempt a job."""
+    zombie = subprocess.Popen(["true"])
+    deadline = time.monotonic() + 3
+    while gate.alive(zombie.pid) and time.monotonic() < deadline:   # exited, not yet reaped: state Z
+        time.sleep(0.02)
+    assert not gate.alive(zombie.pid)
+    assert Path(f"/proc/{zombie.pid}").exists()                      # still there, only dead
+    zombie.wait()
+    assert not gate.alive(zombie.pid) and gate.alive(os.getpid())
+    for pid, stat, argv, statm in ((7, "7 (a) b) S 1 7 7 0", b"python\0-c\0", "9 8 7 0 0 5 0"),   # comm may hold ") "
+                                   (11, "11 (python) S 1 11 11 0", b"", "9 8 7 0 0 5 0"),     # live, argv blanked
+                                   (9, "9 (python) R 1 9 9 0", b"", "0 0 0 0 0 0 0"),       # exiting: no mm, not yet Z
+                                   (10, "10 (python) Z 1 10 10 0", b"", "0 0 0 0 0 0 0")):
+        (tmp_path / str(pid)).mkdir()
+        (tmp_path / str(pid) / "stat").write_text(stat)
+        (tmp_path / str(pid) / "cmdline").write_bytes(argv)
+        (tmp_path / str(pid) / "statm").write_text(statm)
+    assert gate.alive(7, proc=tmp_path) and gate.alive(11, proc=tmp_path)
+    assert not any(gate.alive(p, proc=tmp_path) for p in (8, 9, 10))
+
+
+def test_a_job_child_that_exits_between_the_snapshot_and_the_tree_walk_is_not_foreign(tmp_path):
+    """The sweep's compile pool replaces a worker every chunk: a worker NVML listed (alive then) that exits before the
+    job's tree is walked is in neither. Liveness is asked again after the walk (the daemon walks `own` first)."""
+    from lscli.daemon import Daemon
+    paths = Paths(tmp_path / "home").ensure()
+    state = {"alive": True}
+    snap = gate.GpuSnapshot([777], 90, True, {777: "spawn_main"}, alive=lambda pid: state["alive"])
+    d = Daemon(paths, None, snapshot=lambda: snap, battery=lambda: False)
+
+    def walk():                                          # the worker is reaped while the tree is walked
+        state["alive"] = False
+        return {1}
+    assert not any(r.startswith("compute process") for r in d.gate_reasons(own=walk))
+    state["alive"] = True                                # still running after the walk and not in the tree: foreign
+    assert any(r.startswith("compute process 777") for r in d.gate_reasons(own=lambda: {1}))
+
 def _snap(pids=(), util=0):
     return gate.GpuSnapshot(list(pids), util, True, {p: "proc" for p in pids})
 
