@@ -212,10 +212,11 @@ if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
   LSCLI_CONFIG="$CONFIG_DIR/config.toml" "$VENV/bin/python" -I -c \
     'import os; from lscli import config; open(os.environ["LSCLI_CONFIG"], "w").write(config.dumps(config.DEFAULTS))'
 fi
+# unquoted heredoc ($LSCLI_HOME, $VENV expand): escape every ` and $ meant literally, or bash runs it now
 cat > "$BIN_DIR/lscli" <<EOF
 #!/bin/sh
 export LSCLI_HOME="$LSCLI_HOME"
-# -I: never put the caller's cwd or PYTHONPATH on sys.path, or `lscli` run inside (or with PYTHONPATH pointing at) a
+# -I: never put the caller's cwd or PYTHONPATH on sys.path, or \`lscli\` run inside (or with PYTHONPATH pointing at) a
 # CS464 checkout would import that checkout's lscli instead of this install's
 exec "$VENV/bin/python" -I -m lscli "\$@"
 EOF

@@ -105,6 +105,8 @@ def test_install_then_uninstall(tmp_path):
     calls = (tmp_path / "calls.log").read_text()
     assert "--user daemon-reload" in calls and "--user enable --now lscli.service" in calls and "enable-linger" not in calls
     assert json.loads((lh / "models/zero_shot/MODELS.json").read_text())["source"] == "zero_shot"
+    wrapper = (home / ".local/bin/lscli").read_text()                 # the template ran no command substitution
+    assert "or `lscli` run inside" in wrapper and "command not found" not in r.stderr, r.stderr[-2000:]
     v = subprocess.run([str(home / ".local/bin/lscli"), "--version"], env=env, capture_output=True, text=True)
     assert v.returncode == 0 and "lscli" in v.stdout
     # run from a directory with its own `lscli` package (a CS464 checkout): the installed lscli still runs
