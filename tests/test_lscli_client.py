@@ -422,3 +422,30 @@ def test_enable_env_refuses_a_shadowing_package(home, tmp_path):
     (site_dir / "tune").mkdir()
     (site_dir / "tune" / "__init__.py").write_text("")
     assert cli.main(["enable-env", str(py), "--no-deps"]) == 1 and not (site_dir / "lscli.pth").exists()
+
+
+def test_enable_env_refuses_a_checkout_reachable_from_the_callers_cwd_or_pythonpath(home, tmp_path, monkeypatch, capsys):
+    """Spec 6: the clash check also runs the way a program started here would import (cwd first, PYTHONPATH), so a
+    CS464 checkout reachable that way is refused instead of registered; from a neutral directory it is fine."""
+    from lscli import cli
+    py = _venv_with_this_torch(tmp_path / "venv")
+    site_dir = next((tmp_path / "venv" / "lib").glob("python3*/site-packages"))
+    checkout = tmp_path / "checkout"
+    (checkout / "tune").mkdir(parents=True)
+    (checkout / "tune" / "__init__.py").write_text("raise ImportError('imported the checkout')\n")
+    monkeypatch.chdir(checkout)                                           # started inside the checkout
+    assert cli.main(["enable-env", str(py), "--no-deps"]) == 1
+    err = capsys.readouterr().err
+    assert f"tune resolves to {(checkout / 'tune').resolve()}" in err and "imported the checkout" not in err
+    assert "PYTHONPATH set" not in err
+    assert not (site_dir / "lscli.pth").exists() and envs.load(home) == {}
+    neutral = tmp_path / "elsewhere"
+    neutral.mkdir()
+    monkeypatch.chdir(neutral)
+    monkeypatch.setenv("PYTHONPATH", str(checkout))                       # the checkout on PYTHONPATH
+    assert cli.main(["enable-env", str(py), "--no-deps"]) == 1
+    assert "with PYTHONPATH set" in capsys.readouterr().err and not (site_dir / "lscli.pth").exists()
+    monkeypatch.delenv("PYTHONPATH")
+    (neutral / "analysis").mkdir()                                        # a data folder, not a package: only a note
+    assert cli.main(["enable-env", str(py), "--no-deps"]) == 0 and (site_dir / "lscli.pth").exists()
+    assert "analysis/ without __init__.py" in capsys.readouterr().err
