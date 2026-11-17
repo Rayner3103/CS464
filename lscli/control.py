@@ -60,3 +60,21 @@ def paused(control: dict, now: float | None = None) -> bool:
 def request_reload(paths) -> None:
     """Ask the daemon to re-read config.toml (it compares this stamp each loop)."""
     write_json(paths.control, {**read_control(paths), "reload": time.time()})
+
+
+def write_control(paths, doc: dict) -> None:
+    write_json(paths.control, {**doc, "updated": time.time()})
+
+
+def train_now(paths) -> dict:
+    """`lscli train start`: let training ignore the time window until the current training finishes."""
+    doc = {**read_control(paths), "train_now": True}
+    write_control(paths, doc)
+    return doc
+
+
+def retrain(paths, stages: list[str] | None) -> dict:
+    """`lscli train retrain`: a full retraining (stages None) or just these stages, in a new run directory."""
+    doc = {**read_control(paths), "retrain": {"stages": stages, "t": time.time()}}
+    write_control(paths, doc)
+    return doc

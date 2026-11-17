@@ -28,10 +28,12 @@ class JobError(Exception):
 
 
 class Job:
-    def __init__(self, argv: list[str], *, cwd=None, env=None, log=None):
+    def __init__(self, argv: list[str], *, cwd=None, env=None, log=None, protocol: bool = True):
+        """protocol=False (a training stage): stdout goes to the log too, nothing to read, nothing to fill a pipe."""
         self.log = open(log, "ab") if log else subprocess.DEVNULL
-        self.p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=self.log, start_new_session=True)
+        self.p = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE if protocol else self.log, stderr=self.log,
+                                  start_new_session=True)
         self.seen: set[int] = {self.p.pid}
         self.buf = b""
         self.eof = False
@@ -92,6 +94,8 @@ class Job:
 
     def close(self) -> None:
         for f in (self.p.stdin, self.p.stdout):
+            if f is None:
+                continue
             try:
                 f.close()
             except Exception:
@@ -169,3 +173,24 @@ def _converse(job, request, watch, answer, silence_s):
             return msg
         elif op == "error":
             raise JobError(msg.get("error", "unknown error"))
+
+
+def supervise(job: Job, *, watch: Callable[[Callable[[], set]], bool], poll_s: float = 1.0) -> int:
+    """Wait for a job that speaks no protocol (a training stage), calling `watch(tree_fn)` every poll; returns its exit
+    code or raises Preempted after killing its tree. Any other way out (an exception in `watch`, KeyboardInterrupt)
+    kills the tree too."""
+    try:
+        job.p.stdin.close()
+    except Exception:
+        pass
+    try:
+        while True:
+            try:
+                return job.p.wait(poll_s)
+            except subprocess.TimeoutExpired:
+                pass
+            if not watch(job.tree):
+                raise Preempted()
+    except BaseException:
+        job.kill()
+        raise

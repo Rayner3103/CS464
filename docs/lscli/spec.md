@@ -87,7 +87,7 @@ lock_mhz = 0                # 0 = measure at stock clocks; > 0 must equal the he
 
 [train]
 enabled = true
-mode = "full"               # "full" | "quick" (train_best.sh modes)
+mode = "full"               # "full" | "quick" | "smoke" (train_best.sh modes; smoke: a plumbing check, never activated)
 ```
 
 ### 3.2 Usage log `profile/<pid>-<t0>.jsonl` (client-written, every 30 s and at exit)
@@ -257,7 +257,8 @@ One job at a time, holding `gpu.lock`. Jobs, highest priority first; within a cl
 6. **maintenance**: profile merge, queue consumption and daily cache compaction. These are CPU only and need no gate.
 
 The CPU-only training stages (`train_v2`, `lt_fit`, `router_fit`, `package`, `summary`) need the window, power and
-pause conditions, but not GPU idleness. Every other stage is a GPU stage.
+pause conditions, but not GPU idleness. Every other stage is a GPU stage, including `preflight`, which refuses a GPU
+with compute processes.
 
 ### 4.4 One search
 
@@ -287,8 +288,8 @@ program first runs them.
   with the source's architecture (they are refused elsewhere, as in `select_kernel`). The zero-shot Triton rankers are
   used on any GPU.
 * **First training.** The daemon runs `pipeline/train_best.sh --run-dir train/<hw_id>/1 --skip-install
-  --skip-validation [--clock-lock MHZ | --clock-lock none --allow-unlocked] --full|--quick --only <stage>`
-  (`--full` or `--quick` from `train.mode`; later stages use `--resume train/<hw_id>/1 --only <stage>`). That is one stage per job, in the script's order: `preflight`, `env`, `check`,
+  --skip-validation [--clock-lock MHZ | --clock-lock none --allow-unlocked] --full|--quick|--smoke --only <stage>`
+  (the mode from `train.mode`, recorded with the run; later stages use `--resume train/<hw_id>/1 --only <stage>`). That is one stage per job, in the script's order: `preflight`, `env`, `check`,
   `roofline`, `tune_sweep`, `heldout_sweep`, `selectors`, `train_v1`, `tail_sweep`, `train_v2`, `lt_screen`,
   `lt_fit`, `tune_stage2_cold`, `tune_stage2_graph`, `router_fit`, `bundle` (only when the daemon venv's Triton
   matches a registered env), `package`, `summary`.
@@ -297,20 +298,45 @@ program first runs them.
   * It takes `src/pipeline/.lock` itself. The daemon does not hold that lock; its own jobs hold `gpu.lock`.
   * When `package` finishes, `models/` of the run is copied into `models/<hw_id>/` and activated. Every existing
     entry then becomes `superseded` (soft-stale by `models`).
+  * **Modes.** `smoke` (train_best's plumbing check: a handful of shapes per stage, still hours of GPU time) runs
+    every stage, but its models are never activated (`lscli status`: "done (smoke: models not activated)"), and a
+    finished smoke run is not repeated. A finished run whose mode differs from `train.mode` counts as untrained: the
+    next check starts a fresh, unseeded run in the configured mode. A run in progress keeps its mode; a change takes
+    effect when it ends. Retraining after an environment change (below) and `lscli train retrain --stages` keep the
+    previous run's mode.
   * `heldout_sweep` only screens the held-out shapes that `selectors` / `tune topk` need. No fit sees them.
 * **Retraining after an environment change.** The daemon compares the active `trained_env` with the daemon venv's
   environment once a day:
 
 | Change | Stages re-run |
 |---|---|
-| cuBLASLt version | `lt_screen`, `lt_fit`, `tune_stage2_cold`, `tune_stage2_graph`, `router_fit`, `package` |
-| Triton version or kernel source | `tune_sweep`, `heldout_sweep`, `selectors`, `train_v1`, `tail_sweep`, `train_v2`, `tune_stage2_cold`, `tune_stage2_graph`, `router_fit`, `bundle`, `package` |
+| cuBLASLt version | `env`, `lt_screen`, `lt_fit`, `tune_stage2_cold`, `tune_stage2_graph`, `router_fit`, `package` |
+| Triton version or kernel source | `env`, `check`, `tune_sweep`, `heldout_sweep`, `selectors`, `train_v1`, `tail_sweep`, `train_v2`, `tune_stage2_cold`, `tune_stage2_graph`, `router_fit`, `bundle`, `package` |
 | driver only | none: every winner becomes soft-stale and is re-searched; `lscli train retrain` forces a full retraining |
 
-  A retraining runs in a **new** run directory `train/<hw_id>/<n+1>/`. The directory is seeded with hard links to the
-  previous run's outputs and stamps of the stages that are **not** re-run, so the stages that are re-run start empty.
-  Reusing the old directory would keep their old rows, because the stages resume per shape and `--only` skips
-  stamped stages.
+  A retraining runs in a **new** run directory `train/<hw_id>/<n+1>/`. The directory is seeded from the previous run
+  without the outputs and stamps of the stages that re-run, so those stages start empty. Reusing the old directory
+  would keep their old rows, because the stages resume per shape and `--only` skips stamped stages.
+  * Outputs of the stages that do **not** re-run are hard links when they are 1 MiB or more: they are large and never
+    written again.
+  * Every other file is copied, including small subset files that a later stage may rewrite in place, so the new run
+    cannot change the old one through a shared inode.
+  * Run numbers are one past every existing directory: a lost state file never reuses or deletes a run.
+
+  More rules:
+
+  * **Daemon environment.** The daemon re-probes its own environment at every daily check, so an upgrade of the daemon
+    venv is seen without a restart.
+  * **Recorded training environment.** The models' `trained_env` is the environment the stages ran under.
+  * **Stage failures.** A stage that fails twice stops the training (status `failed`, no automatic restart) until
+    `lscli train retrain`. A stage that exits non-zero within a minute while the GPU has become busy counts as a
+    preemption, not a failure: train_best's own idle check lost a race with a user's process.
+  * **Locks.** The daemon's own `train_best.sh` run holds `src/pipeline/.lock`, so the gate ignores that lock when the
+    holder is in the running job's tree.
+  * **Stage output.** A stage's output goes to its job log (`logs/jobs/*-train-<stage>.log`), never to a pipe.
+  * **`lscli train retrain --stages`.** The stages run in train_best order, and only on top of a finished training.
+    Each request is consumed once.
+  * **`lscli train start`.** The window is ignored until the current training finishes or fails.
 
 ### 4.6 Clock
 

@@ -19,7 +19,7 @@ DEFAULTS: dict[str, dict] = {
     "clock": {"lock_mhz": 0},
     "train": {"enabled": True, "mode": "full"},
 }
-CHOICES = {"train.mode": ("full", "quick")}
+CHOICES = {"train.mode": ("full", "quick", "smoke")}
 _WINDOW = re.compile(r"^$|^([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d$")
 
 
