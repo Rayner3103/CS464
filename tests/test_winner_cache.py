@@ -101,6 +101,25 @@ def test_select_kernel_cache_off_always_searches(tmp_path, fake_search, monkeypa
     assert WinnerCache.default() is None
 
 
+def test_select_kernel_stores_the_callers_extra_fields(tmp_path, fake_search):
+    """lscli's inline search stores `torch_us` with the winner. A callable `extra` runs after the search (the order the
+    daemon's worker times torch in) and only when a line is written; if it raises, nothing is stored."""
+    wc = WinnerCache(tmp_path / "w.jsonl", env=ENV)
+    kw = dict(cache=wc, use_bundle=False, lt_n=4)
+    online.select_kernel(None, 64, 64, 64, extra={"torch_us": 50.0}, **kw)
+    assert wc.get(64, 64, 64, "fp16", k=3, lt_n=4)["torch_us"] == 50.0
+    seen = []
+    online.select_kernel(None, 128, 64, 64, extra=lambda: seen.append(len(fake_search)) or {"torch_us": 70.0}, **kw)
+    assert seen == [2] and wc.get(128, 64, 64, "fp16", k=3, lt_n=4)["torch_us"] == 70.0   # after the search
+    online.select_kernel(None, 128, 64, 64, extra=lambda: pytest.fail("cache hit: nothing is written"), **kw)
+
+    def oom():
+        raise RuntimeError("CUDA out of memory")
+    with pytest.warns(UserWarning, match="out of memory"):
+        out = online.select_kernel(None, 256, 64, 64, extra=oom, **kw)
+    assert out["choice"]["key"] == KEY and wc.get(256, 64, 64, "fp16") is None
+
+
 def test_a_broken_cache_never_breaks_selection(tmp_path, fake_search):
     class Broken:
         def get(self, *a, **k):
