@@ -50,7 +50,7 @@ $LSCLI_HOME/
   gpu.lock                   held (flock) by the daemon while one of its jobs uses the GPU
   envs.json                  registered client interpreters
   models/<hw_id>/            this GPU's models + MODELS.json
-  models/zero_shot/          the 3080 models used until native ones exist
+  models/zero_shot/          the 3080 models used until native ones exist (from install/zero_shot.tar.xz)
   train/<hw_id>/<n>/         train_best run directories (n = 1 for the first training, +1 per retraining)
   state.json                 daemon status (daemon-written, read by `lscli status`)
   control.json               pause / resume requests (CLI-written)
@@ -250,7 +250,11 @@ One job at a time, holding `gpu.lock`. Jobs, highest priority first; within a cl
 
 1. **search**: queued `manual` / `miss` requests, and every NN profile shape with no usable entry for an env that ran
    it.
-2. **widen**: shapes whose decayed calls reached `frequent_calls` but whose entry was searched with `k < k_frequent`.
+2. **widen**: shapes whose decayed calls reached `frequent_calls` but whose entry was searched with `k < k_frequent`,
+   and entries from a cuBLASLt-only search (`k = 0`, section 4.4) once a Triton ranker exists. A narrower entry whose
+   only stale field is `models` is a widen, not a superseded.
+
+Every lookup asks for `k = 0` (any entry), so a cuBLASLt-only entry counts as searched while there is no ranker.
 3. **re-search**: soft-stale entries (`stale`).
 4. **train**: the next unfinished training stage (section 4.5), if training is enabled and needed.
 5. **re-search**: entries superseded by newly activated models (`superseded`).
@@ -265,7 +269,10 @@ with compute processes.
 For a (shape, dtype, env_id):
 
 1. **Triton proposals** (daemon process, CPU): `propose_triton` with k = `k_frequent` when the shape's decayed calls
-   are at least `frequent_calls`, else `k`.
+   are at least `frequent_calls`, else `k`. With no model set (section 4.5) there are none: the search is cuBLASLt's
+   heuristic top `lt_n` alone, stored with `k = 0` and `ranker: null`, and no router runs. A later search with a
+   ranker is wider and replaces it. With `lt_n = 0` as well there is nothing to search and only training runs. The
+   client's inline search does the same through `select_kernel(LT_ONLY, ...)`.
 2. **cuBLASLt proposals** (`python -m lscli.propose`, daemon venv, a child of the job): the learned cuBLASLt ranker's
    top `lt_rank` configs (`propose_lt(..., lt_n, lt_rank=...)`), as keys. They are built with the daemon venv's
    cuBLASLt. The worker rebuilds them with its own library (`cublaslt_knn.from_key`) and drops any its library
@@ -284,7 +291,8 @@ program first runs them.
 ### 4.5 Training
 
 * **Models in use.** Until `models/<hw_id>/MODELS.json` lists every model, the daemon uses `models/zero_shot/` (the
-  3080 rankers) plus cuBLASLt's heuristic top `lt_n`. The zero-shot cuBLASLt ranker and router are used only on a GPU
+  3080 rankers, installed from the committed `install/zero_shot.tar.xz`) plus cuBLASLt's heuristic top `lt_n`. With
+  neither (the set was removed, or a custom install without models), searches are cuBLASLt-only (section 4.4). The zero-shot cuBLASLt ranker and router are used only on a GPU
   with the source's architecture (they are refused elsewhere, as in `select_kernel`). The zero-shot Triton rankers are
   used on any GPU.
 * **First training.** The daemon runs `pipeline/train_best.sh --run-dir train/<hw_id>/1 --skip-install
@@ -551,11 +559,13 @@ curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/<tag>/install/inst
    `src` in editable mode. `$LSCLI_HOME` is created with mode 0700 and gets a marker file, `.lscli-home`. An existing
    `--home` that is not empty and has no marker is refused (it is left untouched), unless it is an install from before
    the marker (`src/` a git clone whose origin is `--repo`, and `venv/bin/python`), which then gets the marker.
-3. Download the zero-shot models (GitHub release assets of `<tag>`) into `models/zero_shot/`. Their sha256 sums are
-   **pinned in `install.sh`** itself, not fetched from the release. Unpack `kernels/bundle.tar.xz`.
-   `install/pack_zero_shot.py` builds the archive and prints the hash to pin. Until an asset is published, the pin is
-   empty and the installer skips this step: the daemon then trains this GPU's models first and selects nothing with a
-   Triton ranker until they exist. `--models-url URL --models-sha256 HEX` installs another archive.
+3. Unpack the zero-shot models into `models/zero_shot/` (atomic swap). They are committed in the source as
+   `install/zero_shot.tar.xz` (the RTX 3080's rank v2 Triton ranker, cuBLASLt ranker and router, 11 MiB), so they
+   come with the clone and git checks their integrity; there is no download and no release asset.
+   `install/pack_zero_shot.py` rebuilds the archive reproducibly (same models, same bytes); each rebuild that changes
+   it adds its size to git history. `--models-url URL --models-sha256 HEX` installs another archive instead (checked
+   against the hash). Every archive is unpacked with tarfile's `data` filter and refused if it holds anything but
+   regular files. Then unpack `kernels/bundle.tar.xz`.
 4. Write `~/.config/lscli/config.toml` if absent. Write `~/.local/bin/lscli`, which runs the venv's python with `-I`
    (neither the caller's cwd nor `PYTHONPATH` can put another tree's lscli first). Background training: on a fresh
    install (no config yet), say what it costs (about 35 GPU-hours on an RTX 3080 for `full`, in idle time) and how to
@@ -595,6 +605,8 @@ night trains in whatever window it is awake for. Without linger, the service sto
   in idle time.
 * Zero-shot quality depends on the GPU: close to native on sm_86 (3090), Triton half useless on sm_75 (2060), where
   the cuBLASLt half carries the search.
+* The zero-shot set is pinned to the source tree: an install gets the archive of the commit it cloned. The archive
+  adds ~11 MiB to git history per change.
 * The gate cannot tell an idle process that holds a CUDA context from a busy one: such a process keeps background
   work from running at all.
 * The cuBLASLt ranker's proposals come from the daemon venv's cuBLASLt. A user env with another cuBLASLt build gets

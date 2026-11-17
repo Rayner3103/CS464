@@ -214,20 +214,19 @@ class _Client:
             if calls < self.search["frequent_calls"]:
                 return None
             stem = (self.doc.get("models") or {}).get("triton")
-            if not stem:
-                return None
-            if self.ranker is None:
+            if stem and self.ranker is None:
                 from analysis.learned import Ranker
                 self.ranker = Ranker.load(stem)
+            # no Triton ranker yet: select_kernel(LT_ONLY, ...) is a cuBLASLt-only search (k = 0)
             from lscli.worker import torch_time_us
-            from tune.online import KPolicy, select_kernel
+            from tune.online import LT_ONLY, KPolicy, select_kernel
             pol = KPolicy(self.search["k"], self.search["k_frequent"], self.search["frequent_calls"])
             # torch_us for the dispatch rule, timed after the search as the daemon's worker does: without it the
             # entry would never be dispatched, and the daemon would still count the shape as searched
-            sel = select_kernel(self.ranker, *key[:3], calls=int(calls), policy=pol, lt_n=self.search["lt_n"],
-                                dtype=dtype, cache=self.wc, use_bundle=False, serve_stale=True,
+            sel = select_kernel(self.ranker if stem else LT_ONLY, *key[:3], calls=int(calls), policy=pol,
+                                lt_n=self.search["lt_n"], dtype=dtype, cache=self.wc, use_bundle=False, serve_stale=True,
                                 extra=lambda: {"torch_us": torch_time_us(*key[:3], dtype), "lscli": True})
-            return self.wc.get(*key, k=1, lt_n=0, allow_stale=True) if sel.get("choice") else None
+            return self.wc.get(*key, k=0, lt_n=0, allow_stale=True) if sel.get("choice") else None
         except Exception as e:                       # lightgbm / models missing in this env: behave as a miss
             self.inline_ok = False
             warnings.warn(f"lscli: inline search unavailable ({type(e).__name__}: {e}); misses use torch")
@@ -236,7 +235,7 @@ class _Client:
     def _decide(self, key, dtype) -> tuple:
         """(backend to dispatch | None for torch, whether the table had a usable entry)."""
         wc = self._cache()
-        e = wc.get(*key, k=1, lt_n=0, allow_stale=True)
+        e = wc.get(*key, k=0, lt_n=0, allow_stale=True)                 # any entry, cuBLASLt-only (k = 0) included
         if e is None and key not in self.inline_tried:
             e = self._inline(key, dtype)
         if e is None:
