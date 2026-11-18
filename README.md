@@ -5,12 +5,20 @@ from a parameterized Triton kernel family and NVIDIA's cuBLASLt configurations. 
 list per shape, a short timing on the GPU picks the winner, and a per-shape cache remembers it. `lscli` runs all of
 this as a background service on your own machine, with an opt-in `torch.matmul` patch.
 
+> **New here? Start with [`results/`](results/README.md).** It is the project's write-up in seven short chapters:
+> what a kernel selector is, how we measured, what we compared against, what we trained, how well it picks on sizes
+> it never saw and on other GPUs, and how it ships. The short answer: the selector picks a kernel within a median
+> 0.5 % of the best available in under a second, is faster than NVIDIA's default on most sizes and never slower
+> beyond noise, but does not beat NVIDIA's offline-searched kernels on large GEMMs. Read its
+> [summary page](results/README.md) first (key numbers, gates, glossary), then the chapters in order.
+
 | I want to | Read |
 |---|---|
+| Understand the project and its results (start here) | [`results/`](results/README.md): summary, then chapters 1-7 |
 | Install lscli, try it on my GPU, or uninstall it | [User guide](docs/user_guide.md) |
 | Set up a development / training environment and find my way around | [Developer guide](docs/developer_guide.md) |
 | Know every command, rule and result in detail | [`AGENTS.md`](AGENTS.md) |
-| Read the findings | [`reports/week1.md`](reports/week1.md) (dated, newest first), [`reports/results_overview.md`](reports/results_overview.md) (figures) |
+| Check a finding at full detail | [`reports/week1.md`](reports/week1.md) (dated lab notebook, newest first), [`reports/results_overview.md`](reports/results_overview.md) (figures) |
 
 ## Quick start: lscli
 
@@ -49,7 +57,7 @@ Before measuring anything, read the standard conditions (SM clock locked at 1755
 * It transfers to an RTX 3090 (same architecture). On an RTX 2060, Triton has no tensor-core path and cuBLASLt
   carries the search.
 
-Gates, numbers and caveats: [developer guide section 5](docs/developer_guide.md#5-results). Open work:
+Gates, numbers and caveats: [`results/`](results/README.md) and [developer guide section 5](docs/developer_guide.md#5-results). Open work:
 [section 8](docs/developer_guide.md#8-open-items).
 
 ## Layout

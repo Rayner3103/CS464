@@ -36,7 +36,10 @@ Everything in chapters 2–4 was measured on one card, the RTX 3080. A selector 
 - **Zero-shot works.** Not one of the 27 picks is more than 50% off, for either model. The v2 model is statistically the same as the 3080's own (mean difference +1.4 points, interval −0.7 to +3.6). The v1 model is measurably worse (+3.5 points [+1.1, +6.4], 14 of 27 shapes more than 5% off). So **the model with the physics-style features (v2) is the one that generalises**; v1 leans on details of the 3080.
 - **Retraining on the 3090 fixes v1** (difference vs the 3080 falls to −0.4 [−1.9, +1.4]) and adds little for v2 (zero-shot +1.4 → retrained +0.1; shapes over 5% off: 10 → 6; the 3090's own measuring noise is 4–5%, see 5.4). In plain words: a retrain mostly repairs the model that over-fitted the 3080.
 - **The full retrain** ran on a cluster node (everything fitted from 3090 data, nothing borrowed): 477 + 150 tail shapes screened, rank v1 and v2, the cuBLASLt ranker and the router refit. On all 86 unseen shapes, Triton-only online top-3 with v2: **2.1% typical, 13.6% unlucky 5%, 20% worst 1%** (for comparison, the 3080's v1 on the same 86 shapes: 1.1% / 9.1% / 20%; v1 on the 3090 had a worse tail, 43% worst 1%). No pick is more than 50% off.
-- **The joint race (Triton top-3 + cuBLASLt top-16) behaves as on the 3080:** faster than NVIDIA's default (B2) on **61 of 86 shapes and slower on 0** (3080: 49 / 0), level with the 20-second offline search at the median (0.994×, faster on 26, slower on 9), first use about 0.9 s. The final pick is a cuBLASLt kernel on 24% of shapes here, versus 41% on the 3080: the vendor's heuristic is better on the 3080, so the value of the Triton half is GPU-specific.
+- **The joint race (Triton top-3 + cuBLASLt top-16 + the 3090's own cuBLASLt ranker) behaves as on the 3080:** faster than NVIDIA's default (B2) on **61 of 86 shapes and slower on 0** (3080: 49 / 0), level with the 20-second offline search at the median (0.994×, faster on 26, slower on 9), first use about 0.9 s. The race ends on a cuBLASLt kernel on **41 of 86** shapes (21 from the heuristic list, 20 from the cuBLASLt ranker); the 3080 with the same kind of pool (plus the confirmation pass of 3.7) ends on one on 42 of 86. So the split between the two families is the same on both cards.
+- **G4 still fails on the 3090.** With the 3090's wider noise (5.4) taken as the tie margin, the joint race at ≥ 50 µs is faster than B3+ on 1 of 25 shapes and slower on 4.
+- **The router transfers as a method.** The 3090's own router (AUC 0.803, threshold 0.055), replayed on the held-out run: regret unchanged (0.5 / 8.6 / 10.8 / 2.0% vs 0.5 / 9.5 / 10.4 / 2.0% without it), first use 0.875 → 0.676 s (−23%), 17 of 86 shapes skipped.
+- **The tensor-core path is there:** all 285 compiled Triton kernels of the 3090 zero-shot run contain `mma.sync` instructions (the 2060's 571 contain none, see 5.3).
 
 ## 5.3 RTX 2060: the models fail, but the recipe and the safety net work
 
@@ -52,11 +55,11 @@ Everything in chapters 2–4 was measured on one card, the RTX 3080. A selector 
 
 ## 5.4 The measuring stick is not the same on every GPU
 
-![Noise 3090](figures/05_noise_3090.png)
+![Noise by condition](figures/05_noise_conditions.png)
 
-*Run-to-run spread of the same timing over 3 rounds, unlucky 5% of kernels of 50 µs or more. The 3080 ran with its clock locked; the 3090 cluster job cannot lock the clock.*
+*95th percentile of the spread of the same timing, kernels of 50 µs or more. Left: across the 3 rounds of one session. Right: across sessions, the statistic the 2% tie margin comes from. The 3090 cluster job cannot lock the clock, and only one 3090 session exists.*
 
-On the 3080 two timings within **2%** count as a tie. On the 3090 the same noise study gives about **4–5%**, so on that card differences of a few percent between selectors are inside the noise of the oracle itself. The large effects stand (61 faster / 0 slower than B2; the v1 to v2 tail drop from 43% to 20%; 0 picks over 50% off). This is one session, so the real floor can only be larger. The reason for the extra noise is not identified (clock wander explains little).
+On the 3080 two timings within **2%** count as a tie. The 3090's single noise session spreads **4.3% / 3.9%** (cold / hot) between its rounds. That is the within-session statistic, and the 3080 with its clock unlocked gives almost the same within-session spread (4.25% / 3.83%) while still holding 2% *across* sessions ([2.4](02_baselines.md)). So the 3090's number matches what an unlocked clock costs the 3080 inside one session. It does not yet tell us the 3090's floor across sessions; by analogy with the 3080 a value near 2–3% is plausible, and a second 3090 session would settle it. Until then the 3090's comparisons use a 5% margin. The large effects stand under that margin (61 faster / 0 slower than B2; the v1 to v2 tail drop from 43% to 20%; 0 picks over 50% off).
 
 ## 5.5 What transfers and what does not
 
@@ -68,8 +71,8 @@ On the 3080 two timings within **2%** count as a tie. On the 3090 the same noise
 | Any Triton ranker across **tensor-core** vs **no tensor-core** chips | **No** | 2060: 13–16 of 27 picks > 50% off |
 | The cuBLASLt ranker, the k-NN table, the router | **No, refit per GPU** (tile ids and SM counts differ; the code refuses a foreign GPU) | 3090 refit: weaker than on the 3080 (68% vs 78% of the gap closed at 10 candidates) |
 | The winner cache | No (it is a per-machine file) | by design |
-| The tie margin (what counts as a real difference) | **No, measure per GPU** | 2% on the 3080, about 5% on the 3090 |
-| What NVIDIA's own library picks | No | cuBLASLt wins 41% of 3080 shapes, 24% of 3090, 89% of 2060 |
+| The tie margin (what counts as a real difference) | **No, measure per GPU** | 2% on the 3080 (locked or unlocked); the 3090 has one session only (4–5% within it), so it uses 5% for now |
+| How often the race ends on cuBLASLt | **Same within one architecture**, not across | 3080 42 of 86, 3090 41 of 86 (same pool); 2060 24 of 27 |
 
 Whether the models cross to a different tensor-core generation (Ada, Hopper) is untested.
 
@@ -77,7 +80,8 @@ Whether the models cross to a different tensor-core generation (Ada, Hopper) is 
 
 - 27 shared shapes: percentiles are the worst one or two shapes, and many differences between variants are inside their intervals.
 - The 3090 numbers come from an **unlocked** clock and a different driver (590.48 vs 595.99); the 3080 and 2060 were locked at 1755 MHz. Compare regrets and ratios, never absolute times, across cards.
-- On the 3090 we did **not** run the router's held-out score, a fresh-shape check, or the 3080's cuBLASLt ranker zero-shot. A log of the 3090's comparison script contains a `StopIteration` error whose cause was not investigated; the report was written afterwards and is complete, but 19–21 of the 27 joint picks have a stage-2 timing, so the joint comparison on those shapes is partly covered.
+- On the 3090 we did **not** run a fresh-shape check, a second noise session, a locked-clock run, or the 3080's cuBLASLt ranker and router zero-shot.
+- Two loose ends of the first 3090 write-up were closed on 2026-11-10 from the existing data. (1) The `StopIteration` in a log of the comparison script came from a run before the stage-2 timings were topped up; on the final files the script finds all 258 picks and reproduces the report exactly. (2) "19–21 of 27 joint picks timed" was a scorer bug: picks of the learned cuBLASLt ranker were dropped. With it fixed all 27 are timed, and the retrained v2 joint race is 1.006× of B3+ at the median (within noise of the zero-shot arms, 1.000×).
 - The 2060 comparison is confounded by the missing tensor-core path (5.3).
 
 ---
