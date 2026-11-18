@@ -126,14 +126,40 @@ pipeline/zero_shot.sh --quick --clock-lock none --allow-unlocked --oracle <dir>/
 ```
 
 Needs the four 3080 model files (`lgbm_rank.{txt,json}`, `lgbm_rank_v2.{txt,json}`) in `data/src3080/` or
-`data/rtx3080_sm86_68sms_10gb/`, or anywhere with `--models DIR`; they are only read. Stages: `preflight install tests env sweep run score
-picks stage2_cold stage2_graph compare summary` (`--list-stages`). `sweep` (the oracle) dominates; `--oracle` copies a finished screen instead.
+`data/rtx3080_sm86_68sms_10gb/`, or anywhere with `--models DIR`; they are only read. Stages: `preflight install tests env lt_screen lt_fit
+sweep run score picks stage2_cold stage2_graph compare summary` (`--list-stages`; `lt_screen` / `lt_fit` run only with `--lt-mode retrain`,
+which trains this GPU's own cuBLASLt ranker: `docs/zero_shot_runbook.md` section 6b). `sweep` (the oracle) dominates; `--oracle` copies a finished screen instead.
 `SUMMARY.md` has the regret table per variant (`v1` / `v2` x `as_is` / `native`) at k = 3 and k = 5; the reports are under `reports/k3`, `reports/k5`
 and `ranker_compare.md` (joint choice vs B2 / B3 / B3+).
 
+## Training the shipped selector on a new GPU: `pipeline/train_best.sh`
+
+`run.sh` reproduces the phase-1 study. `train_best.sh` instead fits everything the shipped selector (`tune.online.select_kernel`)
+uses on this GPU: rank v1 and v2, the learned cuBLASLt ranker, the router, and optionally the prebuilt kernel bundle. It then
+validates them on the held-out shapes. Same conventions as `run.sh` (stamps, `--resume`, `--from`, `--only`, `pipeline/.lock`).
+
+```bash
+sudo nvidia-smi -lgc <MHZ>,<MHZ>                     # or --clock-lock none --allow-unlocked
+pipeline/train_best.sh --full --clock-lock <MHZ> [--with-bundle] [--skip-validation]
+```
+
+| Mode | Shapes | Use it for |
+|---|---|---|
+| `--full` (default) | 477 tune + 150 tail, 86 held-out, all 652 cuBLASLt screen shapes | the real models: about 35 h on an RTX 3080 (extrapolated; the RTX 3090's full run used SLURM) |
+| `--quick` | ~56 tune, ~27 held-out, 30 tail, 160 cuBLASLt screen shapes, B3+ at 10 s per shape | slow cards (the RTX 2060's Triton sweep alone took 17.7 h for 27 shapes) |
+| `--smoke` | a handful per stage | plumbing only; the fits are meaningless, and it still takes hours of GPU time |
+
+Stages (`--list-stages`): `preflight install env check roofline tune_sweep heldout_sweep selectors train_v1 tail_sweep train_v2
+lt_screen lt_fit tune_stage2_cold tune_stage2_graph router_fit bundle validate_run validate_score validate_stage2_cold
+validate_stage2_graph validate_compare package summary`. `bundle` does work only with `--with-bundle`, and the `validate_*`
+stages only without `--skip-validation`. Output: `pipeline/runs/train_best-<mode>-<timestamp>/` with `models/` (the fitted files,
+MD5SUMS, and an `INSTALL.md` saying where each goes) and `SUMMARY.md`. lscli's daemon runs this same script one stage at a time in
+idle time (`docs/lscli/spec.md` section 4.5). On SLURM: `sbatch remoteGPU/train_best.sh`.
+
 ## On a SLURM cluster
 
-`sbatch remoteGPU/run.sh` runs this pipeline (`MODE=smoke|quick|full`) and `sbatch remoteGPU/zero_shot.sh` runs the zero-shot transfer.
+`sbatch remoteGPU/run.sh` runs this pipeline (`MODE=smoke|quick|full`), `sbatch remoteGPU/train_best.sh` the full training and
+`sbatch remoteGPU/zero_shot.sh` the zero-shot transfer (`remoteGPU/noise.sh`: the noise study).
 Both need the login-node setup in their headers (venv in `$REPO/.venv`, no sudo, so unlocked clocks by default), write to a fixed
 directory and continue where they stopped when resubmitted.
 
