@@ -38,7 +38,7 @@ uninstalling (`lscli uninstall [--purge]`) are in the [user guide](docs/user_gui
 ## Quick start: development
 
 ```bash
-git clone https://github.com/Rayner3103/CS464.git && cd CS464 && git switch learned-selectors
+git clone https://github.com/Rayner3103/CS464.git && cd CS464  # master holds the newest code
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
 python -m tune env && python -m pytest -q             # GPU idle; most tests need it
