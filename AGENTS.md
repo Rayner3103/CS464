@@ -3,7 +3,8 @@
 Guide for agents working in this repo. It summarizes what the baseline phase (branch `baseline`) built, what it found,
 and how to run, extend and not break it. Source of truth for details: [`plan.md`](plan.md) (the plan and gates),
 [`docs/methodology.md`](docs/methodology.md) (measurement protocol), [`reports/week1.md`](reports/week1.md) (dated
-findings, newest first).
+findings, newest first). For people: [`docs/developer_guide.md`](docs/developer_guide.md) (setup, map, models, open items)
+and [`docs/user_guide.md`](docs/user_guide.md) (installing, trying and uninstalling lscli); keep them in step with this file.
 
 ## 1. What this project is
 
@@ -73,9 +74,10 @@ lscli/       the learned-selector CLI and daemon (docs/lscli/spec.md is the cont
   daemon.py      idle-time loop: gate.py (NVML + window + power + locks), scheduler.py, jobs.py (process trees, preemption),
                  models.py (native / zero-shot sets), propose.py (cuBLASLt ranker proposals), training.py (train_best stages)
   cli.py         `lscli` commands; config.py, files.py, envs.py, usage.py, search_queue.py, control.py, doctor.py
-install/     install.sh (curl | bash), lscli.service (systemd --user), lscli-clock (optional root clock helper),
+install/     install.sh (curl | bash; default --ref master), lscli.service (systemd --user), lscli-clock (optional root clock helper),
              zero_shot.tar.xz (the 3080 zero-shot model set the installer unpacks; rebuilt with pack_zero_shot.py, reproducibly)
-tests/       pytest unit tests (~300 tests; most need a CUDA GPU)
+examples/    lscli_demo.py: times a few fp16 GEMMs through torch and through lscli's patch and prints lscli's decision per shape (user guide, "Try it out")
+tests/       pytest unit tests (~380 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)

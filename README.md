@@ -1,55 +1,72 @@
 # CS464: learned kernel selection for GPU GEMM
 
-Phase 1 sets the baselines before any ML. The full plan is in [`plan.md`](plan.md), the measurement protocol in
-[`docs/methodology.md`](docs/methodology.md), and the latest findings in [`reports/week1.md`](reports/week1.md).
+For each matrix-multiply shape (fp16 `C = A·B`) a program runs, this project picks the fastest GPU kernel, choosing
+from a parameterized Triton kernel family and NVIDIA's cuBLASLt configurations. A LightGBM ranker proposes a short
+list per shape, a short timing on the GPU picks the winner, and a per-shape cache remembers it. `lscli` runs all of
+this as a background service on your own machine, with an opt-in `torch.matmul` patch.
 
-## lscli: the selector as a background service
+| I want to | Read |
+|---|---|
+| Install lscli, try it on my GPU, or uninstall it | [User guide](docs/user_guide.md) |
+| Set up a development / training environment and find my way around | [Developer guide](docs/developer_guide.md) |
+| Know every command, rule and result in detail | [`AGENTS.md`](AGENTS.md) |
+| Read the findings | [`reports/week1.md`](reports/week1.md) (dated, newest first), [`reports/results_overview.md`](reports/results_overview.md) (figures) |
 
-`lscli` puts the learned selector to work on one machine. It learns which GEMM shapes your programs run, trains this
-GPU's own models when the machine is idle, and searches those shapes ahead of time, so a program finds its kernel
-already chosen. Install it (Linux, systemd, one NVIDIA GPU, no root):
+## Quick start: lscli
+
+Linux with systemd, one NVIDIA GPU, Python ≥ 3.11. No root needed.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/learned-selector-cli/install/install.sh | bash
-lscli enable-env $(command -v python3)      # the env your programs use
-LSCLI_PATCH=1 python train.py               # or: import lscli; lscli.enable()
-lscli status                                # lscli doctor if it does nothing
+curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/master/install/install.sh | bash
+cd ~ && lscli enable-env "$(command -v python3)"     # the Python env your programs use (not a CS464 checkout)
+LSCLI_PATCH=1 python train.py                       # or: import lscli; lscli.enable()
+lscli status                                        # lscli doctor if nothing happens
 ```
 
-Specification: [`docs/lscli/spec.md`](docs/lscli/spec.md); implementation plan: [`docs/lscli/plan.md`](docs/lscli/plan.md).
+Searches run while the machine is idle (by default 01:00-07:00). Options (no questions, no background training,
+pinned ref, library-only use), a short walkthrough with [`examples/lscli_demo.py`](examples/lscli_demo.py), and
+uninstalling (`lscli uninstall [--purge]`) are in the [user guide](docs/user_guide.md).
+
+## Quick start: development
+
+```bash
+git clone https://github.com/Rayner3103/CS464.git && cd CS464 && git switch learned-selectors
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
+python -m tune env && python -m pytest -q             # GPU idle; most tests need it
+```
+
+Before measuring anything, read the standard conditions (SM clock locked at 1755 MHz) and the GPU job rules in the
+[developer guide](docs/developer_guide.md#15-standard-conditions-and-gpu-hygiene).
+
+## Where it stands (RTX 3080)
+
+* The Triton family reaches a median 98.8 % of a searched cuBLASLt (B3+), and choosing per shape matters: the best
+  single config is a median ~70 % slower than the per-shape best. It does not beat B3+ on kernels ≥ 50 µs.
+* The shipped selector (rank v2 top-3 + cuBLASLt top-16 + learned cuBLASLt picks) lands a median 0.5 % from the best
+  candidate in its pool on 86 held-out shapes (p95 5.5 %), and 0.6 % on 60 fresh shapes. It ties B3+ at ≥ 50 µs, at
+  ~0.17 s first-use cost per shape with the prebuilt kernels.
+* It transfers to an RTX 3090 (same architecture). On an RTX 2060, Triton has no tensor-core path and cuBLASLt
+  carries the search.
+
+Gates, numbers and caveats: [developer guide section 5](docs/developer_guide.md#5-results). Open work:
+[section 8](docs/developer_guide.md#8-open-items).
 
 ## Layout
 
 ```
-tune/        harness: env capture, timing, correctness gate, records, runner, noise/drift, CLI
-kernels/     parameterized Triton GEMM family + config space / pruning rules
-baselines/   B0 roofline, B1 torch.matmul (cuBLAS), B5 Triton tutorial kernel
-suites/      shape suites (versioned JSON; regenerate with `python -m suites.generate`)
-analysis/    report generation (plots + tables)
-lscli/       the lscli CLI, client patch, daemon, training orchestration (docs/lscli/spec.md)
-install/     lscli installer, systemd unit, clock helper, the committed zero-shot model set and its packer
-tests/       unit tests (`python -m pytest`)
-data/<hw>/   results + env.json (gitignored)
-reports/     write-ups and figures
+tune/        measurement harness + CLI (python -m tune ...), the shipped selector (online.py), winner cache, router
+kernels/     parameterized Triton GEMM, config space / pruning rules, prebuilt kernel bundle
+baselines/   B0 roofline, B1 torch.matmul, B2/B3 cuBLASLt heuristic, B3+ cuBLASLt search, B5 Triton tutorial,
+             cuBLASLt k-NN proposals and learned ranker
+suites/      shape suites (versioned JSON; python -m suites.generate) and the tune / held-out split
+analysis/    tables, model fits (learned rankers, router), cross-GPU scoring, figures (CPU only)
+lscli/       the selector as a per-user service: client patch, worker, daemon, CLI (docs/lscli/spec.md)
+install/     lscli installer, systemd unit, clock helper, the committed zero-shot models and their packer
+pipeline/    one-command runs: run.sh (the study), train_best.sh (train a new GPU), zero_shot.sh
+remoteGPU/   SLURM wrappers of the pipeline scripts
+examples/    lscli_demo.py
+tests/       pytest suite (python -m pytest -q)
+reports/     write-ups, generated tables, figures/, snapshot/ (small committed copies of data)
+data/<hw>/   raw results, screens, models, logs (gitignored, per machine)
 ```
-
-## Usage
-
-The project uses the existing Python environment, pinned in `requirements.txt`. Run everything from the repo root:
-
-```bash
-python -m pytest -q                                  # unit tests (needs a CUDA GPU for most)
-python -m tune env                                   # data/<hw_id>/env.json
-python -m tune check --suite edge                    # correctness gate over the edge-shape suite
-python -m tune roofline                              # B0: measured peak TFLOP/s and DRAM GB/s
-python -m tune noise --rounds 3                      # noise-floor study (run again on other days)
-python -m tune drift --minutes 10                    # thermal drift
-python -m tune baseline --suite S1,S2 --which torch,triton_tutorial --cache-modes cold,hot
-python -m tune benchmark --suite S1,S2 --backends triton:handpicked --cache-modes cold,hot --budget 30m
-python -m tune analyze                               # reports/week1_results.md + reports/figures/
-python -m tune portfolio [--heldout]                 # config-space reduction from the sweep screen (G3, G5)
-python -m tune selectors                             # NN / k-NN / hand-rule selector baselines on held-out shapes
-```
-
-`benchmark` and `baseline` append to `data/<hw_id>/results.jsonl` and can be resumed: re-running skips
-measurements that are already done.

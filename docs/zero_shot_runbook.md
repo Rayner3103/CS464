@@ -27,7 +27,9 @@ On a machine you control, `pipeline/zero_shot.sh` runs the whole thing in one co
 lgbm_rank.txt  lgbm_rank.json  lgbm_rank_v2.txt  lgbm_rank_v2.json        # about 71 MB in total
 ```
 
-into a **separate** folder, e.g. `$D/src3080/`. If the machine already has its own `lgbm_rank.*` in `$D` (a retrained model), copying over it would overwrite it.
+into a **separate** folder, e.g. `$D/src3080/`. Without access to the 3080's `data/`: rank v2 (byte-identical) is committed in
+`install/zero_shot.tar.xz` (`tar -xJf install/zero_shot.tar.xz -C $D/src3080 lgbm_rank_v2.txt lgbm_rank_v2.json`); rank v1's booster is
+not committed anywhere. If the machine already has its own `lgbm_rank.*` in `$D` (a retrained model), copying over it would overwrite it.
 Check the copy with `md5sum` against the source. v2's analytic-feature constants are fixed model units: do not change them for the new GPU.
 
 ## 2. The oracle: this GPU's own held-out screen

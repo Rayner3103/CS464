@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # lscli installer (docs/lscli/spec.md section 8):
 #
-#   curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/learned-selector-cli/install/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/master/install/install.sh | bash
 #
-# The default --ref is the lscli main branch, which moves; pass --ref <tag> (and fetch install.sh from that tag) to
-# install a fixed version.
+# The default --ref is master, which moves; pass --ref <branch|tag> (and fetch install.sh from that ref) to install
+# another branch or a fixed version (docs/user_guide.md section 1.3).
 #
 # Installs the learned-selector CLI and its daemon for THIS user: a git clone in $LSCLI_HOME/src, a venv with the pinned
 # versions, the zero-shot models, ~/.local/bin/lscli, the config, and a systemd --user unit. Needs no root, except for
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/Rayner3103/CS464.git"
-REF="learned-selector-cli"
+REF="master"
 LSCLI_HOME="${LSCLI_HOME:-$HOME/.local/share/lscli}"
 CONFIG_DIR="$HOME/.config/lscli"
 BIN_DIR="$HOME/.local/bin"

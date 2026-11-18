@@ -509,7 +509,7 @@ overhead.
 
 | Command | Synopsis | Effect |
 |---|---|---|
-| `status` | `lscli status [--watch]` | Daemon state, gate and reasons, current job, queue, training progress, cache tiers, client hit rate (from the profile) |
+| `status` | `lscli status` | Daemon state, gate and reasons, current job, queue, training progress, cache tiers, client hit rate (from the profile) |
 | `enable-env` | `lscli enable-env [PYTHON] [--no-deps]` (default: `python3` on `PATH`) | Needs torch + triton importable there. Refuses when a package named like lscli's (`lscli`, `tune`, `kernels`, `baselines`, `analysis`) is importable from anywhere but lscli's copy, checked both isolated (`python -I`) and from the caller's cwd with its `PYTHONPATH`, so a checkout reachable there is reported as a clash instead of being registered. pip-installs numpy / nvidia-ml-py if missing (`--no-deps`: fail instead). Writes `lscli.pth` into the env's site-packages: it puts `src/` on the path and runs the `LSCLI_PATCH` hook. Registers the env in `envs.json` and queues the shapes the profile already knows for it |
 | `disable-env` | `lscli disable-env PYTHON` | Remove `lscli.pth`; unregister |
 | `envs` | `lscli envs` | List registered interpreters and their versions |
@@ -569,7 +569,7 @@ Other subcommands, all with JSON on stdout:
 ## 8. Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/<tag>/install/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/master/install/install.sh | bash   # --ref <branch|tag>: another version
 ```
 
 1. **Preflight.** Exit 4 if any of these fails:
@@ -580,9 +580,10 @@ curl -fsSL https://raw.githubusercontent.com/Rayner3103/CS464/<tag>/install/inst
    * gcc and the Python headers are present (Triton builds its launcher with them);
    * `git` is present;
    * one GPU (with more: warn and use device 0).
-2. `git clone` the repo at `<tag>` into `$LSCLI_HOME/src`. It must be a clone, because `train_best.sh`'s `preflight`
-   checks the history. Create `venv/` and install the pinned `requirements.txt` (torch from the cu130 index) and
-   `src` in editable mode. `$LSCLI_HOME` is created with mode 0700 and gets a marker file, `.lscli-home`. An existing
+2. `git clone` the repo at `--ref` (default `master`) into `$LSCLI_HOME/src`. It must be a clone, because
+   `train_best.sh`'s `preflight` checks the history. Create `venv/`, install the pinned `requirements.txt` (torch from
+   the cu130 index), and put `src` on the venv's path with a `.pth` file (`lscli-src.pth`). `$LSCLI_HOME` is created
+   with mode 0700 and gets a marker file, `.lscli-home`. An existing
    `--home` that is not empty and has no marker is refused (it is left untouched), unless it is an install from before
    the marker (`src/` a git clone whose origin is `--repo`, and `venv/bin/python`), which then gets the marker.
 3. Unpack the zero-shot models into `models/zero_shot/` (atomic swap). They are committed in the source as

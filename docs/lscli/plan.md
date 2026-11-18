@@ -14,7 +14,7 @@ this file is the route to it. Decisions were taken in the 2026-11-08 design inte
 | Idle gate | GPU idle (no foreign compute process, low utilization) + time window + AC power |
 | Preemption | Abort, discard the unit in flight, back off, resume later from per-shape checkpoints |
 | Clock | Optional sudoers helper (MHz chosen at install) locks the SM clock only around idle jobs and resets it after; otherwise stock clocks, recorded. A manual lock is declared with `lscli clock hold` (NVML cannot report one, so it cannot be saved and restored) |
-| Install | `curl … \| sh`; Linux + systemd user service; no root except the optional clock helper |
+| Install | `curl … \| bash`; Linux + systemd user service; no root except the optional clock helper |
 | Process split | Thin client in the user's env, heavy daemon in its own venv; files only between them |
 | Where winners are timed | In the user's interpreter (a worker the daemon starts), so the measured kernel is the one that runs. Triton ranking and the router run in the daemon (CPU); the cuBLASLt ranker's proposals in a short-lived daemon-venv child (needs the GPU); the daemon process never holds a CUDA context |
 | Cold start | The 3080 rankers zero-shot + cuBLASLt heuristic top-16, until native models exist; then re-searched. The zero-shot set is committed (`install/zero_shot.tar.xz`), not a release asset. With no model set at all, searches are cuBLASLt-only (`k = 0`) and are widened once a ranker exists |
@@ -82,9 +82,10 @@ rebased.
   is measured on the 3080 only, `reports/week1.md` 2026-11-13), and they are never written into `data/<hw>/` result files or reports.
 * **Version skew.** Bundle cubins only serve a user env with Triton 3.7.1 on sm_86. In other envs the worker compiles
   in idle time, and the compiled kernels land in the user's own Triton cache.
-* **Packaging.** The client installs the existing top-level `tune`, `kernels` and `baselines` packages plus `lscli`. The
-  daemon installs the repo checkout in editable mode, because `analysis.learned.Ranker` and `pipeline/` are needed only
-  there.
+* **Packaging.** No package is pip-installed. `lscli enable-env` writes `lscli.pth` into the client env, which puts
+  `src/` on its path, so lscli's copies of the top-level `tune`, `kernels`, `baselines` and `analysis` packages are
+  importable there (the name-clash limitation, spec section 9). The daemon venv gets `src/` the same way
+  (`lscli-src.pth`); `analysis.learned.Ranker` and `pipeline/` are needed only there.
 
 ## 4. Open after v1
 
