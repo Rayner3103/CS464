@@ -72,11 +72,11 @@ A selector learns "this shape likes this config" on one GPU. A different GPU cha
 | **Number of SMs** (3080: 68, 2060: 30) | decides where the "wave" cliffs sit |
 | **Fast on-chip memory per SM** | decides which tile sizes fit at all (we prune configs that don't) |
 | **Memory speed** (3080: 686 GB/s measured, 2060: 289 GB/s) | decides whether small-M jobs are limited by memory or by maths |
-| **Tensor cores** (special matrix hardware) | the 3080 has ones Triton can use. With the Triton version we used, the **2060's compiled code contained no tensor-core instructions** (0 of 193 kernels), so Triton reached only 0.43× of cuBLAS there |
+| **Tensor cores** (special matrix hardware) | the 3080 has ones Triton can use. With the Triton version we used (3.7.1), the **2060's compiled code contains no tensor-core (`mma`) instructions** (checked on all 193 cached kernels of the first run and all 571 of the zero-shot run), so the best Triton config reaches only **0.44×** of the searched cuBLASLt there (median, 27 shapes) |
 | **GPU memory (VRAM)** (3080: 10 GB, 2060: 6 GB) | very large shapes do not fit, and compiling many configs in parallel can run out of memory |
 | **Clock speed, power cap, driver version** | change timings by a few percent, so we lock the clock at 1755 MHz and only compare runs with the same driver |
 
-**Take-away:** the *recipe* (screen → train → race a few picks) moved to a second GPU and worked, but the *trained model* and the *numbers* must be redone per GPU (the 2060 retrain took about 10 hours of sweeping). Chapter 5 tests this properly on two more GPUs, including using the trained model unchanged.
+**Take-away:** the *recipe* (screen → train → race a few picks) moved to two more GPUs and worked on both. The *trained Triton model* carries over only within the same chip family: the 3080's model works unchanged on an RTX 3090 (same architecture) and fails on the RTX 2060 (no tensor-core path). The cuBLASLt models, the tie margin and the cached winners are measured per GPU. [Chapter 5](05_transferability.md) has the evidence.
 
 ---
 Next: [2. Baselines](02_baselines.md)

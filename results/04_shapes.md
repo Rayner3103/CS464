@@ -16,12 +16,13 @@ A selector is only as good as the shapes it saw. We built the shape lists **befo
 | **tail** (added later) | 150 extra shapes: narrow-N (30), small-M (30), tiny-K (20), unaligned and under 50 µs (40), mid-size (20), small split-K (10) | extra *training* data in the regimes where the first model was weakest |
 | edge | 169 degenerate shapes (1×1×1, K smaller than a tile …) | **correctness only**: every kernel must give the right answer first |
 | noise | 30 shapes spread over the suites and over run time | used for the noise study only |
+| **fresh** (added last) | 60 shapes, seed 465: 30 random and 30 LLM-layer sizes of models not in S2 (Qwen2-7B, Gemma-2-9B, Phi-3-mini, Mistral-Nemo-12B, Yi-6B) | a final check of the frozen selector ([3.8](03_model_training.md)). In no suite, and none shares two of M, N, K with a training shape (`tests/test_fresh_suite.py` checks both) |
 
 Limits (the project's frozen scope): sizes up to 16384, fp16, plain `C = A × B`. LLaMA-70B's 28672-wide layers are kept in the file but tagged "out of range" (22 shapes) and not used.
 
 ![Shapes per suite](figures/04_shapes_per_suite.png)
 
-*Total after removing out-of-range shapes. A shape that appears in two suites is counted in both here, but counted once when training (477 unique training shapes and 86 unique test shapes were actually screened; 4 very large shapes were not screened, probably for memory reasons, which was not checked).*
+*Total after removing out-of-range shapes. A shape that appears in two suites is counted in both here, but counted once when training (477 unique training shapes and 86 unique test shapes were screened). Four shapes above 1,200 GFLOP were not screened: the sweep skips them by design (`tune sweep --max-gflop`, default 1200). Screening them would be expensive: one run of one config on 16384³ takes at least 0.14 s even at peak speed, and a screen times up to 10,840 configs several times each. They are 16384³ and two large S7 shapes (training) and 12000³ (held-out).*
 
 ## 4.2 The train / test split, and why it is built this way
 
@@ -49,13 +50,14 @@ flowchart TD
 
 *Each dot is a shape (log axes). Orange is held-out region (the bands), pink is held-out random, blue is tune. The grid-like rows are the LLM layer sizes.*
 
-Counts: **477** tune shapes (+150 tail for ranker v2), **86** held-out shapes (30 take ≥ 50 µs, 56 take less), and 27 of those 86 were also used on the RTX 2060 and the RTX 3090 (the shared set of [chapter 5](05_transferability.md)).
+Counts: **477** tune shapes (+150 tail for ranker v2), **86** held-out shapes (30 take ≥ 50 µs, 56 take less), **60** fresh shapes, and 27 of the 86 were also used on the RTX 2060 and the RTX 3090 (the shared set of [chapter 5](05_transferability.md)). The cuBLASLt ranker was trained on a screen of 652 tune-split shapes, which also never includes a held-out shape.
 
 ## 4.3 Why we trust the test
 
 - **Held-out shapes are never used in fitting.** That means not for the menu of configs, nor for k-NN weights, nor for the rule, nor for the model. The one place held-out shapes could have influenced a choice (narrow-N in the tail suite) is stated openly in [3.7](03_model_training.md).
-- The tail suite excludes any shape that shares two of (M, N, K) with a held-out shape.
-- Results are always reported as **median, mean, and the worst 5%**, and separately for jobs that are short (< 50 µs) or long, because the average hides the tail.
+- The tail suite excludes any shape that shares two of (M, N, K) with a held-out shape. The cuBLASLt screen does not apply that rule (73 of its 652 shapes share two dimensions with a held-out shape), but it reads no held-out timing.
+- The fresh shapes were generated after every model, threshold and pool choice was fixed, so they test the shipped selector on shapes nobody looked at.
+- Results are always reported as **median, mean, the worst 5% and the worst 1%**, and separately for jobs that are short (< 50 µs) or long, because the average hides the tail.
 
 ---
 Previous: [3. Model training](03_model_training.md) · Next: [5. Transferability](05_transferability.md) · Back to [README](README.md)

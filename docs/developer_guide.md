@@ -23,21 +23,20 @@ Contents: [1. Setup](#1-setup) · [2. Repository map](#2-repository-map) · [3. 
 
 ## 1. Setup
 
-### 1.1 Clone and pick a branch
+### 1.1 Clone
 
 ```bash
-git clone https://github.com/Rayner3103/CS464.git && cd CS464
-git switch learned-selectors
+git clone https://github.com/Rayner3103/CS464.git && cd CS464  # master: the newest code
 ```
 
 | Branch | Holds |
 |---|---|
-| `learned-selectors` | The newest code: the research harness, the shipped selector and lscli. Work from here |
-| `master` | The default branch, and the ref the installer clones: what users get. Updated from `learned-selectors` by a merge PR (last: #26, 2026-11-19) |
+| `master` | The default branch and the newest code: the research harness, the shipped selector and lscli. Clone and branch from here; it is also the ref the installer clones |
+| `learned-selectors` | Where the learned selectors were developed, merged into `master` by PR (last: #28, 2026-11-19); nothing newer than `master` |
 | `learned-selector-cli` | lscli's integration branch (PRs #2-#23), merged into `learned-selectors` by #24 |
 | `baseline` | The baseline phase as it stood on 2026-10-19 (before the learned selectors) |
 
-Nothing is committed directly to `learned-selectors` or `learned-selector-cli`. Every change is a branch and a pull
+Nothing is committed directly to `master`, `learned-selectors` or `learned-selector-cli`. Every change is a branch and a pull
 request, reviewed first.
 
 ### 1.2 Python environment
@@ -113,6 +112,7 @@ used. Only compare sessions with the same lock and driver. The rules that have c
 | `remoteGPU/` | SLURM wrappers of the pipeline scripts and the noise study (`sbatch remoteGPU/<script>.sh`); edit the `#SBATCH` partition / account lines for your cluster | the script headers |
 | `examples/` | `lscli_demo.py`, the "try it out" script of the user guide | |
 | `tests/` | pytest suite (`python -m pytest -q`) | |
+| `results/` | The project write-up for a first-time reader or grader: chapters 1-7 (question, baselines, models, shapes, other GPUs, shipping, deployment), their figures (`make_figures.py`, CPU only) and the bundle A/B script (`bundle_ab.py`, GPU) | [`results/README.md`](../results/README.md) |
 | `reports/` | Write-ups, generated tables, `figures/`, `snapshot/` | `reports/week1.md` |
 | `learning/` | Background study notes, not part of the harness | |
 

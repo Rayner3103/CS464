@@ -78,6 +78,7 @@ install/     install.sh (curl | bash; default --ref master), lscli.service (syst
              zero_shot.tar.xz (the 3080 zero-shot model set the installer unpacks; rebuilt with pack_zero_shot.py, reproducibly)
 examples/    lscli_demo.py: times a few fp16 GEMMs through torch and through lscli's patch and prints lscli's decision per shape (user guide, "Try it out")
 tests/       pytest unit tests (~380 tests; most need a CUDA GPU)
+results/     the project write-up for a first-time reader / grader (README + chapters 01-07, figures/); `make_figures.py` redraws the figures (CPU only), `bundle_ab.py` re-runs the bundle on/off A/B (GPU); keep it in step with reports/week1.md
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)

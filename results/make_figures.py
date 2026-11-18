@@ -323,6 +323,34 @@ def fig_joint():
     save(fig, "03_joint_vs_cublaslt.png")
 
 
+def fig_lt_proposals():
+    """Where the cuBLASLt half's candidates come from: heuristic only -> + k-NN proposals -> + learned ranker (shipped)."""
+    # HAND-COPIED from reports/week1.md 2026-11-04 (audit) "Corrected held-out table" (86 held-out shapes, regret vs the
+    # extended joint oracle) and 2026-11-05 "Pools" (60 fresh shapes, regret vs the session's joint oracle). Pools are
+    # v2 top-3 Triton + cuBLASLt heuristic top-16 + the named proposals. (median, p95, p99) in %.
+    pools = ["heuristic top-16 only", "+ k-NN proposals (8 nearest shapes)", "+ learned cuBLASLt ranker top-5 (shipped)"]
+    cols = [GREY, AQUA, BLUE]
+    sets = [("86 held-out shapes", [(0.7, 11.7, 22.8), (0.6, 6.9, 8.3), (0.5, 5.5, 8.4)]),
+            ("60 fresh shapes (no model, threshold or choice saw them)", [(1.0, 17.4, 33.6), (1.0, 6.7, 27.6), (0.6, 5.6, 12.8)])]
+    fig, axs = plt.subplots(1, 2, figsize=(11, 3.9), sharey=True)
+    x = np.arange(3)
+    w = 0.26
+    for ax, (ttl, vals) in zip(axs, sets):
+        for i, (p, c, v) in enumerate(zip(pools, cols, vals)):
+            xs = x + (i - 1) * w
+            ax.bar(xs, v, w * 0.92, color=c, label=p)
+            for xi, vi in zip(xs, v):
+                ax.text(xi, vi + 0.5, f"{vi:g}", ha="center", fontsize=8)
+        ax.set_xticks(x, ["median", "unlucky 5%\n(p95)", "worst 1%\n(p99)"])
+        ax.set_title(ttl, fontsize=10)
+    axs[0].set_ylabel("extra time vs the best candidate (%)")
+    axs[0].set_ylim(0, 38)
+    axs[0].legend(fontsize=8.5, loc="upper left")
+    fig.suptitle("Proposing cuBLASLt configs the heuristic never lists cuts the tail (joint race, ranker v2 top-3)",
+                 x=0.01, ha="left", fontweight="bold", fontsize=11)
+    save(fig, "03_lt_proposals.png")
+
+
 def fig_cross_gpu():
     # HAND-COPIED from reports/cross_gpu.md (27 shared held-out shapes, online top-3)
     fig, axs = plt.subplots(1, 2, figsize=(10, 3.8))
@@ -424,32 +452,38 @@ def fig_transfer_ceiling():
     save(fig, "05_transfer_ceiling.png")
 
 
-def fig_noise_3090():
-    """Noise floor of the measuring stick on the two GPUs (>= 50 us kernels)."""
-    # HAND-COPIED from reports/week1.md 2026-11-09 "Noise floor of the 3090": range p95 over 3 rounds, >= 50 us.
-    # 3080: its two complete locked-1755 sessions (cold 1.4-1.8%, hot 1.8-1.9%); 3090: one unlocked session (cold 4.26%, hot 3.93%).
-    fig, ax = plt.subplots(figsize=(6.4, 3.8))
+def fig_noise_conditions():
+    """Noise floor (>= 50 us kernels) by GPU and clock state: within one session vs across sessions."""
+    # HAND-COPIED from reports/noise_compare_unlocked.md (3080, 3 locked + 3 unlocked sessions; p95 of the relative range,
+    # >= 50 us; "within" = across the 3 rounds of one session, "cross-session" = range of the session medians) and
+    # reports/week1.md 2026-11-09 (3090: one unlocked session, within-session only; no cross-session number exists).
+    arms = [("RTX 3080, clock locked", BLUE, (1.65, 1.67), (1.75, 1.78)),
+            ("RTX 3080, clock unlocked", VIOLET, (4.25, 3.83), (1.35, 1.90)),
+            ("RTX 3090, clock unlocked", AQUA, (4.26, 3.93), None)]
+    fig, axs = plt.subplots(1, 2, figsize=(10, 3.9), sharey=True)
     x = np.arange(2)
-    a3080 = [(1.4, 1.8), (1.8, 1.9)]
-    for k, (lo, hi) in enumerate(a3080):
-        ax.bar(k - 0.2, lo, 0.18, color=BLUE)
-        ax.bar(k, hi, 0.18, color=BLUE, alpha=0.6)
-        ax.text(k - 0.2, lo + 0.08, f"{lo}", ha="center", fontsize=8.5)
-        ax.text(k, hi + 0.08, f"{hi}", ha="center", fontsize=8.5)
-    ax.bar(x + 0.22, [4.26, 3.93], 0.18, color=AQUA)
-    for k, v in enumerate([4.26, 3.93]):
-        ax.text(k + 0.22, v + 0.08, f"{v}", ha="center", fontsize=8.5)
-    ax.axhline(2, color=INK2, ls=":", lw=1)
-    ax.text(-0.48, 2.2, "2% tie margin (3080)", ha="left", fontsize=8.5, color=INK2)
-    ax.set_xticks(x, ["cold L2", "hot L2"])
-    ax.set_xlim(-0.5, 1.6)
-    ax.set_ylim(0, 6.4)
-    ax.set_ylabel("run-to-run spread, unlucky 5% (%)")
-    ax.set_title("The 3090's measuring stick is about 2× wider\n(kernels of 50 µs or more)", fontsize=10)
-    from matplotlib.patches import Patch
-    ax.legend(handles=[Patch(color=BLUE, label="3080, session 1 (locked clock)"), Patch(color=BLUE, alpha=0.6, label="3080, session 2"),
-                       Patch(color=AQUA, label="3090 (clock not locked)")], fontsize=8.5, loc="upper left")
-    save(fig, "05_noise_3090.png")
+    w = 0.26
+    for ax, idx, ttl in [(axs[0], 2, "Within one session (3 rounds)"), (axs[1], 3, "Across sessions (the tie-margin statistic)")]:
+        for i, a in enumerate(arms):
+            xs = x + (i - 1) * w
+            if a[idx] is None:
+                for xi in xs:
+                    ax.text(xi, 0.15, "not\nmeasured", ha="center", fontsize=7.5, color=INK2)
+                continue
+            ax.bar(xs, a[idx], w * 0.92, color=a[1], label=a[0])
+            for xi, v in zip(xs, a[idx]):
+                ax.text(xi, v + 0.08, f"{v:.2f}", ha="center", fontsize=8)
+        ax.axhline(2, color=INK2, ls=":", lw=1)
+        ax.text(-0.45, 2.12, "2% tie margin", ha="left", fontsize=8.5, color=INK2)
+        ax.set_xticks(x, ["cold L2", "hot L2"])
+        ax.set_title(ttl, fontsize=10)
+    axs[0].set_ylabel("spread of the same timing,\n95th percentile (%)")
+    axs[0].set_ylim(0, 5.2)
+    h, l = axs[0].get_legend_handles_labels()
+    fig.legend(h, l, loc="upper center", bbox_to_anchor=(0.5, 0.01), ncol=3, fontsize=9)
+    fig.suptitle("An unlocked clock makes one session noisier, not the comparison across sessions (kernels ≥ 50 µs)",
+                 x=0.01, ha="left", fontweight="bold", fontsize=11)
+    save(fig, "05_noise_conditions.png")
 
 
 # ------------------------------------------------------------------------------------------------ 06 shipping
@@ -470,19 +504,21 @@ def fig_bundle():
     ax.set_title("First use is about 4× faster", fontsize=10)
     ax.legend(fontsize=8.5, loc="upper right")
     ax = axs[1]
-    # HAND-COPIED from docs/kernel_bundle.md "Shipping size" (MiB)
-    lab = ["unpacked on disk", "cubin + json files", "plain tar | xz", "zstd -19", "our archive\n(committed)"]
-    val = [986, 799, 51, 25, 19.2]
-    cols = [GREY, GREY, GREY, GREY, BLUE]
+    # HAND-COPIED from docs/kernel_bundle.md "What was built and measured", 2026-11-10 rebuild (MiB; 1.5 GiB on disk = 1,536 MiB).
+    # The timing panel on the left is the 2026-11-04 measurement with the 3080-only bundle (1,176 configs): the mechanism
+    # (load instead of compile) is the same, and it was not re-timed with the larger bundle.
+    lab = ["unpacked on disk", "cubin + json files", "committed archive\n(tar.xz)"]
+    val = [1536, 1179, 25.4]
+    cols = [GREY, GREY, BLUE]
     y = np.arange(len(lab))[::-1]
     ax.barh(y, val, color=cols, height=0.6)
     for yi, v in zip(y, val):
-        ax.text(v * 1.1, yi, f"{v:g} MiB", va="center", fontsize=9)
+        ax.text(v * 1.1, yi, f"{v:,g} MiB", va="center", fontsize=9)
     ax.set_xscale("log")
-    ax.set_xlim(8, 4000)
+    ax.set_xlim(8, 8000)
     ax.set_yticks(y, lab, fontsize=9)
-    ax.set_xlabel("size of the 21,187 compiled kernels (log scale)")
-    ax.set_title("…and fits in one 19 MiB file", fontsize=10)
+    ax.set_xlabel("size of the 30,327 compiled kernels (log scale)")
+    ax.set_title("…and ships as one 25 MiB archive", fontsize=10)
     save(fig, "06_bundle.png")
 
 
@@ -532,8 +568,8 @@ def fig_shapes():
 
 def main():
     for f in (fig_config_spread, fig_baseline_bars, fig_square_tflops, fig_b6, fig_noise, fig_selectors, fig_portfolio,
-              fig_topk, fig_v1_v2, fig_joint, fig_cross_gpu, fig_transfer_quality, fig_transfer_ceiling, fig_noise_3090,
-              fig_bundle, fig_shapes):
+              fig_topk, fig_v1_v2, fig_joint, fig_lt_proposals, fig_cross_gpu, fig_transfer_quality, fig_transfer_ceiling,
+              fig_noise_conditions, fig_bundle, fig_shapes):
         try:
             f()
         except Exception as e:  # keep going; report which figure failed

@@ -16,11 +16,11 @@ flowchart TD
 | Name | What it is | Why we need it | Result |
 |---|---|---|---|
 | **B0 roofline** | the hardware's speed limit: maths speed and memory speed | tells us when a result is "as fast as physically possible" | **62.9 TFLOP/s** maths (spec 59.5), **686 GB/s** memory (spec 760). Under steady load the card hits its power cap |
-| **B1 `torch.matmul`** | what a normal PyTorch user gets | "what people have today" | median **0.93×** of B3+ (worst 10% below 0.73×) |
+| **B1 `torch.matmul`** | what a normal PyTorch user gets | "what people have today" | median **0.93×** of B3+ (worst 10% below 0.73×). Identical to B2 (B2/B1 median 1.000): torch calls cuBLAS, whose default is cuBLASLt's top-1 pick |
 | **B2 cuBLASLt default** | NVIDIA's own selector, top pick | the vendor's selector, which we are trying to match | median speed **0.93×** of B3+ (160 shapes). The worst 10% are below 0.73× |
 | **B3 cuBLASLt best of its list** | time NVIDIA's top-N suggestions and take the best | a fairer "vendor with benchmarking" bar | median **0.98×** of B3+ |
 | **B3+ searched cuBLASLt** | B3 plus a 20-second-per-shape search over many NVIDIA algorithm options | **the honest ceiling**. Beating a library that is not allowed to benchmark proves little | found a faster option than the default on **237 of 477** shapes. The bar we use for every "beats cuBLAS" claim |
-| **B5 Triton tutorial kernel** | the example matmul that ships with Triton, one fixed config | shows what a naive Triton kernel gives | median **0.30×** of B3+ (over 3× slower). Up to **14× slower** than torch on one-row (decode) shapes |
+| **B5 Triton tutorial kernel** | the example matmul that ships with Triton, one fixed config | shows what a naive Triton kernel gives | median **0.30×** of B3+ (over 3× slower). Up to **14× slower** than torch on decode shapes (M ≤ 16) and up to 85× on large-K shapes: its 128×256 tile is mostly padding when M ≤ 16, and with small M and N and no split-K it makes too few tiles to fill 68 SMs |
 | **Triton oracle** | our parameterised kernel, with the best of all configs picked per shape by brute force | the best any selector could ever do with this kernel | **0.99×** of B3+ (median, 160 shapes; 98.8% by the report's calculation) |
 | **B6 best single config** | one config used for every shape | shows whether *choosing per shape* is worth anything | see 2.3 |
 | B4 CUTLASS | not built | | |
@@ -65,13 +65,23 @@ What we found and did:
 - The biggest noise source was **where the input data sits in GPU memory** (up to 3.7% on memory-bound shapes), not temperature or clock. Heat drift over 10 minutes was +0.01%.
 - Fix: time each shape on **3 different memory placements** and pool them. The unlucky-case noise fell from 5.4% to 2.6%, and the worst 1% from 12.5% to 6.3%.
 - Also: lock the clock, clear the GPU's cache before every timing ("cold L2"), and discard weak runs.
-- Result: **differences under 2% (jobs ≥ 50 µs) or 5% (shorter jobs) are called ties.** For very short jobs (under about 50 µs) we rank by launching 50 copies in a CUDA graph and dividing, since single launches are only measured in steps of about 1 µs.
+- Result: **differences under 2% (jobs ≥ 50 µs) or 5% (shorter jobs) are called ties.** The 2% is the 95th percentile of the spread between three sessions on different days (1.75% cold, 1.78% hot, rounded up). For very short jobs (under about 50 µs) we rank by launching 50 copies in a CUDA graph and dividing, since single launches are only measured in steps of about 1 µs.
+
+**What if the clock is not locked?** A deployed selector runs on a user's desktop at stock clocks, so the noise study was repeated with the clock unlocked (3 sessions, one after a reboot, 2026-11-13):
+
+![Noise by clock state](figures/05_noise_conditions.png)
+
+*Left: spread of the same timing inside one session. Right: spread between sessions, the statistic the tie margin is set from. The RTX 3090 bars belong to [chapter 5](05_transferability.md).*
+
+- **The 2% tie margin still holds between sessions** (95th percentile 1.90% unlocked vs 1.78% locked). Each session reports the median of 3 rounds, which removes a bad round.
+- **A single measurement is about twice as noisy**: one benchmark row is off the cross-session value by 1.8–2.0% at the 95th percentile (locked: 1.0–1.1%), and inside a session the rounds disagree by up to 4.3%. The card is power-capped on 82–92% of unlocked rows (14–19% locked), so its boost clock moves while a kernel is timed.
+- **The selector's own quick timing** (10 samples, one memory placement) separates two kernels to within about **3% locked and 4% unlocked** (95th percentile). Candidates closer than that are a coin toss, both in the online race and in the winner cache.
 
 ## 2.5 Gate summary
 
 | Gate | Question | Result |
 |---|---|---|
-| G1 | Is timing trustworthy? | **Pass** for jobs ≥ 50 µs (tie margin 2%) |
+| G1 | Is timing trustworthy? | **Pass** for jobs ≥ 50 µs (tie margin 2%; also 2% between sessions with the clock unlocked) |
 | G2 | Is our kernel family ≥ 90% as fast as B3+? | **Pass** (98.8%) |
 | G3 | Does picking per shape beat one fixed config? | **Pass** (one fixed config is a median 48–74% slower than the per-shape best) |
 | G4 | Does it beat B3+ somewhere that matters? | **Fail** at ≥ 50 µs. Narrow pass for tiny jobs |
