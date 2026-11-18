@@ -1,0 +1,880 @@
+"""`lscli` command line (spec section 6). This file holds the commands that need no daemon running; the daemon, client
+installation, training and install commands are added by later PRs of the stack (docs/lscli/plan.md).
+
+Exit codes: 0 success, 1 failure, 2 usage error (argparse), 3 the daemon is needed but not running, 4 unsupported system.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from lscli import __version__, config, control, envs, usage
+from lscli import search_queue as queue
+from lscli.files import read_json
+from lscli.paths import Paths
+
+EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_NO_DAEMON, EXIT_UNSUPPORTED = 0, 1, 2, 3, 4
+
+
+def _out(args, doc, text: str) -> None:
+    print(json.dumps(doc, indent=1, sort_keys=True, default=str) if args.json else text)
+
+
+def _ago(t: float | None) -> str:
+    if not t:
+        return "never"
+    d = time.time() - t
+    return f"{d:.0f}s ago" if d < 120 else f"{d / 60:.0f}min ago" if d < 7200 else f"{d / 3600:.1f}h ago"
+
+
+# ------------------------------------------------------------------------------------------------------------ status
+def _training_line(tr: dict) -> str:
+    """One status line from the daemon's `Training.summary()`. Its `stage` is the next stage only while a run is
+    running (None once it is done or failed), so the line is built from `status`: printing `stage` alone read
+    `training: None (17/17 stages)` for a finished run and hid a failed one."""
+    status = tr.get("status") or "none"
+    if not tr.get("run"):
+        return f"training: {status}"
+    count = f"{tr.get('done')}/{tr.get('total')} stages"
+    if status == "running" and tr.get("stage"):
+        return f"training: running stage {tr['stage']} (run {tr['run']}, {count})"
+    if status == "failed":                       # no failed stage: every stage ran, activating the models failed
+        failed = ", ".join(tr.get("failures") or {})
+        return (f"training: failed{f' at {failed}' if failed else ''} (run {tr['run']}, {count}; "
+                f"see `lscli train status`)")
+    if status == "done" and tr.get("mode") == "smoke":      # a plumbing check: never activated
+        return f"training: done (smoke: models not activated; run {tr['run']}, {count})"
+    return f"training: {status} (run {tr['run']}, {count})"
+
+
+def cmd_status(args, paths: Paths) -> int:
+    st = control.read_state(paths)
+    alive = control.daemon_alive(st)
+    ctl = control.read_control(paths)
+    pend, _ = queue.pending(paths)
+    prof = usage.load(paths)
+    doc = {"daemon": {"running": alive, **(st or {})}, "control": ctl, "queue": {"pending": len(pend)},
+           "envs": len(envs.load(paths)), "profile": {"shapes": len(prof["shapes"]), "updated": prof.get("updated")}}
+    lines = [f"lscli {__version__}  home {paths.root}"]
+    if alive:
+        gate = st.get("gate") or {}
+        lines.append(f"daemon: {st.get('state')} since {_ago(st.get('since'))} (pid {st.get('pid')})")
+        lines.append("gate: open" if gate.get("open") else "gate: closed - " + "; ".join(gate.get("reasons") or ["?"]))
+        if not st.get("hw_id"):
+            lines.append("hw_id: pending (its first probe needs a CUDA context and waits for the gate to open)")
+        waiting = [e for e in st.get("probes_waiting") or [] if e != "daemon"]
+        if waiting:
+            lines.append(f"envs waiting for a probe with CUDA (gate open): {', '.join(waiting)}")
+        if st.get("job"):
+            lines.append(f"job: {st['job']}")
+        for eid, msg in (st.get("env_errors") or {}).items():
+            lines.append(f"env {eid}: blocked: {msg} (fix it, then `lscli enable-env` that interpreter again)")
+        if (st.get("models") or {}).get("training"):
+            lines.append(_training_line(st["models"]["training"]))
+    else:
+        lines.append("daemon: not running" + (f" (last state {st.get('state')} {_ago(st.get('since'))})" if st else ""))
+    held = control.clock_held(paths)
+    doc["clock_held"] = held is not None
+    if held is not None:
+        lines.append("clock: held" + (f" since {_ago(held['t'])}" if held.get("t") else "")
+                     + " (no GPU jobs, no clock changes; lscli clock release)")
+    if control.paused(ctl):
+        lines.append("paused" + (f" until {time.strftime('%H:%M', time.localtime(ctl['paused_until']))}"
+                                 if ctl.get("paused_until") else ""))
+    merged = (read_json(paths.profile, None) or {}).get("updated")
+    lines.append(f"queue: {len(pend)} pending   envs: {doc['envs']}   profile: {len(prof['shapes'])} shapes "
+                 f"(merged {_ago(merged)})")
+    _out(args, doc, "\n".join(lines))
+    return EXIT_OK                                   # status needs no daemon: "not running" is an answer, not a failure
+
+
+# ------------------------------------------------------------------------------------------------------------ config
+def cmd_config(args, paths: Paths) -> int:
+    try:
+        cfg = config.load(args.config)
+        if args.key is None:
+            _out(args, cfg, config.dumps(cfg).rstrip())
+            return EXIT_OK
+        if args.value is None:
+            v = config.get(cfg, args.key)
+            _out(args, {args.key: v}, config.dumps({args.key: v}).rstrip() if isinstance(v, dict) else str(v))
+            return EXIT_OK
+        cfg = config.set_value(args.key, args.value, args.config)
+    except config.ConfigError as e:
+        print(f"lscli config: {e}", file=sys.stderr)
+        return EXIT_FAIL
+    from lscli.files import locked
+    with locked(paths.ensure().client):            # the daemon rewrites client.json too: keep its fields
+        cur = read_json(paths.client, {}) or {}
+        config.write_client_json(paths, cfg, models=(cur.get("env_extra") or {}).get("models"),
+                                 gpu_uuid=cur.get("gpu_uuid"), model_stems=cur.get("models"))
+    control.request_reload(paths)
+    _out(args, {args.key: config.get(cfg, args.key)}, f"{args.key} = {config.get(cfg, args.key)}")
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------------------------------------------------ envs
+def cmd_envs(args, paths: Paths) -> int:
+    es = envs.load(paths)
+    rows = [f"{eid}  torch {e.get('torch', '?'):<14} triton {e.get('triton', '?'):<7} cuda {e.get('cuda_runtime', '?'):<5} "
+            f"{e.get('python')}" for eid, e in es.items()]
+    _out(args, es, "\n".join(rows) if rows else "no registered envs (lscli enable-env PYTHON)")
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------------------------------------------------ profile
+def cmd_profile(args, paths: Paths) -> int:
+    cfg = config.load(args.config)
+    prof = usage.merge(paths, cfg["search"]["half_life_days"], write=False)
+    shapes = [s for s in prof["shapes"] if args.layout is None or s.get("layout") == args.layout][:args.top]
+    lines = [f"{'M':>6} {'N':>6} {'K':>6} {'dtype':5} {'lay':3} {'calls (decayed)':>16} {'total':>12} {'hit %':>6}  last seen"]
+    for s in shapes:
+        tot = s.get("hits", 0) + s.get("fallbacks", 0)
+        hit = f"{100 * s.get('hits', 0) / tot:5.1f}" if tot else "    -"
+        lines.append(f"{s['M']:>6} {s['N']:>6} {s['K']:>6} {s['dtype']:5} {s.get('layout', 'NN'):3} {s['calls']:>16.0f} "
+                     f"{s.get('calls_total', 0):>12} {hit:>6}  {_ago(s.get('last_seen'))}")
+    _out(args, {**prof, "shapes": shapes}, "\n".join(lines) if shapes else "no shapes recorded yet")
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------------------------------------------------ prewarm
+_SHAPE = re.compile(r"^(\d+)[xX](\d+)[xX](\d+)$")
+
+
+def _parse_shapes(args) -> list[tuple[int, int, int]]:
+    out = []
+    for s in args.shapes:
+        m = _SHAPE.match(s)
+        if not m:
+            raise ValueError(f"bad shape {s!r}; use MxNxK")
+        out.append(tuple(int(x) for x in m.groups()))
+    if args.shapes_file:
+        doc = json.loads(Path(args.shapes_file).read_text())
+        out += [(int(s["M"]), int(s["N"]), int(s["K"])) for s in (doc["shapes"] if isinstance(doc, dict) else doc)]
+    bad = [s for s in out if not all(1 <= x <= 16384 for x in s)]
+    if bad:
+        raise ValueError(f"M, N, K must be in [1, 16384]: {bad[:3]}")
+    return out
+
+
+def cmd_prewarm(args, paths: Paths) -> int:
+    try:
+        shapes = _parse_shapes(args)
+    except (ValueError, KeyError, OSError) as e:
+        print(f"lscli prewarm: {e}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        targets = envs.resolve(paths, args.env)
+    except KeyError as e:
+        print(f"lscli prewarm: {e}", file=sys.stderr)
+        return EXIT_FAIL
+    if not shapes:
+        print("lscli prewarm: no shapes given", file=sys.stderr)
+        return EXIT_USAGE
+    if not targets:
+        print("lscli prewarm: no registered env (lscli enable-env PYTHON)", file=sys.stderr)
+        return EXIT_FAIL
+    for eid in targets:
+        for M, N, K in shapes:
+            queue.request(paths.ensure(), M, N, K, args.dtype, eid, "manual")
+    n = len(shapes) * len(targets)
+    _out(args, {"queued": n}, f"queued {len(shapes)} shape(s) x {len(targets)} env(s)")
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------------------------------------------------ cache
+def _worker(paths: Paths, python: str, *argv: str, timeout: float = 3600) -> dict:
+    """Run `python -m lscli.worker ...` and return its result line (raises on an error line or no result). It runs in
+    lscli's source directory, as the daemon's workers do: `-m` puts the cwd first on sys.path, so a worker started from
+    inside a CS464 checkout would otherwise import that checkout's lscli / harness."""
+    r = subprocess.run([python, "-m", "lscli.worker", *argv], capture_output=True, text=True, timeout=timeout,
+                       stdin=subprocess.DEVNULL, cwd=source_dir(paths))
+    for line in reversed(r.stdout.strip().splitlines()):
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        if doc.get("op") == "result":
+            return doc
+        if doc.get("op") == "error":
+            raise RuntimeError(doc["error"])
+    raise RuntimeError(f"no result from the worker of {python} (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+
+
+def env_extra_for(paths: Paths, eid: str) -> dict:
+    """The env_extra a worker / client of env `eid` declares: client.json's fields plus its env id."""
+    cur = read_json(paths.client, None) or config.client_document(config.load())
+    return {**(cur.get("env_extra") or {}), "env_id": eid}
+
+
+def _raw_entries(paths: Paths) -> list[dict]:
+    """The stored entries, last line per (shape, environment). `_parse` checks only the key fields, so a damaged line
+    whose `choice` has no key, or whose `env` is not an object, is skipped here like an unreadable one (`cache ls`
+    reads both)."""
+    from tune.winner_cache import WinnerCache
+    rows = {}
+    for r, _ in WinnerCache._parse(paths.winners.read_text().splitlines() if paths.winners.exists() else []):
+        if r.get("kind") == "verified":
+            continue
+        choice, env = r.get("choice"), r.get("env")
+        if not (isinstance(choice, dict) and isinstance(choice.get("key"), str)) or not isinstance(env, (dict, type(None))):
+            continue
+        rows[(r["M"], r["N"], r["K"], r["dtype"], json.dumps(r.get("env"), sort_keys=True))] = r
+    return list(rows.values())
+
+
+def _gpu_processes() -> list[int] | None:
+    """PIDs of the compute processes on any GPU (NVML); None when NVML cannot tell."""
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        try:
+            return [p.pid for i in range(pynvml.nvmlDeviceGetCount())
+                    for p in pynvml.nvmlDeviceGetComputeRunningProcesses(pynvml.nvmlDeviceGetHandleByIndex(i))]
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:                               # no driver / no NVML: nothing to check against
+        return None
+
+
+def _claim_gpu(args, paths: Paths, uses: str):
+    """Guard for the cache commands that start an env's worker: reading the environment opens a CUDA context (~128 MiB
+    for 1-2 s) and `verify` also runs every cached kernel. Nothing else stops them, so: hold `gpu.lock` for the whole
+    command (the daemon skips its jobs while it is held; a held lock is a daemon job on the GPU now, which our CUDA
+    context would preempt, or another cache command: refuse), and when other processes are computing on the GPU ask first (`--yes`
+    answers; without a terminal, refuse). Returns (lock file or None, exit code)."""
+    import fcntl
+    lockf = open(paths.ensure().gpu_lock, "a")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lockf.close()
+        print(f"lscli cache {args.action}: gpu.lock is held (a daemon job on the GPU, or another lscli cache command); "
+              "retry later, or `lscli pause` first if the daemon is running a job", file=sys.stderr)
+        return None, EXIT_FAIL
+    busy = [p for p in (_gpu_processes() or []) if p != os.getpid()]
+    if busy and not args.yes:
+        msg = (f"lscli cache {args.action}: the GPU is in use (pids {', '.join(map(str, busy))}) and this {uses}, "
+               "which can disturb a measurement running there")
+        if not sys.stdin.isatty():
+            lockf.close()
+            print(msg + "; pass --yes to go ahead", file=sys.stderr)
+            return None, EXIT_USAGE
+        print(msg + ". Continue? [y/N] ", end="", file=sys.stderr, flush=True)
+        if sys.stdin.readline().strip().lower() not in ("y", "yes"):
+            lockf.close()
+            return None, EXIT_FAIL
+    return lockf, EXIT_OK
+
+
+def cmd_cache(args, paths: Paths) -> int:
+    if args.action == "clear":
+        if not args.yes:
+            print("lscli cache clear: deletes every stored winner; pass --yes", file=sys.stderr)
+            return EXIT_USAGE
+        paths.winners.unlink(missing_ok=True)
+        _out(args, {"cleared": True}, f"removed {paths.winners}")
+        return EXIT_OK
+    try:
+        targets = envs.resolve(paths, args.env)
+    except KeyError as e:
+        print(f"lscli cache: {e}", file=sys.stderr)
+        return EXIT_FAIL
+    if args.action == "ls" and args.stale and args.env is None and len(targets) != 1:
+        print("lscli cache ls --stale: tiers are relative to one env; pass --env ID", file=sys.stderr)
+        return EXIT_USAGE
+    if args.action != "ls" and not targets:
+        print("lscli cache: no registered env (lscli enable-env PYTHON)", file=sys.stderr)
+        return EXIT_FAIL
+    workers = args.action != "ls" or len(targets) == 1
+    docs = _static_envs(paths, targets) if workers and args.action != "verify" else {}
+    lockf = None
+    if workers and (args.action == "verify" or any(d is None for d in docs.values())):   # a CUDA context on the GPU
+        lockf, code = _claim_gpu(args, paths, "runs every cached kernel on it" if args.action == "verify"
+                                 else "opens a CUDA context on it")
+        if lockf is None:
+            return code
+    try:
+        return _cache_action(args, paths, targets, docs)
+    finally:
+        if lockf is not None:
+            lockf.close()
+
+
+def _static_envs(paths: Paths, targets: dict) -> dict:
+    """{env_id: environment doc read with no CUDA context, or None when that is not possible} for `cache ls --env` and
+    `compact`: possible once this GPU's hw_id is cached (lscli/hwcache.py). A None is read with CUDA, under the lock."""
+    from lscli import gate, hwcache
+    hw = hwcache.known(paths, gate.gpu_identity())
+    out = {}
+    for eid, e in targets.items():
+        try:
+            out[eid] = _worker(paths, e["python"], "env", "--env-extra", json.dumps(env_extra_for(paths, eid)),
+                               "--hw-id", hw)["env"] if hw else None
+        except (RuntimeError, OSError, subprocess.TimeoutExpired):
+            out[eid] = None                 # "needs CUDA", or any other failure: the CUDA probe reports it
+    return out
+
+
+def _cache_action(args, paths: Paths, targets: dict, docs: dict | None = None) -> int:
+    docs = docs or {}
+    if args.action == "ls":
+        if args.env is None and len(targets) != 1:
+            rows = _raw_entries(paths)      # no single env to rate tiers against: list the lines as stored
+            doc = [{**{k: r[k] for k in ("M", "N", "K", "dtype")}, "key": r["choice"]["key"], "family": r["choice"].get("family"),
+                    "winner_us": r.get("winner_us"), "torch_us": r.get("torch_us"), "env_id": (r.get("env") or {}).get("env_id"),
+                    "tier": None} for r in rows]
+        else:
+            from tune.winner_cache import tier
+            (eid, e), = targets.items()
+            env = docs.get(eid) or _worker(paths, e["python"], "env", "--env-extra", json.dumps(env_extra_for(paths, eid)))["env"]
+            doc = []
+            for r in _raw_entries(paths):
+                t, fields = tier(r, env)
+                if args.stale and t == "current":
+                    continue
+                doc.append({**{k: r[k] for k in ("M", "N", "K", "dtype")}, "key": r["choice"]["key"],
+                            "family": r["choice"].get("family"), "winner_us": r.get("winner_us"),
+                            "torch_us": r.get("torch_us"), "env_id": (r.get("env") or {}).get("env_id"),
+                            "tier": t, "stale": fields})
+        lines = [f"{'M':>6} {'N':>6} {'K':>6} {'dtype':5} {'tier':8} {'winner us':>10} {'torch us':>10}  key"]
+        for d in sorted(doc, key=lambda d: (d["M"], d["N"], d["K"])):
+            f = lambda v: f"{v:10.1f}" if isinstance(v, (int, float)) else f"{'-':>10}"  # noqa: E731
+            lines.append(f"{d['M']:>6} {d['N']:>6} {d['K']:>6} {d['dtype']:5} {d['tier'] or '?':8} {f(d['winner_us'])} "
+                         f"{f(d['torch_us'])}  {d['key']}" + (f"  ({', '.join(d['stale'])})" if d.get("stale") else ""))
+        _out(args, doc, "\n".join(lines) if doc else "no entries")
+        return EXIT_OK
+    results, failed = {}, 0
+    for eid, e in targets.items():
+        extra = json.dumps(env_extra_for(paths, eid))
+        try:
+            if args.action == "verify":
+                res = _worker(paths, e["python"], "verify", "--cache", str(paths.winners), "--env-extra", extra)
+                failed += res["failed"]
+                results[eid] = {"checked": len(res["entries"]), "failed": res["failed"]}
+            else:                                       # compact: each env's scope with its own environment as current
+                from tune.winner_cache import WinnerCache
+                env = docs.get(eid) or _worker(paths, e["python"], "env", "--env-extra", extra)["env"]
+                results[eid] = WinnerCache(paths.winners, env=env).compact()
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as ex:
+            results[eid] = {"error": str(ex)}
+            failed += 1
+    _out(args, results, "\n".join(f"{eid}: {r}" for eid, r in results.items()))
+    return EXIT_FAIL if failed else EXIT_OK
+
+
+# ------------------------------------------------------------------------------------------------------------ enable-env
+PTH = "lscli.pth"
+_FIND_KIND = ("import importlib.util, json, sys; out = {}\n"     # name -> [location, namespace?] or None
+              "for n in sys.argv[1:]:\n"
+              "    s = importlib.util.find_spec(n)\n"
+              "    ns = s is not None and s.origin in (None, 'namespace')\n"
+              "    out[n] = None if s is None else [(list(s.submodule_search_locations or []) or [None])[0] if ns "
+              "else s.origin, ns]\n"
+              "print(json.dumps(out))")
+PACKAGES = ("lscli", "tune", "kernels", "baselines", "analysis")
+_SITE = "import sysconfig; print(sysconfig.get_paths()['purelib'])"
+_FIND = ("import importlib.util, json, sys; out = {}\n"
+         "for n in sys.argv[1:]:\n"
+         "    s = importlib.util.find_spec(n)\n"
+         "    out[n] = (s.origin or (list(s.submodule_search_locations or []) or [None])[0]) if s else None\n"
+         "print(json.dumps(out))")
+
+
+def is_our_wrapper(text: str) -> bool:
+    """The `~/.local/bin/lscli` install.sh writes: `exec ".../venv/bin/python" -I -m lscli "$@"` (earlier `-P`, and before
+    the cwd fix nothing), so uninstall removes it and nothing else of that name."""
+    return re.search(r'/venv/bin/python" (-[IP] )?-m lscli "\$@"', text) is not None
+
+
+def source_dir(paths: Paths) -> Path:
+    """The code a client env runs: the installed checkout ($LSCLI_HOME/src), else the tree this lscli runs from."""
+    return paths.src.resolve() if (paths.src / "lscli").is_dir() else Path(__file__).resolve().parent.parent
+
+
+def _py(python: str, *argv: str, timeout: float = 120) -> str:
+    """Run an inspection snippet in `python`, in the caller's cwd and environment, with LSCLI_PATCH=0 so an existing
+    lscli.pth never imports lscli (or a checkout's lscli) while we look."""
+    r = subprocess.run([python, *argv], capture_output=True, text=True, timeout=timeout,
+                       env={**os.environ, "LSCLI_PATCH": "0"})
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip()[-400:] or f"exit {r.returncode}")
+    return r.stdout.strip().splitlines()[-1]
+
+
+def _pth_text(src: Path) -> str:
+    return (f"{src}\n"
+            "import os, importlib.util; (os.environ.get('LSCLI_PATCH') == '1' and os.environ.get('LSCLI_DISABLE') != '1' "
+            "and importlib.util.find_spec('lscli') is not None) and __import__('lscli.boot')\n")
+
+
+def cmd_enable_env(args, paths: Paths) -> int:
+    import shutil
+    python = args.python or shutil.which("python3")
+    if not python or not Path(python).exists():
+        print(f"lscli enable-env: no interpreter {args.python or 'python3'}", file=sys.stderr)
+        return EXIT_FAIL
+    python = envs.interpreter_path(python)
+    try:
+        info = envs.probe(python)
+    except RuntimeError as e:
+        print(f"lscli enable-env: {e}", file=sys.stderr)
+        return EXIT_FAIL
+    if not info.get("torch") or not info.get("triton"):
+        print(f"lscli enable-env: {python} has no importable torch + triton "
+              f"({info.get('torch_error') or info.get('triton_error')})", file=sys.stderr)
+        return EXIT_FAIL
+    src = source_dir(paths)
+    try:
+        site = Path(_py(python, "-c", _SITE))
+        found = json.loads(_py(python, "-I", "-c", _FIND, *PACKAGES))   # -I: no cwd / PYTHONPATH / user site
+    except (RuntimeError, ValueError, OSError) as e:
+        print(f"lscli enable-env: cannot inspect {python}: {e}", file=sys.stderr)
+        return EXIT_FAIL
+    ours = [src]
+    try:                                            # an earlier enable-env that pointed at another (moved) src/ is ours too
+        old = (site / PTH).read_text().splitlines()[0].strip()
+        if old:
+            ours.append(Path(old).resolve())
+    except (OSError, IndexError):
+        pass
+    clash = {n: o for n, o in found.items() if o and not any(Path(o).resolve().is_relative_to(d) for d in ours)}
+    if clash:
+        print("lscli enable-env: the env already has packages named like lscli's ("
+              + ", ".join(f"{n} at {o}" for n, o in clash.items()) + "); refusing to shadow them", file=sys.stderr)
+        return EXIT_FAIL
+    # Again as a program started here would see it (spec 6): from the caller's cwd, with its PYTHONPATH and user site.
+    # A CS464 checkout reachable that way shadows lscli's copy, so it is a clash too, not something to register.
+    try:
+        here = json.loads(_py(python, "-c", _FIND_KIND, *PACKAGES))
+        cwd = os.getcwd()
+    except (RuntimeError, ValueError, OSError) as e:
+        print(f"lscli enable-env: cannot inspect {python} from the current directory: {e}", file=sys.stderr)
+        return EXIT_FAIL
+    outside = {n: v for n, v in here.items()
+               if v and v[0] and not any(Path(v[0]).resolve().is_relative_to(d) for d in ours)}
+    reach = {n: v[0] for n, v in outside.items() if not v[1]}
+    if reach:
+        print(f"lscli enable-env: started from {cwd}" + (" with PYTHONPATH set" if os.environ.get("PYTHONPATH") else "")
+              + ", " + ", ".join(f"{n} resolves to {o}" for n, o in reach.items()) + " instead of lscli's copy (a CS464 "
+              "checkout?). A program started the same way would mix the two: run enable-env, and your programs, from "
+              "another directory without the checkout on PYTHONPATH, and do not enable an interpreter a checkout is "
+              "developed with (spec section 9)", file=sys.stderr)
+        return EXIT_FAIL
+    for n, (where, _) in outside.items():              # a plain directory (no __init__.py), e.g. a data folder
+        print(f"lscli enable-env: note: {where} (a directory named {n}/ without __init__.py) will be shadowed by lscli's "
+              f"{n} package for programs of this env that import {n}", file=sys.stderr)
+    missing = [m for m, mod in (("numpy", "numpy"), ("nvidia-ml-py", "pynvml"))
+               if json.loads(_py(python, "-I", "-c", _FIND, mod)).get(mod) is None]
+    if missing:
+        if args.no_deps:
+            print(f"lscli enable-env: {python} lacks {', '.join(missing)} (pip install them, or drop --no-deps)", file=sys.stderr)
+            return EXIT_FAIL
+        r = subprocess.run([python, "-m", "pip", "install", *missing])
+        if r.returncode != 0:
+            return EXIT_FAIL
+    try:
+        site.mkdir(parents=True, exist_ok=True)
+        (site / PTH).write_text(_pth_text(src))
+    except OSError as e:
+        print(f"lscli enable-env: cannot write {site / PTH}: {e}", file=sys.stderr)
+        return EXIT_FAIL
+    eid, rec = envs.register(paths.ensure(), python, info)
+    prof = usage.load(paths)
+    n = 0
+    for s in prof["shapes"]:                       # shapes other envs already ran: search them for this env too
+        if s.get("layout", "NN") == "NN":
+            queue.request(paths, s["M"], s["N"], s["K"], s["dtype"], eid, "miss")
+            n += 1
+    _out(args, {"env_id": eid, **rec, "pth": str(site / PTH), "queued": n},
+         f"enabled {python} (env {eid}, torch {rec.get('torch')}, triton {rec.get('triton')})\n"
+         f"  {site / PTH}\n  run programs with LSCLI_PATCH=1, or call lscli.enable() in them"
+         + (f"\n  queued {n} known shape(s) for this env" if n else ""))
+    return EXIT_OK
+
+
+def cmd_disable_env(args, paths: Paths) -> int:
+    python = envs.interpreter_path(args.python)
+    removed = False
+    try:
+        site = Path(_py(python, "-c", _SITE))
+        if (site / PTH).exists():
+            (site / PTH).unlink()
+            removed = True
+    except (RuntimeError, OSError) as e:
+        print(f"lscli disable-env: cannot inspect {python} ({e}); unregistering only", file=sys.stderr)
+    unreg = envs.unregister(paths, python)
+    _out(args, {"pth_removed": removed, "unregistered": unreg},
+         f"{'removed ' + PTH if removed else 'no ' + PTH}; {'unregistered' if unreg else 'was not registered'}")
+    return EXIT_OK if removed or unreg else EXIT_FAIL
+
+
+# ------------------------------------------------------------------------------------------------------------ daemon
+_UNIT = "lscli.service"
+
+
+def _systemctl(*argv: str) -> int:
+    try:
+        return subprocess.run(["systemctl", "--user", *argv]).returncode
+    except OSError as e:
+        print(f"lscli: systemctl unavailable ({e})", file=sys.stderr)
+        return EXIT_UNSUPPORTED
+
+
+def cmd_daemon(args, paths: Paths) -> int:
+    if args.action == "run":
+        from lscli.daemon import Daemon, setup_logging
+        st = control.read_state(paths)
+        if control.daemon_alive(st) and st.get("pid") != os.getpid():
+            print(f"lscli daemon: already running (pid {st['pid']})", file=sys.stderr)
+            return EXIT_FAIL
+        setup_logging(paths.ensure())
+        return Daemon(paths, args.config).run()
+    rc = _systemctl(args.action, _UNIT)
+    return EXIT_OK if rc == 0 else (rc if rc == EXIT_UNSUPPORTED else EXIT_FAIL)
+
+
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)([smhd])$")
+
+
+def cmd_pause(args, paths: Paths) -> int:
+    seconds = None
+    if args.duration:
+        m = _DURATION.match(args.duration)
+        if not m:
+            print("lscli pause: --for takes e.g. 90m, 2h, 1d", file=sys.stderr)
+            return EXIT_USAGE
+        seconds = float(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    doc = control.pause(paths.ensure(), seconds)
+    _out(args, doc, "paused" + (f" until {time.strftime('%Y-%m-%d %H:%M', time.localtime(doc['paused_until']))}"
+                                if doc.get("paused_until") else " until `lscli resume`")
+         + ("" if control.daemon_alive(control.read_state(paths)) else " (the daemon is not running)"))
+    return EXIT_OK
+
+
+HOLD_WAIT_S = 30.0
+
+
+def _wait_no_job(paths: Paths, timeout: float) -> dict | None:
+    """Wait until the running daemon reports no job (its watcher preempts within ~1 s, then up to 5 s of SIGTERM grace,
+    then the clock reset); the job that is still running after `timeout`, else None."""
+    deadline = time.monotonic() + timeout
+    while True:
+        st = control.read_state(paths)
+        job = st.get("job") if st and control.daemon_alive(st) else None
+        if job is None or time.monotonic() >= deadline:
+            return job
+        time.sleep(0.5)
+
+
+def cmd_clock(args, paths: Paths) -> int:
+    """`lscli clock [hold | release]` (spec 4.6). NVML cannot report an `nvidia-smi -lgc` lock, so lscli cannot save
+    and restore one: the user declares it instead. Holding stops the daemon's GPU jobs and every clock change it would
+    make (helper lock / reset, and the unit's reset at start and stop) until release."""
+    if args.action == "hold":
+        doc = control.hold_clock(paths.ensure())
+        job = _wait_no_job(paths, HOLD_WAIT_S)          # a running job stops and resets its own lock first
+        if job is not None:
+            print(f"lscli clock hold: the daemon's job ({job.get('kind')}) has not stopped yet; wait until `lscli status` "
+                  "shows no job before locking the clock", file=sys.stderr)
+        _out(args, {"held": True, "job_running": job is not None, **doc},
+             "clock held: the daemon runs no GPU job and leaves the SM clock alone until `lscli clock release`. "
+             "Lock it yourself now, e.g. `sudo nvidia-smi -lgc 1755,1755`, and reset it (`sudo nvidia-smi -rgc`) "
+             "when done.")
+        return EXIT_OK if job is None else EXIT_FAIL
+    if args.action == "release":
+        was = control.clock_held(paths) is not None
+        control.release_clock(paths)
+        _out(args, {"held": False}, "clock released: the daemon locks / resets the clock around its GPU jobs again"
+             if was else "the clock was not held")
+        return EXIT_OK
+    held = control.clock_held(paths)
+    _out(args, {"held": held is not None, **(held or {})},
+         ("clock held" + (f" since {_ago(held['t'])}" if held.get("t") else "") + " (lscli clock release)")
+         if held is not None else "clock not held")
+    return EXIT_OK
+
+
+def cmd_resume(args, paths: Paths) -> int:
+    control.resume(paths.ensure())
+    _out(args, {"paused": False}, "resumed")
+    return EXIT_OK
+
+
+def cmd_logs(args, paths: Paths) -> int:
+    if args.job:
+        logs = sorted((paths.logs / "jobs").glob(f"*{args.job}*.log"))
+        if not logs:
+            print(f"lscli logs: no job log matching {args.job!r}", file=sys.stderr)
+            return EXIT_FAIL
+        path = logs[-1]
+    else:
+        path = paths.logs / "daemon.log"
+        if not path.exists():
+            print("lscli logs: no daemon log yet", file=sys.stderr)
+            return EXIT_FAIL
+    if args.follow:
+        try:
+            return subprocess.run(["tail", "-n", str(args.lines), "-F", str(path)]).returncode
+        except KeyboardInterrupt:
+            return EXIT_OK
+    lines = path.read_text(errors="replace").splitlines()[-args.lines:]
+    print("\n".join(lines))
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------------------------------------------------ train
+def cmd_train(args, paths: Paths) -> int:
+    from lscli import training
+    st = control.read_state(paths) or {}
+    if args.action == "start":
+        control.train_now(paths.ensure())
+        tr = training.Training(paths, st["hw_id"]) if st.get("hw_id") else None
+        failed = tr is not None and tr.state.get("status") == "failed"
+        msg = "training may run outside the time window until it finishes (the GPU gate still applies)"
+        if failed:
+            where = f"at stage {tr.next_stage_any()}" if tr.next_stage_any() else "by activating its models again"
+            msg = (f"continuing failed training run {tr.state['run']} {where} (finished stages are kept; failures were "
+                   f"{tr.state.get('failures') or {}}; a pending `train retrain` starts over instead); " + msg)
+        _out(args, {"train_now": True, "continue_failed_run": tr.state["run"] if failed else None}, msg)
+        return EXIT_OK
+    if args.action == "retrain":
+        stages = [s.strip() for s in args.stages.split(",")] if args.stages else None
+        bad = [s for s in stages or [] if s not in training.STAGES]
+        if bad:
+            print(f"lscli train retrain: unknown stage(s) {', '.join(bad)}; stages: {', '.join(training.STAGES)}", file=sys.stderr)
+            return EXIT_USAGE
+        control.retrain(paths.ensure(), stages)
+        _out(args, {"retrain": stages or "all"}, f"retraining {'stages ' + ', '.join(stages) if stages else 'everything'} "
+             "at the next open gate")
+        return EXIT_OK
+    hw = st.get("hw_id")
+    if not hw:
+        print("lscli train status: unknown GPU (the daemon has not run yet)", file=sys.stderr)
+        return EXIT_NO_DAEMON
+    tr = training.Training(paths, hw)
+    doc = {**tr.summary(), "trained_env": training.trained_env(paths, hw), "models": (st.get("models") or {}).get("ids")}
+    text = (f"training: {doc['status']}" + (f" (run {doc['run']}: {doc['reason']})" if doc.get("run") else "")
+            + (f"\n  next stage {doc['stage']}, {doc['done']}/{doc['total']} done" if doc.get("stage") else "")
+            + (f"\n  failures {doc['failures']}" if doc.get("failures") else "")
+            + (f"\n  stopped {'at stage ' + tr.next_stage_any() if tr.next_stage_any() else 'activating its models'}: "
+               "`lscli train start` continues this run (finished stages are kept), `lscli train retrain` starts over"
+               if doc["status"] == "failed" else "")
+            + f"\nmodels: {(doc['models'] or {}).get('source', 'none')}"
+            + (f"\n  trained on triton {doc['trained_env'].get('triton')}, cuBLASLt {doc['trained_env'].get('cublaslt')}, "
+               f"driver {doc['trained_env'].get('driver')}" if doc.get("trained_env") else ""))
+    _out(args, doc, text)
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------------------------------------------------ doctor
+def cmd_doctor(args, paths: Paths) -> int:
+    from lscli import doctor
+    rows = doctor.checks(paths)
+    _out(args, rows, doctor.report(rows))
+    return doctor.exit_code(rows)
+
+
+# ------------------------------------------------------------------------------------------------------------ uninstall
+CLOCK_FILES = ("/usr/local/libexec/lscli-clock", "/etc/sudoers.d/lscli", "/etc/lscli/clock.conf")
+HOME_MARKER = ".lscli-home"                  # written by install.sh; `--purge` deletes only a home that has it
+LSCLI_REPO = "https://github.com/Rayner3103/CS464.git"   # install.sh's default --repo (the legacy-home check)
+
+
+def is_lscli_home(root: Path) -> bool:
+    """The marker install.sh writes, or an install from before it: src/ a git clone whose origin is lscli's repository,
+    and venv/bin/python (install.sh's own check for a re-install, which then adds the marker)."""
+    if (root / HOME_MARKER).is_file():
+        return True
+    if not ((root / "src" / ".git").is_dir() and os.access(root / "venv" / "bin" / "python", os.X_OK)):
+        return False
+    r = subprocess.run(["git", "-C", str(root / "src"), "remote", "get-url", "origin"], capture_output=True, text=True)
+    return r.returncode == 0 and r.stdout.strip() == LSCLI_REPO
+
+
+def purge_refusal(root: Path) -> str | None:
+    """Why `--purge` must not delete `root` (None = safe): never /, $HOME or one of its ancestors, and only an lscli
+    home (`is_lscli_home`: install.sh's marker, or an install from before it)."""
+    root = root.resolve()
+    home = Path.home().resolve()
+    if root == Path("/") or root == home or root in home.parents:
+        return "it is / or your home directory (or above it)"
+    if not root.is_dir():
+        return "not a directory"
+    if not is_lscli_home(root):
+        return f"it is not an lscli home (no {HOME_MARKER}, and not an install from before the marker)"
+    return None
+
+
+def cmd_uninstall(args, paths: Paths) -> int:
+    """Spec 6: stop and remove the unit, reset the clock (unless held), remove the clock helper (sudo), remove every env's hook,
+    remove ~/.local/bin/lscli; keep $LSCLI_HOME and the config unless --purge."""
+    import shutil
+    if args.purge:                                     # checked before anything is removed
+        why = purge_refusal(paths.root)
+        if why:
+            print(f"lscli uninstall --purge: refusing to delete {paths.root}: {why}", file=sys.stderr)
+            return EXIT_FAIL
+    if not args.yes:
+        try:
+            if args.purge:                             # deleting a directory: type its path, not just "y"
+                root = str(paths.root.resolve())
+                ans = input(f"Uninstall lscli and DELETE {root} (usage record, models, winners) and the config.\n"
+                            f"Type the path to confirm: ")
+                ok = ans.strip().rstrip("/") == root
+            else:
+                ok = input("Uninstall lscli (data kept)? [y/N] ").lower().startswith("y")
+        except EOFError:
+            ok = False
+        if not ok:
+            print("nothing done")
+            return EXIT_FAIL
+    done = []
+    unit = Path.home() / ".config" / "systemd" / "user" / "lscli.service"
+    if shutil.which("systemctl"):
+        subprocess.run(["systemctl", "--user", "disable", "--now", "lscli.service"], capture_output=True)
+    if unit.exists():
+        unit.unlink()
+        done.append(f"removed {unit}")
+        if shutil.which("systemctl"):
+            subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    helper = Path(CLOCK_FILES[0])
+    if helper.exists():
+        held = control.clock_held(paths) is not None   # the user's lock: leave it, as the daemon does
+        reset = subprocess.CompletedProcess([], 0) if held else subprocess.run(["sudo", "-n", str(helper), "reset"],
+                                                                               capture_output=True)
+        if held:
+            done.append("clock left as it is (held): reset it yourself when done (`sudo nvidia-smi -rgc`)")
+        if reset.returncode != 0:                      # keep the helper: it is the user's way back to stock clocks
+            done.append("clock reset FAILED; the clock helper was kept (run `sudo nvidia-smi -rgc`, then uninstall again)")
+        else:
+            r = subprocess.run(["sudo", "rm", "-f", *CLOCK_FILES])        # may ask for a password: the only root step
+            subprocess.run(["sudo", "rmdir", "/etc/lscli"], capture_output=True)
+            done.append("removed the clock helper" if r.returncode == 0 else "could NOT remove the clock helper (sudo)")
+    for eid, rec in list(envs.load(paths).items()):
+        try:
+            site = Path(_py(rec["python"], "-c", _SITE))
+            (site / PTH).unlink(missing_ok=True)
+            done.append(f"removed {site / PTH}")
+        except (RuntimeError, OSError) as e:
+            done.append(f"env {eid}: could not remove its hook ({e})")
+        envs.unregister(paths, eid)
+    wrapper = Path.home() / ".local" / "bin" / "lscli"
+    try:                                               # only the wrapper install.sh writes
+        if wrapper.exists() and is_our_wrapper(wrapper.read_text(errors="replace")):
+            wrapper.unlink()
+            done.append(f"removed {wrapper}")
+    except OSError:
+        pass
+    done.append("linger was left as it is (loginctl disable-linger $USER if you enabled it for lscli)")
+    if args.purge:
+        from lscli.paths import config_path
+        shutil.rmtree(paths.root, ignore_errors=True)
+        cfg = config_path()
+        cfg.unlink(missing_ok=True)                    # the file only; its directory only when it is lscli's and empty
+        try:
+            if cfg.parent.name == "lscli":
+                cfg.parent.rmdir()
+        except OSError:
+            pass
+        done.append(f"removed {paths.root} and {cfg}")
+    else:
+        done.append(f"kept {paths.root} (lscli uninstall --purge removes it)")
+    _out(args, {"done": done}, "\n".join(done))
+    return EXIT_OK
+
+
+# ------------------------------------------------------------------------------------------------------------ main
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="lscli", description="learned-selector CLI (docs/lscli/spec.md)")
+    ap.add_argument("--home", help="state directory (default $LSCLI_HOME or ~/.local/share/lscli)")
+    ap.add_argument("--config", type=Path, default=None, help="config file (default $LSCLI_CONFIG or ~/.config/lscli/config.toml)")
+    ap.add_argument("--json", action="store_true", help="print one JSON document")
+    ap.add_argument("--version", action="version", version=f"lscli {__version__}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status", help="daemon state, gate, queue, profile").set_defaults(fn=cmd_status)
+    c = sub.add_parser("config", help="show / get / set a config key",
+                       description="Show the config, get one KEY, or set KEY to VALUE. Setting validates the whole config "
+                       "and rewrites config.toml from the validated values: every key is written out (defaults "
+                       "included, so they no longer follow a changed default), in a fixed order, and comments and "
+                       "formatting are not kept. A file with an unknown key or section is refused, not rewritten.")
+    c.add_argument("key", nargs="?", help="section.name, e.g. idle.window")
+    c.add_argument("value", nargs="?", help="new value; rewrites config.toml in full (comments dropped, defaults "
+                   "written out)")
+    c.set_defaults(fn=cmd_config)
+    sub.add_parser("envs", help="registered interpreters").set_defaults(fn=cmd_envs)
+    e = sub.add_parser("enable-env", help="install the client hook into an interpreter's env and register it")
+    e.add_argument("python", nargs="?", help="interpreter (default: python3 on PATH)")
+    e.add_argument("--no-deps", action="store_true", help="fail instead of pip-installing numpy / nvidia-ml-py")
+    e.set_defaults(fn=cmd_enable_env)
+    d = sub.add_parser("disable-env", help="remove the client hook from an interpreter's env and unregister it")
+    d.add_argument("python")
+    d.set_defaults(fn=cmd_disable_env)
+    p = sub.add_parser("profile", help="the usage record, hottest first")
+    p.add_argument("--top", type=int, default=20)
+    p.add_argument("--layout", choices=("NN", "NT"))
+    p.set_defaults(fn=cmd_profile)
+    w = sub.add_parser("prewarm", help="queue shapes for an idle-time search")
+    w.add_argument("shapes", nargs="*", help="MxNxK")
+    w.add_argument("--shapes", dest="shapes_file", help="shapes JSON ({'shapes': [{M, N, K}]})")
+    w.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
+    w.add_argument("--env", help="env id or interpreter path (default: every registered env)")
+    w.set_defaults(fn=cmd_prewarm)
+    dm = sub.add_parser("daemon", help="run the daemon in the foreground, or start / stop / restart its unit")
+    dm.add_argument("action", choices=("run", "start", "stop", "restart"))
+    dm.set_defaults(fn=cmd_daemon)
+    pa = sub.add_parser("pause", help="stop starting background jobs (a running one is preempted)")
+    pa.add_argument("--for", dest="duration", help="e.g. 90m, 2h, 1d (default: until resume)")
+    pa.set_defaults(fn=cmd_pause)
+    sub.add_parser("resume", help="clear a pause").set_defaults(fn=cmd_resume)
+    ck = sub.add_parser("clock", help="hold the SM clock for a manual lock (no daemon GPU jobs, no clock changes) / release it",
+                        description="hold: the clock is yours (e.g. `sudo nvidia-smi -lgc` for a measurement); the daemon "
+                        "runs no GPU job and never locks or resets the clock until release. No argument: show the state.")
+    ck.add_argument("action", nargs="?", choices=("hold", "release"))
+    ck.set_defaults(fn=cmd_clock)
+    lg = sub.add_parser("logs", help="daemon or job log")
+    lg.add_argument("-f", "--follow", action="store_true")
+    lg.add_argument("-n", "--lines", type=int, default=50)
+    lg.add_argument("--job", help="part of a job log name (logs/jobs/)")
+    lg.set_defaults(fn=cmd_logs)
+    tn = sub.add_parser("train", help="training status; allow training now; force a retraining")
+    tn.add_argument("action", choices=("status", "start", "retrain"))
+    tn.add_argument("--stages", help="retrain: comma-separated train_best stages (default: everything)")
+    tn.set_defaults(fn=cmd_train)
+    sub.add_parser("doctor", help="check the GPU, systemd, the daemon, the clock helper, envs and models").set_defaults(fn=cmd_doctor)
+    un = sub.add_parser("uninstall", help="remove the unit, clock helper, env hooks and command (data kept unless --purge)")
+    un.add_argument("--purge", action="store_true", help="also delete $LSCLI_HOME (only an lscli home: install.sh's "
+                    ".lscli-home marker, or an install from before it) and the config; asks you to type the path")
+    un.add_argument("--yes", action="store_true", help="do not ask (and, with --purge, do not ask for the path)")
+    un.set_defaults(fn=cmd_uninstall)
+    k = sub.add_parser("cache", help="inspect / verify / compact / clear the winner cache")
+    k.add_argument("action", choices=("ls", "verify", "compact", "clear"))
+    k.add_argument("--env", help="env id or interpreter path")
+    k.add_argument("--stale", action="store_true", help="ls: only entries that are not current")
+    k.add_argument("--yes", action="store_true", help="clear: confirm; ls --env / verify / compact: go ahead even "
+                   "when other processes are using the GPU (these start the env's worker; verify opens a CUDA context and "
+                   "runs every cached kernel, ls --env / compact open one only until the daemon has stored this GPU's "
+                   "hw_id)")
+    k.set_defaults(fn=cmd_cache)
+    return ap
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.home:
+        os.environ["LSCLI_HOME"] = str(Path(args.home).expanduser().resolve())
+    try:
+        return args.fn(args, Paths())
+    except config.ConfigError as e:                 # a broken config.toml: say so, no traceback
+        print(f"lscli: {e}", file=sys.stderr)
+        return EXIT_FAIL
+
+
+if __name__ == "__main__":
+    sys.exit(main())

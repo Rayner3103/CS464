@@ -67,7 +67,15 @@ analysis/
   zero_shot.py       zero-shot transfer: the saved lgbm_rank on another GPU, scored vs that GPU's own screen (`python -m analysis.zero_shot run|score`); `load_screen` keeps `slow` screen rows
   lt_ceiling.py / lt_clusters.py / lt_knn_scan.py / lt_knn_ab.py / lt_rank.py / lt_rank_ab.py / router.py / confirm_ab.py / joint_rank.py  the cuBLASLt k-NN, learned-ranker, router and joint-score study (router: fit + held-out score; confirm_ab: paired scoring of the router / confirmation online runs; joint_rank: the negative result) (CPU only): where the joint search's regret comes from, winner structure, tune-only leave-one-out choice of k, held-out A/B from one stage-2 session
   cross_gpu.py       cross-GPU comparison on the held-out shapes the runs share: regret vs each GPU's own screen, speed vs B3+, family ceiling, PTX mma check, paired bootstrap; CPU-only (`python -m analysis.cross_gpu --side LABEL DIR ...`, docstring has the command). Never compare a subset run to the 86-shape `REFERENCE_3080` constants in `zero_shot.py`
-tests/       pytest unit tests (200 tests; most need a CUDA GPU)
+lscli/       the learned-selector CLI and daemon (docs/lscli/spec.md is the contract, docs/lscli/plan.md the PR plan):
+  client.py      opt-in torch patch (LSCLI_PATCH=1 via lscli.pth, or lscli.enable()): dispatches cached winners, counts shapes
+  worker.py      measure / env / verify under the USER's interpreter (line protocol on a private fd)
+  daemon.py      idle-time loop: gate.py (NVML + window + power + locks), scheduler.py, jobs.py (process trees, preemption),
+                 models.py (native / zero-shot sets), propose.py (cuBLASLt ranker proposals), training.py (train_best stages)
+  cli.py         `lscli` commands; config.py, files.py, envs.py, usage.py, search_queue.py, control.py, doctor.py
+install/     install.sh (curl | bash), lscli.service (systemd --user), lscli-clock (optional root clock helper),
+             zero_shot.tar.xz (the 3080 zero-shot model set the installer unpacks; rebuilt with pack_zero_shot.py, reproducibly)
+tests/       pytest unit tests (~300 tests; most need a CUDA GPU)
 reports/     write-ups, generated tables (*.md, *_summary.json, *.csv), figures/, snapshot/ (small committed copies of data)
 data/<hw>/   all raw results, screens, env records, logs (gitignored, machine-specific)
 learning/    background study notes (not part of the harness)
@@ -104,7 +112,7 @@ Measuring commands pin the process to one CPU core and write under `data/<hw_id>
 | `selectors [--results ... --graph-results ...]` | Fit trivial selectors on the tune screen, write picks, score on held-out shapes (screen + stage 2) | `data/<hw>/selector_picks.json`, `reports/selector_baselines.md` |
 | `learned [--results ... --graph-results ...]` | Grouped-CV grid search (cached, ~2 h first run) and held-out scoring of the 10 learned selectors; reads `selector_picks.json` for b6/knn5/knnf | `data/<hw>/learned_picks.json`, `learned_search.json`, `reports/learned_selectors.md` |
 | `topk [--results ... --graph-results ... --online ...]` | Refit lgbm_rank on all tune shapes, save `data/<hw>/lgbm_rank.txt/.json`, write top-5 picks per held-out shape, score best-of-k and the online search | `data/<hw>/learned_topk_picks.json`, `reports/learned_topk.md` |
-| `ranker-v2 [--extra-screens sweep_screen_tail]` | CPU only. Fit rank v2 (v1's rank form + analytic roofline features + near-top row weights + the tail suite as extra tune shapes) on all tune shapes; hyperparameters are v1's CV-chosen ones; diversification rule refit on v2's own out-of-fold scores. Reads no held-out shape. Use with `online --ranker data/<hw>/lgbm_rank_v2` | `lgbm_rank_v2.txt/.json`, `lgbm_rank_v2_cv_scores.npz` |
+| `ranker-v2 [--extra-screens sweep_screen_tail]` | CPU only. Fit rank v2 (v1's rank form + analytic roofline features + near-top row weights + the tail suite as extra tune shapes) on all tune shapes; hyperparameters are v1's CV-chosen ones (v2 is always a regression: when v1's search chose lambdarank, v2 takes the best regression entry of that search, `learned.v2_hp`); diversification rule refit on v2's own out-of-fold scores. Reads no held-out shape. Use with `online --ranker data/<hw>/lgbm_rank_v2` | `lgbm_rank_v2.txt/.json`, `lgbm_rank_v2_cv_scores.npz` |
 | `bundle build\|status\|verify` | The prebuilt Triton kernel bundle (`kernels/bundle.py`). `build` compiles every kernel the rankers' pools can launch (v1 ∪ v2 pools + hand-picked, fp16, every specialization; the committed bundle covers the 3080's and the 3090's pools, via `--pool <stems>`) into a scratch cache (`data/<hw>/bundle_build_cache`, resumable) and keeps only cubin + json in `kernels/bundle/` (gitignored); GPU idle, ~1 GiB host RAM + ~360 MiB VRAM per worker. `verify` warms every runnable (pool config, suite shape) pair with the bundle installed and an empty user cache and requires 0 compiles, then runs a few kernels against torch.matmul; exit 1 on any miss. `status` prints whether the bundle matches this Triton / GPU. `pack` writes the committed archive `kernels/bundle.tar.xz` (25 MiB; `unpack` is what `install()` does on a fresh clone, ~14 s, atomic). `--pool`, `--dtypes`, `--workers`, `--limit` | `kernels/bundle/<cache key>/{_matmul_kernel,_splitk_reduce_kernel}.{cubin,json}`, `manifest.json`; `kernels/bundle.tar.xz` |
 | `online --shapes-file ... --k 5 [--order diverse\|inner] [--lt-n 16] [--k-frequent 5 --frequent-calls 1000000] --fresh-cache` | First-use search: rank (plain or diversified top-k), compile + validate + short-time the top k (empty Triton cache), keep the fastest; choices for every k' <= k stored. `--lt-n N` also short-times cuBLASLt's heuristic top N in the same pool (joint selection, no compile; `choice_lt` stores k' x lt_n' in {0, 1, 4, N}). `--lt-knn N` (with `--lt-n`) adds cuBLASLt proposals from the deep searches of the N nearest tune shapes (top 2 each, no compile; `baselines/cublaslt_knn.py`); they join `choice` but no `choice_lt` entry, so `choice_lt["<k>_lt16"]` stays the heuristic-only search for A/B. `--router [--router-threshold X]` times the cuBLASLt candidates first and skips the Triton half when the family router (`tune/router.py`) says Triton cannot win (`--router-threshold 0` = LT first, never skip: the ordering control); `--confirm N` re-times the N fastest candidates in reverse order and ranks by the mean of both timings (cancels the timing-order bias; used with the router). `--lt-rank M` (with `--lt-n`) adds the M configs the learned cuBLASLt ranker (`baselines/cublaslt_rank.py`) predicts fastest; same family-subset rule. `--k-frequent` makes k per shape (call-count policy `tune.online.KPolicy`, default k 3 / frequent 5): shapes in the file with `calls` >= `--frequent-calls` or `frequent: true` get `--k-frequent` candidates, the rest `--k`; one shape from Python: `tune.online.select_kernel(ranker, M, N, K, calls=...)` | `online_lgbm_rank[_diverse].jsonl` (`online_joint_*` with `--lt-n`) |
 
@@ -236,6 +244,23 @@ Other findings to keep in mind:
   because that would fit the rule to held-out data. Held-out p99 (essentially the worst shape): diverse online top-3 20.2%, knnf 40.9%, knn5 122%; a 100-config static portfolio still 18.2%. Remaining tail (+10–22%) is ranker error: 320×1×79, 5398×196×774, 4065×8842×28. Shape → config classifiers and every linear model are worse than k-NN.
   Against B3+: 1.01 under 50 µs graph; G4 still fails at ≥ 50 µs. The Triton-only selector is slower than B3+ on 35 of 86 held-out shapes (v2). Its win over knnf at equal budget (top-1, no timing) is in the tail and mean, not the median (2.4% vs 2.5%); the top-3 numbers pay ~0.4 s of compile and timing that a table lookup does not.
 
+## 6b. lscli (the selector as a service)
+
+`lscli` turns `select_kernel` into a per-user service (spec: `docs/lscli/spec.md`). Pieces an agent must not break:
+- **The daemon process never creates a CUDA context.** NVML only, LightGBM on the CPU; everything GPU runs in a job
+  (`lscli.propose`, `lscli.worker` under the user's interpreter, `train_best.sh` stages). Otherwise NVML lists the daemon
+  as a compute process and the idle gate never opens. `tests/test_lscli_daemon.py` checks the end-to-end path.
+- **Winners are timed where they run**: the worker runs under the registered env's interpreter; the daemon writes the
+  entry only after a final gate check. Entries carry `env_extra` (clock policy, model ids, `env_id`); see the
+  winner-cache tiers in `tune/winner_cache.py`.
+- **No model set = cuBLASLt-only searches**: `select_kernel(tune.online.LT_ONLY, ...)` / a daemon with no models
+  searches cuBLASLt alone and stores `k = 0`; lookups ask for `k = 0` so such an entry counts, and it is widened once a
+  ranker exists. Do not pass `None` for "no ranker": `None` is the tests' placeholder for a faked search.
+- **Daemon measurements are not study data**: they run at stock or helper-locked clocks with no noise study and are
+  never written into `data/<hw>/` result files or reports.
+- **Branches**: nothing is committed directly to `learned-selector-cli` (or `learned-selectors`); every change is a PR
+  from its own branch, reviewed first.
+
 ## 7. Rules for agents
 
 **GPU job hygiene (has cost real data before):**
@@ -245,6 +270,10 @@ Other findings to keep in mind:
   background `while kill -0 PID` loop.
 - Killing a `tune sweep` parent orphans its spawn compile workers (~218 MiB GPU context each). Kill them by PID. Never use `pkill -f`
   with a pattern that also matches your own shell command.
+- If the lscli daemon is installed on the machine (`lscli status`), run `lscli pause` before a measurement session and start
+  only once `lscli status` shows no job: a daemon job overlaps a process that starts during it by up to ~6 s (spec 4.2). When you lock
+  the SM clock yourself, run `lscli clock hold` first, then `sudo nvidia-smi -lgc 1755,1755`; otherwise the daemon's helper or its
+  unit's restart can reset your lock (spec 4.6). Afterwards: `sudo nvidia-smi -rgc`, `lscli clock release`, `lscli resume`.
 
 **Measurement discipline:**
 - Use the standard conditions and `--clock-lock 1755` for anything that goes into a report. Long runs belong in the background
@@ -315,6 +344,7 @@ Full training of the shipped selector on another GPU (rank v1 + v2, cuBLASLt ran
 4b. **3090 follow-ups.** Done 2026-11-10 on existing data (`reports/week1.md` 2026-11-10): the 5% re-score (G4 stays unpassed: joint vs B3+ at >= 50 us 1 faster / 4 slower of 25), the router's held-out replay (regret unchanged, first use -23%, 17 of 86 skipped), the `StopIteration` (predates the stage-2 top-up) and the "19-21 of 27 timed" cause (a `cross_gpu` bug that dropped learned-cuBLASLt-ranker picks; fixed, retrained-v2 joint now 1.006 vs B3+, 27 of 27 timed). Open: a fresh-shape check on the 3090; the 3080 cuBLASLt ranker / router zero-shot on it (`TUNE_LT_RANK_FOREIGN=1`, `TUNE_ROUTER_FOREIGN=1`); the bundle: the key matches (sm_86, Triton 3.7.1) but 41% of the 3090's pool configs were not in the 3080-only bundle; rebuilt 2026-11-10 as the union of both GPUs' pools (30,327 kernels, `verify --per-shape 0`: 640,233 pairs, 0 misses on the 3080), so what is left is `bundle verify --pool <both GPUs' stems>` on the 3090 itself. Beyond it: another tensor-core generation (Ada, Hopper) is untested; sm_86 -> sm_86 is the easy case.
 5. Kernel-level fixes if differentiation matters: an aligned-copy or padded path for unaligned strides, and a fused or atomic split-K reduction.
 6. Not built yet: B4 (CUTLASS), per-candidate subprocess isolation with hang timeouts (plan 7.2), adaptive sampling.
+7. Retrain the RTX 3090's rank v2: `analysis/learned.py` now uses #13's rule (`v2_hp`: the best regression entry of v1's CV search when v1 chose lambdarank, as the 3090's did), but the shipped 3090 v2 was fit with `875ba36`'s rule (v1's hyperparameters, objective forced to regression).
 
 ## 10. Limitations of the shipped selector (prebuilt kernels and winner cache)
 

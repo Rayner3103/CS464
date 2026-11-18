@@ -1,0 +1,697 @@
+"""`lscli daemon run`: the idle-time loop (spec section 4).
+
+Every TICK_S: re-read the config when asked, merge the usage logs, evaluate the gate, write state.json, and if the gate
+is open run the most urgent task (lscli/scheduler.py) to completion or preemption. One job at a time, holding
+`gpu.lock`; while it runs, a watch callback re-evaluates the staying-open rule about once a second and kills the job's
+process tree when it fails (spec 4.2), followed by `backoff_minutes` of backoff.
+
+The daemon process never creates a CUDA context (NVML only, LightGBM on the CPU). Everything that touches the GPU runs
+in a job: the cuBLASLt ranker's proposals (`python -m lscli.propose`, daemon venv) and the measurement
+(`<env python> -m lscli.worker measure`, the user's interpreter). Environments (the daemon venv's, with its hw_id, and
+each registered env's) come from `lscli.worker env` runs that open no CUDA context once this GPU's hw_id is in
+`gpu_hw.json` (`lscli/hwcache.py`); a probe that needs a context (the first one on a GPU, or an env whose worker
+cannot read the cuBLASLt version without one) runs only with the gate open and gpu.lock held (`probe_gated`).
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import fcntl
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+from lscli import __version__, config, control, envs, gate, guard, hwcache, jobs, models, scheduler, training, usage
+from lscli import search_queue as queue
+from lscli.files import locked, read_json, write_json
+from lscli.paths import Paths
+
+TICK_S = 5.0
+HELPER = Path("/usr/local/libexec/lscli-clock")                      # the optional root clock helper (spec 4.6)
+GPU_REASONS = ("compute process", "GPU idle", "NVML unavailable", gate.CLOCK_HELD)   # what a CPU-only stage may ignore
+TRAIN_CHECK_S = 86400.0
+MERGE_EVERY_S = 60.0
+COMPACT_EVERY_S = 86400.0
+ENV_REFRESH_S = 86400.0
+ENV_RETRY_S = 600.0                  # a registered env whose probe failed is retried this often (not every tick)
+PROPOSE_TIMEOUT_S = 300.0
+HEARTBEAT_S = 5.0
+NEEDS_CUDA = object()                # `_worker_env` result: the CUDA-free probe cannot answer here, probe it gated
+
+
+class Daemon:
+    def __init__(self, paths: Paths | None = None, config_path: Path | None = None, *, python: str | None = None,
+                 snapshot=gate.gpu_snapshot, battery=gate.on_battery, clock=time.time, local_now=_dt.datetime.now):
+        self.paths = (paths or Paths()).ensure()
+        self.config_path = config_path
+        self.python = python or sys.executable
+        self.snapshot, self.battery, self.clock, self.local_now = snapshot, battery, clock, local_now
+        self.cfg = config.load(config_path)
+        self.gate = gate.Gate(self.cfg)
+        self.stop = False
+        self.state = "starting"
+        self.since = clock()
+        self.backoff_until: float | None = None
+        self.failures: dict[tuple, int] = {}
+        self.clock_locked = False                            # the helper lock this daemon set and has not reset
+        self.env_docs: dict[tuple, tuple[float, dict]] = {}
+        self.env_failed: dict[str, float] = {}               # env id -> last failed probe
+        self.env_blocked: dict[str, tuple] = {}              # env id -> (env key, message): the runtime guard refused
+        self.probe_error: str | None = None                  # the last worker `env` probe's error line, if any
+        self.unknown_envs: set[str] = set()                  # registered, but no environment yet (probe failed)
+        self.need_cuda: set[str] = set()                     # env ids ("daemon": this venv) waiting for a gated probe
+        self.wcs: dict[str, tuple] = {}                      # env id -> (env doc, file stamp, WinnerCache)
+        self.last_heartbeat = 0.0
+        self.daemon_env: dict = {}
+        self.last_merge = self.last_compact = 0.0
+        self.reload_seen = control.read_control(self.paths).get("reload")
+        self.job_info: dict | None = None
+        self.reasons: list[str] = ["starting"]
+        self.identity: dict = {}
+        self.hw_id: str | None = None
+        self.last_train_check = 0.0
+        self.models: models.ModelSet | None = None
+        self.log = logging.getLogger("lscli.daemon")
+        self.counters = {"searches": 0, "preempted": 0, "failed": 0}
+
+    # ------------------------------------------------------------------------------------------------ set-up
+    def start(self) -> None:
+        self.identity = gate.gpu_identity()
+        self.resolve_hw()
+        self.log.info("lscli %s daemon: GPU %s (%s), hw_id %s", __version__, self.identity.get("name"),
+                      self.identity.get("uuid"), self.hw_id)
+        if self.identity.get("count", 0) > 1:
+            self.log.warning("%d GPUs: lscli v1 uses device 0 only", self.identity["count"])
+        self.load_models()
+
+    def resolve_hw(self) -> bool:
+        """Probe the daemon venv's environment (hw_id, versions) in a worker, with no CUDA context: only when this GPU's
+        hw_id is cached (`lscli/hwcache.py`). Otherwise the first gated probe learns it (`probe_gated`). Retried on later
+        ticks until it works (the driver may not be ready at login). Returns True when it just became known."""
+        if self.hw_id or "daemon" in self.env_blocked:
+            return False
+        if not self.identity.get("uuid"):
+            self.identity = gate.gpu_identity()
+        hw = hwcache.known(self.paths, self.identity)
+        if hw is None:
+            self.need_cuda.add("daemon")
+            return False
+        doc = self._worker_env(self.python, {}, hw)
+        if doc is NEEDS_CUDA:
+            self.need_cuda.add("daemon")
+            return False
+        if not doc:
+            self._block_daemon_if_refused()
+            return False
+        self.daemon_env, self.hw_id = doc, hw
+        self.need_cuda.discard("daemon")
+        return True
+
+    def _block_daemon_if_refused(self) -> bool:
+        """The runtime guard refused the daemon venv's own worker: no retry until restart (spec 5.1)."""
+        if not (self.probe_error or "").startswith(guard.PREFIX):
+            return False
+        self.env_blocked["daemon"] = ((), self.probe_error)
+        self.log.error("the daemon venv's worker refused to run: %s", self.probe_error)
+        return True
+
+    def probe_gated(self) -> None:
+        """The environment probes that need a CUDA context: the daemon venv's while hw_id is unknown, and the envs whose
+        CUDA-free probe could not answer. Called only with the gate open; holds gpu.lock like a job (skipped if it is
+        held). A CUDA-measured hw_id is stored for later, CUDA-free probes."""
+        if not self.need_cuda:
+            return
+        lockf = open(self.paths.gpu_lock, "a")
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lockf.close()
+            return
+        try:
+            if "daemon" in self.need_cuda and "daemon" in self.env_blocked:
+                self.need_cuda.discard("daemon")
+            if "daemon" in self.need_cuda:
+                doc = self._worker_env(self.python, {})
+                if not isinstance(doc, dict):
+                    if self._block_daemon_if_refused():
+                        self.need_cuda.discard("daemon")
+                elif doc.get("hw_id"):
+                    self.need_cuda.discard("daemon")
+                    self.daemon_env, self.hw_id = doc, doc["hw_id"]
+                    if not self.identity.get("uuid"):
+                        self.identity = gate.gpu_identity()
+                    hwcache.remember(self.paths, self.identity, self.hw_id)
+                    self.load_models()
+            if not self.hw_id:
+                return
+            registry = envs.load(self.paths)
+            now = self.clock()
+            for eid in sorted(self.need_cuda - {"daemon"}):
+                self.need_cuda.discard(eid)
+                rec = registry.get(eid)
+                if rec is None or eid in self.env_blocked:
+                    continue
+                doc = self._worker_env(rec["python"], self.env_extra(eid))
+                if isinstance(doc, dict):
+                    self.env_docs[self._env_key(eid, rec)] = (now, doc)
+                    self.env_failed.pop(eid, None)
+                else:
+                    self.env_failed[eid] = now
+                    if (self.probe_error or "").startswith(guard.PREFIX):
+                        self.block_env(eid, self.probe_error)
+        finally:
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+            lockf.close()
+
+    def load_models(self) -> None:
+        self.models = models.active(self.paths, self.hw_id)
+        ids = self.models.ids() if self.models else None
+        with locked(self.paths.client):
+            config.write_client_json(self.paths, self.cfg, models=ids, gpu_uuid=self.identity.get("uuid"),
+                                     model_stems=self.models.stem_paths() if self.models else {})
+        self.env_docs.clear()
+        self.log.info("models: %s", ids or "none: cuBLASLt-only searches until this GPU's models are trained")
+
+    def env_extra(self, eid: str) -> dict:
+        return {**config.env_extra(self.cfg, self.models.ids() if self.models else None), "env_id": eid}
+
+    def _worker_env(self, python: str, extra: dict, hw_id: str | None = None):
+        """The environment doc of `python` (a worker run): with `hw_id`, read without a CUDA context (NEEDS_CUDA when
+        that is not possible there); without, the worker opens one, so only `probe_gated` calls it that way."""
+        from lscli.cli import source_dir
+        self.probe_error = None                          # this probe's error line only, never an earlier one's
+        try:
+            r = subprocess.run([python, "-m", "lscli.worker", "env", "--env-extra", json.dumps(extra),
+                                *(["--hw-id", hw_id] if hw_id else [])],
+                               cwd=source_dir(self.paths), capture_output=True, text=True, timeout=300,
+                               stdin=subprocess.DEVNULL)
+            for line in reversed(r.stdout.splitlines()):
+                doc = json.loads(line)
+                if doc.get("op") == "result":
+                    return doc["env"]
+                if doc.get("op") == "error":
+                    if str(doc.get("error", "")).startswith(hwcache.NEEDS_CUDA):
+                        return NEEDS_CUDA
+                    self.probe_error = str(doc.get("error"))
+                    self.log.warning("environment of %s unavailable: %s", python, self.probe_error)
+                    return None
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            self.log.warning("environment of %s unavailable: %s", python, e)
+        return None
+
+    def block_env(self, eid: str, message: str, key: tuple | None = None) -> None:
+        """The runtime guard refused env `eid` (spec 5.1): no probe or search for it until its record changes
+        (`lscli enable-env` again) or the daemon restarts; `lscli status` / `doctor` show the message."""
+        if key is None:
+            rec = envs.load(self.paths).get(eid)
+            if rec is None:
+                return
+            key = self._env_key(eid, rec)
+        if self.env_blocked.get(eid, (None,))[0] != key:
+            self.log.warning("env %s blocked until `lscli enable-env` runs again: %s", eid, message)
+        self.env_blocked[eid] = (key, message)
+        self.env_docs = {k: v for k, v in self.env_docs.items() if k[0] != eid}
+
+    def _env_key(self, eid: str, rec: dict) -> tuple:
+        return (eid, json.dumps(self.env_extra(eid), sort_keys=True), rec.get("updated"))
+
+    def caches(self) -> dict:
+        """{env_id: WinnerCache in that env's environment}. An environment is probed (by running the env's interpreter,
+        with no CUDA context) once a day, when the env's record or the model set changed, or when a worker reported a
+        different one; a failed probe is retried after ENV_RETRY_S and the env is listed in `unknown_envs` (its requests
+        stay queued). Without a hw_id nothing is probed; an env whose probe needs CUDA waits for `probe_gated`, keeping
+        its last doc if it has one. A cache instance is kept per env and re-read only when winners.jsonl changed."""
+        from tune.winner_cache import WinnerCache
+        out, self.unknown_envs = {}, set()
+        now = self.clock()
+        try:
+            st = self.paths.winners.stat()
+            stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            stamp = None
+        registry = envs.load(self.paths)
+        self.env_blocked = {e: b for e, b in self.env_blocked.items() if e in registry or e == "daemon"}
+        for eid, rec in registry.items():
+            key = self._env_key(eid, rec)
+            blocked = self.env_blocked.get(eid)
+            if blocked is not None and blocked[0] != key:   # its record (or the model set) changed: try again
+                self.env_blocked.pop(eid)
+                blocked = None
+            t, doc = self.env_docs.get(key, (0.0, None))
+            if blocked is not None:                          # the runtime guard refused it: no retry loop (spec 5.1)
+                doc = None
+            elif doc is None or now - t > ENV_REFRESH_S:
+                if not self.hw_id or eid in self.need_cuda:
+                    pass                                     # waits for probe_gated (keeps an expired doc meanwhile)
+                elif now - self.env_failed.get(eid, -1e18) < ENV_RETRY_S:
+                    doc = None
+                else:
+                    got = self._worker_env(rec["python"], self.env_extra(eid), self.hw_id)
+                    if got is NEEDS_CUDA:
+                        self.need_cuda.add(eid)
+                    elif got is None:
+                        doc = None
+                        self.env_failed[eid] = now
+                        if (self.probe_error or "").startswith(guard.PREFIX):
+                            self.block_env(eid, self.probe_error, key)
+                    else:
+                        doc = got
+                        self.env_docs[key] = (now, doc)
+                        self.env_failed.pop(eid, None)
+            if doc is None:
+                self.unknown_envs.add(eid)
+                continue
+            have = self.wcs.get(eid)
+            if have is None or have[0] != doc:
+                have = (doc, stamp, WinnerCache(self.paths.winners, env=doc))
+            elif have[1] != stamp:
+                have[2].reload()
+                have = (doc, stamp, have[2])
+            self.wcs[eid] = have
+            out[eid] = have[2]
+        return out
+
+    # ------------------------------------------------------------------------------------------------ the gate
+    def gate_reasons(self, own=None) -> list[str]:
+        """Why the gate is closed. `own` = the running job's process tree, or a function returning it: called AFTER the
+        GPU snapshot, so a job process that created its CUDA context just before is in the tree it is compared with."""
+        lock = self.paths.src / "pipeline" / ".lock"
+        snap = self.snapshot()
+        if callable(own):
+            own = own()
+        locked = lock.exists() and gate.lock_held(lock, exclude=own or frozenset())   # our own train_best holds it
+        return self.gate.reasons(snap=snap, now=self.clock(), local=self.local_now(), battery=self.battery(),
+                                 paused=control.paused(control.read_control(self.paths), self.clock()),
+                                 backoff_until=self.backoff_until, pipeline_locked=locked, own=own,
+                                 clock_held=control.clock_held(self.paths) is not None)
+
+    def write_state(self, **extra) -> None:
+        pend, _ = queue.pending(self.paths)
+        ctl = control.read_control(self.paths)
+        write_json(self.paths.state, {
+            "pid": os.getpid(), "version": __version__, "state": self.state, "since": self.since,
+            "gate": {"open": not self.reasons, "reasons": self.reasons}, "job": self.job_info,
+            "backoff_until": self.backoff_until, "paused_until": ctl.get("paused_until") if control.paused(ctl) else None,
+            "gpu": self.identity, "hw_id": self.hw_id, "probes_waiting": sorted(self.need_cuda),
+            "models": {"source": self.models.source if self.models else None,
+                       "ids": self.models.ids() if self.models else None,
+                       "training": training.Training(self.paths, self.hw_id).summary() if self.hw_id else None},
+            "queue": {"pending": len(pend)}, "counters": self.counters, "updated": self.clock(),
+            "env_errors": {eid: msg for eid, (_, msg) in self.env_blocked.items()}})
+
+    def set_state(self, s: str) -> None:
+        if s != self.state:
+            self.state, self.since = s, self.clock()
+
+    # ------------------------------------------------------------------------------------------------ one tick
+    def maintenance(self, caches: dict | None = None) -> None:
+        now = self.clock()
+        ctl = control.read_control(self.paths)
+        if ctl.get("reload") != self.reload_seen:
+            self.reload_seen = ctl.get("reload")
+            try:
+                self.cfg = config.load(self.config_path)
+                self.gate.cfg = self.cfg
+                self.load_models()
+                self.log.info("configuration reloaded")
+            except config.ConfigError as e:
+                self.log.error("config not reloaded: %s", e)
+        if now - self.last_merge >= MERGE_EVERY_S:
+            usage.merge(self.paths, self.cfg["search"]["half_life_days"], now=now)
+            self.last_merge = now
+        if caches is not None:
+            pend, _ = queue.pending(self.paths)
+            if pend:                                       # drop finished requests, keep the rest (any order)
+                queue.retain(self.paths, lambda r: not scheduler.satisfied(r, caches, self.failures, self.unknown_envs))
+            if now - self.last_compact >= COMPACT_EVERY_S and caches:
+                for wc in caches.values():
+                    wc.compact()
+                self.last_compact = now
+
+    def next_task(self, caches: dict) -> scheduler.Task | None:
+        pend, _ = queue.pending(self.paths)
+        triton = self.models is not None and self.models.triton() is not None
+        tasks = scheduler.plan(self.cfg, usage.load(self.paths), pend, caches, self.failures, self.clock(), triton=triton)
+        if not triton and not self.cfg["search"]["lt_n"]:
+            tasks = []                                       # no Triton ranker and no cuBLASLt pool: only training runs
+        stage = self.training_stage()
+        if stage is not None:
+            tasks = sorted(tasks + [scheduler.Task("train", stage=stage)])
+        return tasks[0] if tasks else None
+
+    # ------------------------------------------------------------------------------------------------ training
+    def training_stage(self) -> str | None:
+        """The next train_best stage to run, starting a training when one is needed (spec 4.5); None otherwise."""
+        if not self.cfg["train"]["enabled"] or not self.hw_id:
+            return None
+        tr = training.Training(self.paths, self.hw_id)
+        ctl = control.read_control(self.paths)
+        req = ctl.get("retrain")
+        cont = ctl.get("continue")
+        if cont:                                            # `lscli train start`: consumed once, like a retrain request
+            ctl = {k: v for k, v in ctl.items() if k != "continue"}
+            control.write_control(self.paths, ctl)
+            t = cont.get("t") if isinstance(cont, dict) else None
+            if not req and tr.continue_failed(t):          # a retrain request starts over instead
+                self.log.info("continuing failed training run %s at stage %s (lscli train start)", tr.state["run"],
+                              tr.next_stage())
+        if req:
+            control.write_control(self.paths, {k: v for k, v in ctl.items() if k != "retrain"})   # consumed once
+            self._refresh_daemon_env()
+            if req.get("stages"):
+                if tr.state.get("status") != "done" or tr.run_dir is None:
+                    self.log.warning("retrain of %s refused: no finished training to start from", req["stages"])
+                else:                                       # seeded from the previous run: keeps its mode
+                    tr.begin({"manual"}, list(req["stages"]), self.daemon_env, "requested: " + ", ".join(req["stages"]),
+                             request_t=req.get("t"), mode=tr.mode())
+            else:
+                tr.begin({"first"}, training.stages_for({"first"}, self._with_bundle()), self.daemon_env,
+                         "requested (lscli train retrain)", request_t=req.get("t"), mode=self.cfg["train"]["mode"])
+        elif not tr.active() and tr.state.get("status") != "failed" and \
+                self.clock() - self.last_train_check >= TRAIN_CHECK_S:
+            self.last_train_check = self.clock()
+            self._refresh_daemon_env()                      # a Triton / cuBLASLt upgrade of the daemon venv shows here
+            want, last = self.cfg["train"]["mode"], tr.mode()
+            done = tr.state.get("status") == "done"
+            if done and last and last != want:            # another mode: a fresh run, never seeded from that one
+                ch, reason = {"first"}, f"train.mode changed: {last} -> {want}"
+            elif done and want == last == "smoke":          # a smoke run activates nothing: do not loop on it
+                ch, reason = set(), ""
+            else:
+                ch = training.changes(training.trained_env(self.paths, self.hw_id), self.daemon_env)
+                reason = "no models for this GPU" if "first" in ch else "changed: " + ", ".join(sorted(ch))
+            if ch:
+                tr.begin(ch, training.stages_for(ch, self._with_bundle()), self.daemon_env, reason,
+                         mode=want if "first" in ch else last or want)
+        if not tr.active():
+            self._clear_train_now()                         # nothing to train: `train start` does not linger
+            return None
+        stage = tr.next_stage()
+        if stage is None and tr.mode() == "smoke":          # a plumbing check: its fits are meaningless
+            tr.finish(activated=False)
+            self.log.info("training run %s done (smoke mode): models not activated", tr.state["run"])
+            self._clear_train_now()
+            return None
+        if stage is None:                                    # every stage stamped: activate the new models
+            try:
+                env = tr.state.get("env") or self.daemon_env  # the environment the stages ran under
+                training.activate(self.paths, self.hw_id, tr.run_dir,
+                                  {k: env.get(k) for k in ("triton", "cublaslt", "driver", "kernel_src", "torch")})
+                tr.finish()
+                self.log.info("training run %s done: models activated", tr.state["run"])
+                self.load_models()
+            except Exception as e:                          # never let a bad run break the loop
+                self.log.error("activating run %s failed: %s: %s", tr.state["run"], type(e).__name__, e)
+                tr.mark_failed()
+            self._clear_train_now()
+            return None
+        return stage
+
+    def _refresh_daemon_env(self) -> None:
+        """The daemon venv's environment again, CUDA-free with the known hw_id; a "needs CUDA" answer waits for
+        `probe_gated` (gate open, gpu.lock), which refreshes it. Nothing to refresh before hw_id is known."""
+        if not self.hw_id:
+            return
+        doc = self._worker_env(self.python, {}, self.hw_id)
+        if doc is NEEDS_CUDA:
+            self.need_cuda.add("daemon")
+        elif doc:
+            self.daemon_env = doc
+
+    def _clear_train_now(self) -> None:
+        ctl = control.read_control(self.paths)
+        if ctl.get("train_now"):
+            control.write_control(self.paths, {**ctl, "train_now": False})
+
+    def _with_bundle(self) -> bool:
+        """Build the kernel bundle only when some registered env runs the daemon venv's Triton (else no hit)."""
+        t = self.daemon_env.get("triton")
+        return bool(t) and any(e.get("triton") == t for e in envs.load(self.paths).values())
+
+    def run_training_stage(self, stage: str) -> None:
+        """One train_best stage as a supervised job (spec 4.5). Raises Preempted / JobError."""
+        from lscli.cli import source_dir
+        tr = training.Training(self.paths, self.hw_id)
+        run = tr.run_dir
+        src = source_dir(self.paths)
+        script = Path(os.environ.get("LSCLI_TRAIN_SCRIPT") or src / "pipeline" / "train_best.sh")
+        argv = ["bash", str(script)]
+        argv += ["--resume", str(run)] if (run / "mode").exists() else \
+            ["--run-dir", str(run), f"--{tr.mode() or self.cfg['train']['mode']}"]
+        mhz = self.cfg["clock"]["lock_mhz"]
+        argv += ["--skip-install", "--skip-validation", "--only", stage]
+        argv += ["--clock-lock", str(mhz)] if mhz else ["--clock-lock", "none", "--allow-unlocked"]
+        if "bundle" in tr.state.get("stages", []):
+            argv.append("--with-bundle")
+        env = {**os.environ, "PATH": f"{Path(self.python).parent}{os.pathsep}{os.environ.get('PATH', '')}"}
+        job = jobs.Job(argv, cwd=src, env=env, log=self._job_log(f"train-{stage}"), protocol=False)
+        t0 = time.monotonic()
+        try:
+            code = jobs.supervise(job, watch=lambda tree_fn: self._watch(tree_fn, stage))
+        except jobs.Preempted:
+            hw_data = run / "data" / (self.hw_id or "")
+            (hw_data / "inflight.json").unlink(missing_ok=True)   # our kill, not a crash of that candidate
+            raise
+        finally:
+            job.close()
+        self.gate.job_ended(self.clock())       # the check below must not count the stage's own utilization (as search)
+        if code != 0 or stage not in tr.done():
+            # train_best's own idle-GPU check or lock can lose a race with a user process that appeared after our
+            # gate poll: a quick failure with the GPU now busy is a preemption, not a broken stage.
+            if time.monotonic() - t0 < 60 and any(r.startswith(GPU_REASONS[0]) for r in self.gate_reasons()):
+                raise jobs.Preempted()
+            n = tr.record_failure(stage)
+            if tr.state.get("status") == "failed":
+                self._clear_train_now()
+            raise jobs.JobError(f"train_best stage {stage} failed (exit {code}, attempt {n})")
+        tr.record_success(stage)
+        self.log.info("training stage %s done (run %s)", stage, tr.state["run"])
+
+    def tick(self) -> scheduler.Task | None:
+        """One iteration; returns the task it ran (None if it ran nothing)."""
+        if self.resolve_hw():
+            self.load_models()
+        caches = self.caches()
+        self.maintenance(caches)
+        self.reasons = self.gate_reasons()
+        if self.backoff_until and self.clock() >= self.backoff_until:
+            self.backoff_until = None
+        if self.reasons:                                   # a training stage may still run (spec 4.3 / `train start`)
+            stage = self.training_stage()
+            if stage is not None and not self._remaining(self.reasons, stage):
+                task = scheduler.Task("train", stage=stage)
+                self.run_task(task)
+                return task
+        if self.reasons:
+            self.set_state("backoff" if self.backoff_until else "paused" if any(r == "paused" for r in self.reasons)
+                           else "waiting")
+            self.write_state()
+            return None
+        if self.need_cuda:                                 # gate open: the probes that need a CUDA context
+            self.probe_gated()
+            caches = self.caches()
+        task = self.next_task(caches)
+        if task is None:
+            self.set_state("waiting")
+            self.reasons = []
+            self.write_state()
+            return None
+        self.run_task(task)
+        return task
+
+    # ------------------------------------------------------------------------------------------------ jobs
+    def _remaining(self, reasons: list[str], stage: str | None) -> list[str]:
+        """The reasons that still block a training stage: a CPU-only stage ignores GPU business, and after `lscli train
+        start` training ignores the time window (the rest of the gate still applies)."""
+        if stage is None:
+            return reasons
+        rest = list(reasons)
+        if stage in training.CPU_STAGES:
+            rest = [r for r in rest if not r.startswith(GPU_REASONS)]
+        if control.read_control(self.paths).get("train_now"):
+            rest = [r for r in rest if not r.startswith("outside window")]
+        return rest
+
+    def _watch(self, tree_fn, stage: str | None = None) -> bool:
+        if self.stop:                                      # SIGTERM: end the job now, the clock reset still runs
+            self.reasons = ["stopping"]
+            return False
+        r = self._remaining(self.gate_reasons(own=lambda: tree_fn() | {os.getpid()}), stage)
+        if r:
+            self.reasons = r
+            self.log.info("preempting %s: %s", self.job_info, "; ".join(r))
+        elif self.clock() - self.last_heartbeat >= HEARTBEAT_S:
+            self.last_heartbeat = self.clock()
+            self.write_state()
+        return not r
+
+    def run_task(self, task: scheduler.Task) -> None:
+        lockf = open(self.paths.gpu_lock, "a")
+        try:
+            fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:                            # another lscli daemon (or a stale one) holds it: not now
+            lockf.close()
+            self.log.warning("gpu.lock is held by another process; skipping this tick")
+            return
+        self.set_state("running")
+        self.job_info = ({"kind": "train", "stage": task.stage, "started": self.clock()} if task.kind == "train" else
+                         {"kind": task.kind, "shape": [task.M, task.N, task.K], "dtype": task.dtype, "env_id": task.env_id,
+                          "k": task.k, "reason": task.reason, "started": self.clock()})
+        self.write_state()
+        try:
+            if task.kind == "train":
+                if task.stage not in training.CPU_STAGES:
+                    self.clock_lock("lock")
+                self.run_training_stage(task.stage)
+                self.counters["train_stages"] = self.counters.get("train_stages", 0) + 1
+                return
+            self.clock_lock("lock")
+            self.search(task)
+            self.counters["searches"] += 1
+            self.failures.pop(task.key, None)
+        except jobs.Preempted:
+            self.counters["preempted"] += 1
+            if not self.stop and not any(r in ("paused", gate.CLOCK_HELD) for r in self.reasons):   # not a busy GPU
+                self.backoff_until = self.clock() + self.cfg["idle"]["backoff_minutes"] * 60
+        except Exception as e:                             # JobError or anything unexpected: count it, never loop on it
+            self.counters["failed"] += 1
+            if task.kind != "train":                       # a stage's failures are counted by the Training state
+                self.failures[task.key] = self.failures.get(task.key, 0) + 1
+            self.log.warning("task %s failed: %s: %s", task, type(e).__name__, e)
+            if task.env_id and str(e).startswith(guard.PREFIX):
+                self.block_env(task.env_id, str(e))
+        finally:
+            self.clock_lock("reset")
+            self.gate.job_ended(self.clock())
+            self.job_info = None
+            fcntl.flock(lockf, fcntl.LOCK_UN)
+            lockf.close()
+            self.set_state("backoff" if self.backoff_until else "waiting")
+            self.write_state()
+
+    def _job_log(self, name: str) -> Path:
+        d = self.paths.logs / "jobs"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{time.strftime('%Y%m%d-%H%M%S')}-{name}.log"
+
+    def search(self, task: scheduler.Task) -> dict:
+        """Spec 4.4: Triton proposals here (CPU), cuBLASLt ranker proposals in `lscli.propose`, measurement in the
+        env's worker. With no model set the search is cuBLASLt's heuristic top lt_n alone (task.k = 0; spec 4.4).
+        Raises Preempted / JobError."""
+        from lscli.cli import source_dir
+        from tune.online import proposal_keys, propose_triton
+        rec = envs.load(self.paths).get(task.env_id)
+        if rec is None:
+            raise jobs.JobError(f"env {task.env_id} is no longer registered")
+        s = self.cfg["search"]
+        ms = self.models
+        tri, rank_s = propose_triton(ms.triton() if ms else None, task.M, task.N, task.K, task.k, "diverse")
+        proposals = proposal_keys(tri)
+        lt_stem = ms.stems["lt_rank"] if ms else None
+        lt_rank = s["lt_rank"] if (s["lt_n"] and lt_stem is not None) else 0
+        cwd = source_dir(self.paths)
+        if lt_rank:
+            job = jobs.Job([self.python, "-m", "lscli.propose"], cwd=cwd, log=self._job_log("propose"))
+            res = jobs.converse(job, {"M": task.M, "N": task.N, "K": task.K, "dtype": task.dtype, "lt_n": s["lt_n"],
+                                      "lt_rank": lt_rank, "stem": str(lt_stem)},
+                                watch=self._watch, silence_s=PROPOSE_TIMEOUT_S)
+            proposals += res["proposals"]
+        router = ms.router() if (ms and s["lt_n"] and tri) else None     # nothing to skip without Triton candidates
+
+        def answer(msg: dict) -> dict:
+            skip, p = router.skip_triton(task.M, task.N, task.K, float(msg["t_lt_us"]))
+            return {"skip": bool(skip), "p": p, "threshold": router.threshold}
+        req = {"M": task.M, "N": task.N, "K": task.K, "dtype": task.dtype, "k": task.k, "lt_n": s["lt_n"],
+               "lt_rank": lt_rank, "confirm": 0, "router": router is not None, "proposals": proposals,
+               "cache": None, "env_extra": self.env_extra(task.env_id), "order": "diverse",
+               "ranker": ms.stems["triton"].name if ms else None, "reply_timeout_s": 30, "rank_s": rank_s}
+        job = jobs.Job([rec["python"], "-m", "lscli.worker", "measure"], cwd=cwd, log=self._job_log("measure"))
+        res = jobs.converse(job, req, watch=self._watch, answer=answer if router is not None else None)
+        if res.get("skipped"):
+            raise jobs.JobError(f"skipped: {res['skipped']}")
+        if not (res.get("choice") or {}).get("key"):
+            raise jobs.JobError("no valid kernel")
+        # Final check, after the worker is gone: a foreign process that appeared since the last watch poll (<= 1 s)
+        # may have overlapped the last samples. Then nothing is written (spec 4.2). The utilization NVML reports now is
+        # still the worker's own: start the post-job grace first, or the check would count it as a busy GPU and restart
+        # the idle clock (one search per gpu_idle_minutes instead of back to back). A foreign process still counts.
+        self.gate.job_ended(self.clock())
+        late = self.gate_reasons(own=set())
+        if any(r.startswith("compute process") or r == gate.CLOCK_HELD for r in late):   # a hold: the user's clock next
+            self.reasons = late
+            raise jobs.Preempted()
+        from lscli.worker import write_entry
+        write_entry(str(self.paths.winners), res["env"], res["put"])
+        self._update_env(task.env_id, rec, res.get("env") or {})
+        self.log.info("searched %sx%sx%s %s for %s: %s (%s), torch %.1f us", task.M, task.N, task.K, task.dtype,
+                      task.env_id, res["choice"]["key"], res["choice"].get("family"), res.get("torch_us") or -1)
+        return res
+
+    def _update_env(self, eid: str, rec: dict, env: dict) -> None:
+        """The worker's environment is authoritative: refresh the env's record and the cached environment doc (a driver
+        or cuBLASLt change would otherwise make every fresh entry look stale to the scheduler)."""
+        fresh = {k: env.get(k) for k in ("torch", "triton", "cuda_runtime") if env.get(k) is not None}
+        if any(rec.get(k) != v for k, v in fresh.items()):
+            rec = envs.register(self.paths, rec["python"], {**rec, **fresh})[1]
+        if env:
+            self.env_docs[self._env_key(eid, rec)] = (self.clock(), env)
+            if hwcache.remember(self.paths, self.identity, env.get("hw_id")):   # measured with CUDA in the job
+                self.log.info("hw_id of GPU %s stored: %s", self.identity.get("uuid"), env.get("hw_id"))
+
+    def clock_lock(self, action: str) -> None:
+        """Lock / reset the SM clock through the optional helper (spec 4.6); a no-op without lock_mhz. While the user
+        holds the clock (`lscli clock hold`) the daemon never locks, and it resets only a lock it set itself: a job the
+        hold preempted ends with its own lock undone. `lscli clock hold` returns once no job runs, so the user's own
+        lock always comes after that reset."""
+        if not self.cfg["clock"]["lock_mhz"]:
+            return
+        if action == "lock" and control.clock_held(self.paths) is not None:
+            self.log.info("clock lock skipped: the clock is held (lscli clock release)")
+            return
+        if action == "reset" and not self.clock_locked and control.clock_held(self.paths) is not None:
+            return                                         # not ours to reset: the user's clock
+        if not HELPER.exists():
+            self.log.warning("clock.lock_mhz is set but %s is missing", HELPER)
+            return
+        r = subprocess.run(["sudo", "-n", str(HELPER), action], capture_output=True, text=True)
+        if r.returncode != 0:
+            self.log.warning("clock %s failed: %s", action, r.stderr.strip()[-200:])
+        elif action in ("lock", "reset"):                   # a failed call leaves the clock (and so the flag) as it was
+            self.clock_locked = action == "lock"
+
+    # ------------------------------------------------------------------------------------------------ main loop
+    def run(self) -> int:
+        signal.signal(signal.SIGTERM, lambda *a: setattr(self, "stop", True))
+        signal.signal(signal.SIGINT, lambda *a: setattr(self, "stop", True))
+        self.start()
+        while not self.stop:
+            try:
+                ran = self.tick()
+            except Exception:                         # one bad tick must not end the service
+                self.log.exception("tick failed")
+                self.set_state("error")
+                self.write_state()
+                ran = None
+            if ran is None:
+                end = time.monotonic() + TICK_S
+                while not self.stop and time.monotonic() < end:
+                    time.sleep(0.2)
+        self.set_state("stopped")
+        self.write_state()
+        return 0
+
+
+def setup_logging(paths: Paths) -> None:
+    paths.logs.mkdir(parents=True, exist_ok=True)
+    from logging.handlers import RotatingFileHandler
+    h = RotatingFileHandler(paths.logs / "daemon.log", maxBytes=5 << 20, backupCount=3)
+    h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    root = logging.getLogger("lscli")
+    root.setLevel(logging.INFO)
+    root.addHandler(h)
+    if sys.stderr.isatty():
+        root.addHandler(logging.StreamHandler())

@@ -128,7 +128,10 @@ fi
 mkdir -p "$RUN_DIR"/{reports,logs,stamps,models}
 RUN_DIR="$(cd "$RUN_DIR" && pwd)"
 REPORTS="$RUN_DIR/reports"
-echo "$MODE" > "$RUN_DIR/mode"
+# hw_id and mode outlive the stage that writes them (--resume reads them): written atomically, because the lscli daemon
+# kills a stage at any point (preemption) and a truncated file would make every later resume of the run fail.
+write_file() { printf '%s\n' "$2" > "$1.tmp.$$" && mv -f "$1.tmp.$$" "$1"; }
+write_file "$RUN_DIR/mode" "$MODE"
 [[ "$LOCK" == "none" && "$ALLOW_UNLOCKED" == 0 ]] && die "--clock-lock none needs --allow-unlocked"
 
 # TUNE_PS / HELD_PS / TAIL_PS = shapes per suite in the sweep subsets (1000 = all); LT_SHAPES = cuBLASLt screen shapes (0 = all 652, spread
@@ -154,8 +157,11 @@ zs() { "$PY" -u -m analysis.zero_shot --clock-lock "$LOCK" "$@"; }
 # The data directory is named by the hardware id (analysis.zero_shot names its report after it). Resolved once and remembered for --resume.
 DATA=""; HW=""
 set_paths() {
-  [[ -f "$RUN_DIR/hw_id" ]] || "$PY" -c 'from tune.env import hw_id; print(hw_id())' | tail -1 > "$RUN_DIR/hw_id"
-  HW="$(<"$RUN_DIR/hw_id")"
+  if [[ ! -s "$RUN_DIR/hw_id" ]]; then             # -s: an empty file left by an older, killed run is re-resolved
+    local hw; hw="$("$PY" -c 'from tune.env import hw_id; print(hw_id())' | tail -1)" || hw=""
+    [[ -z "$hw" ]] || write_file "$RUN_DIR/hw_id" "$hw"
+  fi
+  HW="$(cat "$RUN_DIR/hw_id" 2>/dev/null || true)"
   [[ -n "$HW" ]] || die "could not determine the hardware id (is the GPU visible to torch?)"
   DATA="$RUN_DIR/data/$HW"
   mkdir -p "$DATA"

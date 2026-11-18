@@ -192,8 +192,11 @@ def propose_lt(M: int, N: int, K: int, dtype=torch.float16, lt_n: int = 0, lt_kn
 
 def propose_triton(ranker, M: int, N: int, K: int, k: int, order: str = "plain") -> tuple[list[tuple], float]:
     """The Triton half: the ranker's top k (plain / diverse / inner order) as (family, key, backend, 0.0) tuples, and the
-    ranking's wall time (rank_s). CPU only (the ranker is lightgbm); building a TritonMatmul compiles nothing."""
+    ranking's wall time (rank_s). CPU only (the ranker is lightgbm); building a TritonMatmul compiles nothing. No ranker
+    (None or LT_ONLY) or k = 0 proposes nothing (a cuBLASLt-only search)."""
     from kernels.triton_matmul import TritonMatmul
+    if ranker is None or ranker is LT_ONLY or k <= 0:
+        return [], 0.0
     t0 = time.perf_counter()
     keys = ranker.rank(M, N, K, k, order=order)
     return [("triton", key, TritonMatmul(ranker.cfgs[ranker.pool_keys.index(key)]), 0.0) for key in keys], time.perf_counter() - t0
@@ -361,10 +364,21 @@ def search_shape(ranker, M: int, N: int, K: int, k: int, dtype=torch.float16, or
 _DTYPE_NAMES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
 
 
+class _LtOnly:
+    """The `ranker` of a cuBLASLt-only search (`select_kernel(LT_ONLY, ...)`): there is no Triton ranker yet."""
+
+    def __repr__(self):
+        return "LT_ONLY"
+
+
+LT_ONLY = _LtOnly()
+
+
 def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, frequent: bool | None = None,
                   policy: KPolicy = KPolicy(), lt_n: int = 16, order: str = "diverse", dtype=torch.float16,
                   cache=True, use_bundle: bool = True, lt_knn: int | None = None, lt_rank: int = RANK_DEFAULT,
-                  router: bool | str = "auto", serve_stale: bool = False) -> dict:
+                  router: bool | str = "auto", serve_stale: bool = False,
+                  extra: dict | Callable[[], dict] | None = None) -> dict:
     """First-use kernel selection for one shape with the call-count-aware k policy. `calls` (expected launches) or
     `frequent` (explicit) come from the caller; the ranker cannot know them. Searches the policy's k Triton candidates
     plus cuBLASLt's heuristic top lt_n (0 = Triton only) plus, with lt_n > 0, the configs the deep searches of the lt_knn
@@ -394,7 +408,16 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
         `serve_stale=True` also returns a soft-stale entry (timed under another driver / torch / Triton / cuBLASLt / clock /
         model set on this GPU; `tune/winner_cache.py`): it is run once through the correctness gate in this environment
         (recorded, so later processes skip it; a failure is a miss), then served with reason "cached_stale" and `stale` =
-        the differing fields, so the caller can queue a re-search. Default False: a stale entry is a miss, as before."""
+        the differing fields, so the caller can queue a re-search. Default False: a stale entry is a miss, as before.
+        `extra`: caller fields added to the stored line (`WinnerCache.put(extra=...)`; lscli stores `torch_us` for its
+        dispatch rule). A zero-argument callable is called after the search, just before the line is written, so it can
+        time something in the same state the candidates were timed in (lscli times torch.matmul there, as its daemon's
+        worker does); if it raises, nothing is stored (warned) and the selection is still returned. Not called on a
+        cache hit or a skipped shape.
+
+    `ranker=LT_ONLY` (no Triton ranker for this GPU yet, e.g. lscli before any model set exists) searches cuBLASLt alone:
+    k = 0 whatever the policy, no cuBLASLt proposals (lt_knn = lt_rank = 0), no router, and the entry is stored with k = 0, so a later search with a ranker is wider
+    and replaces it. With lt_n = 0 too there is nothing to search: choice None, reason "no_candidates"."""
     import warnings
     bundle_serves = False
     if use_bundle:
@@ -406,6 +429,9 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
     except Exception as e:                          # e.g. the environment cannot be read: select without a cache
         warnings.warn(f"winner cache unavailable ({type(e).__name__}: {e}); searching without it")
         wc = None
+    lt_only = ranker is LT_ONLY
+    if lt_only:
+        lt_knn = lt_rank = 0                        # the heuristic alone, as the lscli daemon searches without models
     if lt_n and lt_rank:
         from baselines.cublaslt_rank import ranker as _lt_ranker
         if _lt_ranker() is None:
@@ -415,10 +441,12 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
     if not lt_n:
         lt_knn = lt_rank = 0
     rt = None
-    if lt_n and (router is True or (router == "auto" and not bundle_serves)):
+    if lt_n and not lt_only and (router is True or (router == "auto" and not bundle_serves)):
         from tune.router import router as _router
         rt = _router()
-    k = policy.k_for(calls, frequent)
+    k = 0 if lt_only else policy.k_for(calls, frequent)
+    if lt_only and not lt_n:
+        return {"k": 0, "reason": "no_candidates", "rank_s": 0.0, "cached": False, "choice": None, "candidates": []}
     dname = _DTYPE_NAMES.get(dtype, str(dtype))
     if wc is not None:
         try:
@@ -438,15 +466,16 @@ def select_kernel(ranker, M: int, N: int, K: int, *, calls: int | None = None, f
     r = search_shape(ranker, M, N, K, k, dtype, order, lt_n,
                      **({"lt_knn": lt_knn} if lt_knn else {}), **({"lt_rank": lt_rank} if lt_rank else {}),
                      **({"router": rt, "confirm": ROUTER_CONFIRM} if rt is not None else {}))
-    out = {"k": k, "reason": "frequent" if k == policy.k_frequent and k != policy.k else "default", "rank_s": r["rank_s"],
-           "cached": False}
+    reason = "lt_only" if lt_only else "frequent" if k == policy.k_frequent and k != policy.k else "default"
+    out = {"k": k, "reason": reason, "rank_s": r["rank_s"], "cached": False}
     if r.get("skipped"):
         return {**out, "skipped": r["skipped"], "choice": None, "candidates": []}
     choice = choose(r["candidates"], k)
     if wc is not None:
         try:
             wc.put(M, N, K, dname, k=k, lt_n=lt_n, lt_knn=lt_knn, lt_rank=lt_rank, choice=choice, candidates=r["candidates"], order=order,
-                   ranker=f"lgbm_rank/{getattr(ranker, 'features', None) or 'v1'}")
+                   ranker=None if lt_only else f"lgbm_rank/{getattr(ranker, 'features', None) or 'v1'}",
+                   extra=extra() if callable(extra) and choice.get("key") is not None else extra)
         except Exception as e:
             warnings.warn(f"winner cache write failed ({type(e).__name__}: {e})")
     return {**out, "choice": choice, "candidates": r["candidates"]}

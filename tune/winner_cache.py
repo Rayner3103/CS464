@@ -238,17 +238,19 @@ class WinnerCache:
         return True
 
     def reload(self) -> None:
-        """(Re)read the file; hard-stale lines (another GPU, changed kernel source) and unreadable lines are skipped."""
-        self._rows, self._verified = {}, set()
+        """(Re)read the file; hard-stale lines (another GPU, changed kernel source) and unreadable lines are skipped. The
+        new tables are built aside and swapped in at the end, so a reader in another thread sees the old table or the new
+        one, never an empty or half-filled one."""
+        rows, verified = {}, set()
         self._stamp = self._file_stamp()     # taken before reading: a line appended meanwhile costs one more reload, never a miss
         try:
             lines = self.path.read_text(errors="replace").splitlines()   # damaged bytes spoil their line, not the file
         except OSError:
-            return
+            lines = []
         for r, line in self._parse(lines):
             if r.get("kind") == "verified":
                 if r.get("env") == self.env:
-                    self._verified.add(r.get("id"))
+                    verified.add(r.get("id"))
                 continue
             t, fields = tier(r, self.env)
             if t == "hard":
@@ -256,7 +258,8 @@ class WinnerCache:
             r = {k: v for k, v in r.items() if k not in _RESERVED}
             r["id"] = _row_id(r, line)
             r["_stale"] = fields
-            self._rows.setdefault(self._key(r["M"], r["N"], r["K"], r["dtype"]), {})[t] = r
+            rows.setdefault(self._key(r["M"], r["N"], r["K"], r["dtype"]), {})[t] = r
+        self._rows, self._verified = rows, verified
 
     def __len__(self) -> int:
         """Shapes with a current entry."""
@@ -287,6 +290,12 @@ class WinnerCache:
             if self._wide_enough(r, k, lt_n, lt_knn, lt_rank):
                 return self._out(r)
         return None
+
+    def entries(self, allow_stale: bool = True) -> list[dict]:
+        """Every entry `get` could return for some width: the current one of each shape and, with allow_stale, the
+        soft-stale one (both, when a shape has both)."""
+        tiers = ("current", "soft") if allow_stale else ("current",)
+        return [self._out(v[t]) for v in self._rows.values() for t in tiers if t in v]
 
     def stale_entries(self) -> list[dict]:
         """The soft-stale entries `get(allow_stale=True)` can still return: those of shapes with no current entry, and
@@ -329,8 +338,10 @@ class WinnerCache:
                 self._stamp = self._stamp_of(os.fstat(f.fileno()))
 
     def put(self, M: int, N: int, K: int, dtype: str, *, k: int, lt_n: int, choice: dict, candidates: list[dict] | None = None,
-            order: str | None = None, ranker: str | None = None, lt_knn: int = 0, lt_rank: int = 0) -> dict | None:
+            order: str | None = None, ranker: str | None = None, lt_knn: int = 0, lt_rank: int = 0,
+            extra: dict | None = None) -> dict | None:
         """Store a search result's winner in the current environment. Searches that found no valid kernel are not stored.
+        `extra` adds caller fields to the line (lscli: `torch_us`); they cannot overwrite the entry's own fields.
         Returns the entry."""
         if not choice or choice.get("key") is None:
             return None
@@ -341,6 +352,7 @@ class WinnerCache:
                "choice": {x: choice.get(x) for x in ("key", "family", "mode", "rank", "compile_s", "time_s")},
                "winner_us": win.get("graph_us") if choice.get("mode") == "graph" else win.get("cold_us"),
                "timestamp": time.time()}
+        row = {**{k: v for k, v in (extra or {}).items() if k not in _RESERVED}, **row}
         self._append(row)
         self._rows.setdefault(self._key(M, N, K, dtype), {})["current"] = {**row, "_stale": []}
         return row
