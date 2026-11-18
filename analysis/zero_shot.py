@@ -423,7 +423,7 @@ def _main(argv=None):
         files = [f"{(m + '_' if m else '') + v}={out_name(v, m)}" for m in find_models(data) for v in VARIANTS if (data / out_name(v, m)).exists()]
         m_rank = max((json.loads(l).get("lt_rank", 0) for p in data.glob("zero_shot*_*.jsonl") if not p.name.startswith("zero_shot_stage2")
                       for l in p.read_text().splitlines()), default=0)
-        be = "torch,triton:sweep:8,triton:picks,cublaslt:16" + (f",cublaslt_rank:{m_rank}" if m_rank else "")
+        be = "torch,triton:sweep:8,triton:picks,cublaslt:16" + (f",cublaslt_rank:{m_rank}:skip16" if m_rank else "")
         print(f"{n} shapes -> {picks}\n{lt}\n\nRun on the idle GPU (never alongside another GPU job), then score:\n"
               f"  export TUNE_SWEEP_DIR={data / args.screen} TUNE_PICKS={picks}\n"
               f"  python -m tune {lock}benchmark --shapes-file {data / args.screen / 'subset.json'} --backends {be} --cache-modes cold --out-name results_zero_shot.jsonl\n"

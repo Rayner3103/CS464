@@ -92,7 +92,7 @@ We repeated the whole recipe on an **RTX 2060** (retrained from scratch on 56 sh
 
 - **Selection quality is similar** on both GPUs (typical shape 0.7–1.5% off the best, unlucky 5% about 7–8% off, worst 1% 9–10% on the 3080 and 13% on the 2060). With only 27 shapes we can say "no clear difference", not "equal".
 - **But the Triton kernels are far slower than cuBLASLt on the 2060** (median 0.43× of B3+, and 0.24× on jobs of 50 µs or more). The compiled Triton code had no tensor-core instructions on this GPU/compiler version. We did not test whether a different setting fixes this.
-- Reading: **the selector transfers, the kernel family may not.** The model is not shared between GPUs (a zero-shot test, using the 3080's trained model on the 2060, is still to do).
+- Reading: **the selector transfers, the kernel family may not.** The zero-shot test (the 3080's trained model used unchanged) has since been run on the 2060 and on an RTX 3090; the answer is in [chapter 5](05_transferability.md): it fails on the 2060 and works on the 3090.
 
 ## 3.7 Honest limits
 
@@ -102,4 +102,4 @@ We repeated the whole recipe on an **RTX 2060** (retrained from scratch on 56 sh
 - The 150 tail shapes were chosen after seeing where training errors were, and while analysing we had also seen held-out shapes with N ≈ 1. No held-out shape was used in any fit, but that regime was not picked in perfect isolation (noted in `reports/week1.md`).
 
 ---
-Previous: [2. Baselines](02_baselines.md) · Next: [4. Shapes](04_shapes.md)
+Previous: [2. Baselines](02_baselines.md) · Next: [4. Shapes](04_shapes.md) · Later: [5. Transferability](05_transferability.md), [6. Shipping](06_shipping.md)

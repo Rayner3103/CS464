@@ -19,7 +19,7 @@ before it existed, and a result is never wrong because of a miss. But it holds o
 | **Triton 3.7.1** (the compiler files are hashed into every key) | every lookup misses; everything compiles on first use |
 | **one GPU architecture: sm_86** (RTX 3080, RTX 3090). A cubin is SASS for one architecture; the `ptxas` version is also in the key | same (the RTX 2060 is sm_75: no hit) |
 | **the current `kernels/triton_matmul.py`** (kernel source is in the key) | same; rebuild after any edit |
-| **the kernels the v1 and v2 rankers can propose** (union of their pools: 1,174 configs) **+ the 5 hand-picked configs** | a config outside the pool (`triton:<any key>`) or a retrained ranker's new picks compile on first use; rebuild after retraining |
+| **the kernels the v1 and v2 rankers can propose** (union of the 3080's and the 3090's pools: 1,690 configs; the 3080's alone were 1,176) **+ the 5 hand-picked configs** | a config outside the pool (`triton:<any key>`) or a retrained ranker's new picks compile on first use; rebuild after retraining |
 | **fp16** | bf16 compiles on first use (`bundle build --dtypes fp16,bf16` adds it) |
 | **16-byte-aligned base pointers and the contiguous row-major strides `TritonMatmul` passes** (torch allocations qualify) | a sliced or transposed view compiles a new variant |
 
@@ -35,7 +35,17 @@ Also not covered:
 The winner cache is per machine and per environment (GPU, Triton, cuBLASLt version, driver), never expires by itself, and stores the
 fastest of one short online timing (10 cold samples, one placement). See the module docstring for the rest.
 
-## What was built and measured (RTX 3080, Triton 3.7.1, 2026-11-04)
+## What was built and measured (RTX 3080, Triton 3.7.1)
+
+**2026-11-10 rebuild (current): the union of the 3080's and the 3090's ranker pools.** The 3090's own v1 / v2 rankers (retrained, 1,252 configs) share only 59% of their pool with the 3080 bundle's (514 configs missing; 100 of 430 Triton candidates of the 3090's v2 run would have compiled on first use). Built with
+`python -m tune bundle build --pool <3080>/lgbm_rank <3080>/lgbm_rank_v2 <3090>/lgbm_rank <3090>/lgbm_rank_v2` on the 3080 (sm_86, the same SASS target):
+**1,690 configs -> 30,315 `_matmul_kernel` + 12 `_splitk_reduce_kernel` = 30,327 kernels, 1,179 MiB** of cubin + json, 0 compile errors, 335 s on 10 workers
+(the earlier build's scratch cache was reused, so this is not a from-scratch time). Coverage gate `bundle verify --per-shape 0` over every suite + edge shape x runnable union-pool config:
+**640,233 pairs, 20,057 distinct kernels loaded from the bundle, 0 misses**, 6 kernels launched for real matched torch.matmul. `bundle pack`: **25.4 MiB** archive (178 s);
+`unpack` 14 s into 1.5 GiB on disk, byte-identical to the packed tree. **Not run on the 3090 itself**: the check proves coverage and that the cubins load on an sm_86 device; a `bundle verify` with the same `--pool` stems on the 3090 is still open.
+Commit history: the archive grew from 19.2 to 25.4 MiB (+25 MiB in git history).
+
+The numbers below are the first build (3080 pools only, 2026-11-04).
 
 - **Enumeration.** 1,176 configs (the 1,174-config v2 pool contains v1's 868; plus the 2 hand-picked ones it lacks) x every reachable
   argument specialization = **21,175 `_matmul_kernel` + 12 `_splitk_reduce_kernel`** binaries. Triton specializes each integer argument as
@@ -72,7 +82,7 @@ fastest of one short online timing (10 cold samples, one placement). See the mod
 ```bash
 python -m tune bundle build                  # GPU idle. compile every kernel the pools can launch (resumable), write kernels/bundle/
 python -m tune bundle verify --per-shape 0   # the gate: 0 compiles over every suite shape x runnable pool config
-python -m tune bundle pack                   # kernels/bundle -> kernels/bundle.tar.xz (the file to commit, 19 MiB)
+python -m tune bundle pack                   # kernels/bundle -> kernels/bundle.tar.xz (the file to commit, 25 MiB)
 python -m tune bundle status                 # does the bundle match this Triton / GPU? lookup counters
 python -m tune bundle unpack                 # what install() does on a fresh clone
 ```
@@ -107,5 +117,5 @@ c = run()
 ## When to rebuild
 
 After a Triton upgrade, a change to `kernels/triton_matmul.py`, retraining a ranker (new pool), or moving to a new architecture:
-`bundle build && bundle verify --per-shape 0 && bundle pack`. Every committed archive adds ~19 MiB to the git history; if it will be rebuilt
+`bundle build && bundle verify --per-shape 0 && bundle pack`. Every committed archive adds ~25 MiB to the git history; if it will be rebuilt
 often, track it with Git LFS instead.

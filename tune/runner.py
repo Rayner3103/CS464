@@ -39,7 +39,7 @@ class Candidate:
 def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False,
                    dtype: torch.dtype = torch.float16) -> list[Candidate]:
     """Backend spec strings: torch | triton_tutorial | triton:handpicked | triton:sweep[:k] | triton:<config_key> |
-    cublaslt[:N] | cublaslt_deep[:budget_s] | cublaslt_knn[:k] | cublaslt_rank[:m].
+    cublaslt[:N] | cublaslt_deep[:budget_s] | cublaslt_knn[:k] | cublaslt_rank[:m[:skip16]].
 
     triton:sweep[:k] expands to the k fastest configs (default 8) of the stage-1 screen for this shape.
     triton:portfolio[:n] expands to the first n (default 29) members of the tune-fitted greedy portfolio
@@ -54,7 +54,8 @@ def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False
     cublaslt_knn[:k] expands to the configs the deep searches of the k (default 5) nearest TUNE shapes found (top 2 each;
     baselines/cublaslt_knn.py), the learned-from-neighbours stand-in for the offline search.
     cublaslt_rank[:m] expands to the m (default 10) configs a LightGBM ranker trained on the full tune-shape screen predicts
-    fastest among all configs valid for this shape (baselines/cublaslt_rank.py, model data/<hw>/lt_rank).
+    fastest among all configs valid for this shape (baselines/cublaslt_rank.py, model data/<hw>/lt_rank). `cublaslt_rank:m:skip16` leaves out
+    the configs the heuristic top-16 already holds, exactly the list `tune online --lt-n 16 --lt-rank m` times; use it in a stage 2 that scores such a run.
     """
     from baselines.torch_mm import TorchMatmul
     from baselines.triton_tutorial import TritonTutorialMatmul
@@ -73,8 +74,17 @@ def candidates_for(spec: str, M: int, N: int, K: int, prune_shapes: bool = False
         return [Candidate(c.family, c.key, c.cfg, c) for c in knn_candidates(M, N, K, dtype, k)]
     if spec == "cublaslt_rank" or spec.startswith("cublaslt_rank:"):
         from baselines.cublaslt_rank import candidates as rank_candidates
-        m = int(spec.split(":", 1)[1]) if ":" in spec else 10
-        return [Candidate(c.family, c.key, c.cfg, c) for c in rank_candidates(M, N, K, dtype, m)]
+        parts = spec.split(":")[1:]
+        m = int(parts[0]) if parts else 10
+        skip = None
+        if "skip16" in parts[1:]:
+            # The online search (`select_kernel(lt_n=16, lt_rank=m)`) takes the ranker's top-m configs the heuristic top-16 does NOT already
+            # hold, so its picks sit at ranker positions up to m + 16 and carry indices counted among the kept ones. Without skip16 a stage 2
+            # times a different (shorter, re-indexed) list and a pick from it has no timing: analysis.ranker_compare dies with StopIteration.
+            from baselines.cublaslt import candidates as lt_candidates
+            from baselines.cublaslt_knn import cfg_tuple
+            skip = {cfg_tuple(c.cfg) for c in lt_candidates(M, N, K, dtype, 16)}
+        return [Candidate(c.family, c.key, c.cfg, c) for c in rank_candidates(M, N, K, dtype, m, skip=skip)]
     if spec == "cublaslt" or spec.startswith("cublaslt:"):
         from baselines.cublaslt import candidates as lt_candidates
         n = int(spec.split(":", 1)[1]) if ":" in spec else 16

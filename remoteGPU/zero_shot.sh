@@ -199,7 +199,7 @@ if stage stage2; then
     "${ZS[@]}" picks
     export TUNE_SWEEP_DIR="$D/sweep_screen_heldout" TUNE_PICKS="$D/zero_shot_stage2_picks.json"
     BACKENDS="torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_deep:20"
-    [ "$LT_RANK" -gt 0 ] && BACKENDS="torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_rank:$LT_RANK,cublaslt_deep:20"
+    [ "$LT_RANK" -gt 0 ] && BACKENDS="torch,triton:sweep:8,triton:picks,cublaslt:16,cublaslt_rank:$LT_RANK:skip16,cublaslt_deep:20"
     # `cublaslt_rank:M` expands to what this process's ranker proposes: a zero-shot model needs a pass per SM-count variant (as_is, native);
     # `benchmark` resumes per (shape, candidate key), so a second pass only times the picks the first did not propose.
     VARIANTS=(default); [ "$LT_MODE" = "zero_shot" ] && VARIANTS=(as_is native)

@@ -76,7 +76,7 @@ A selector learns "this shape likes this config" on one GPU. A different GPU cha
 | **GPU memory (VRAM)** (3080: 10 GB, 2060: 6 GB) | very large shapes do not fit, and compiling many configs in parallel can run out of memory |
 | **Clock speed, power cap, driver version** | change timings by a few percent, so we lock the clock at 1755 MHz and only compare runs with the same driver |
 
-**Take-away:** the *recipe* (screen → train → race a few picks) moved to a second GPU and worked, but the *trained model* and the *numbers* must be redone per GPU (the 2060 retrain took about 10 hours of sweeping).
+**Take-away:** the *recipe* (screen → train → race a few picks) moved to a second GPU and worked, but the *trained model* and the *numbers* must be redone per GPU (the 2060 retrain took about 10 hours of sweeping). Chapter 5 tests this properly on two more GPUs, including using the trained model unchanged.
 
 ---
 Next: [2. Baselines](02_baselines.md)

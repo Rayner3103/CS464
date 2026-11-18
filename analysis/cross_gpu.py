@@ -35,6 +35,7 @@ from analysis import ranker_compare as rc
 from analysis import zero_shot as zs
 
 EPS = rc.EPS   # {"small": 1.05, "large": 1.02}: tie margins below / above 50 us
+PICK_FAMILIES = rc.PICK_FAMILIES   # every family a joint choice can come from (incl. the k-NN and learned-ranker proposals)
 
 
 def heldout_shapes(data: Path) -> set:
@@ -122,9 +123,9 @@ def stage2_times(rows: list[dict], ref: dict, cold: dict, k: int, joint: bool = 
             continue
         key = (r["choice"][str(k)] if joint else chosen(r, k))["key"]
         src = ref[s]["src"]
-        t = next((src[f][key] for f in ("tri", "lth", "ltd") if key in src[f]), None)
+        t = next((src[f][key] for f in PICK_FAMILIES if key in src[f]), None)
         if t is None:  # not timed in this mode: the cold session
-            t = next((cold[s][f][key] for f in ("tri", "lth", "ltd") if key in cold[s][f]), None)
+            t = next((cold[s][f][key] for f in PICK_FAMILIES if key in cold[s][f]), None)
         if t is not None:
             out[s] = t
     return out
@@ -156,7 +157,7 @@ def joint_summary(rows: list[dict], ref: dict, cold: dict, k: int, shapes) -> di
     t = stage2_times(rows, ref, cold, k, joint=True)
     sp = np.array([ref[s]["b3p"] / v for s, v in t.items() if s in shapes])
     fam = collections.Counter(r["choice"][str(k)].get("family", "triton") for r in rows)
-    return {"n": len(rows), "cublaslt": int(fam.get("cublaslt", 0)), "covered": int(len(sp)),
+    return {"n": len(rows), "cublaslt": int(sum(v for f, v in fam.items() if f.startswith("cublaslt"))), "covered": int(len(sp)),
             **({"median": float(np.median(sp)), "p10": float(np.percentile(sp, 10)), "within_5pct": int((sp >= 0.95).sum())} if len(sp) else {})}
 
 
