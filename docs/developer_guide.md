@@ -33,7 +33,7 @@ git switch learned-selectors
 | Branch | Holds |
 |---|---|
 | `learned-selectors` | The newest code: the research harness, the shipped selector and lscli. Work from here |
-| `master` | The default branch, and the ref the installer clones. It is behind `learned-selectors` until the two are merged; until then the one-line install fails |
+| `master` | The default branch, and the ref the installer clones: what users get. Updated from `learned-selectors` by a merge PR (last: #26, 2026-11-19) |
 | `learned-selector-cli` | lscli's integration branch (PRs #2-#23), merged into `learned-selectors` by #24 |
 | `baseline` | The baseline phase as it stood on 2026-10-19 (before the learned selectors) |
 
@@ -270,12 +270,7 @@ checkout.
 ## 8. Open items
 
 Collected from [`AGENTS.md` section 9](../AGENTS.md#9-open-next-steps), [`docs/lscli/plan.md` section 4](lscli/plan.md#4-open-after-v1)
-and [spec section 9](lscli/spec.md#9-known-limitations-v1) (2026-11-18).
-
-**Release**
-
-* Merge `learned-selectors` into `master`. The installer and the user guide install from `master`, which has no
-  `install/` or `lscli/` yet.
+and [spec section 9](lscli/spec.md#9-known-limitations-v1) (2026-11-19).
 
 **Selector**
 
