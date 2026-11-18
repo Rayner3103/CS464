@@ -1,0 +1,545 @@
+"""lscli training orchestration (lscli/training.py + the daemon's train tasks). A stand-in for pipeline/train_best.sh
+(LSCLI_TRAIN_SCRIPT) keeps train_best's run-directory conventions (mode, hw_id, stamps/<stage>.done, models/) so the
+whole first training, a retraining after a cuBLASLt change, CPU stages under a busy GPU and a preempted stage run in
+seconds without a GPU. The real script's stages were not run here (hours of GPU)."""
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+from lscli import cli, gate, training
+from lscli.files import write_json
+from lscli.paths import Paths
+
+REPO = Path(__file__).resolve().parent.parent
+RANKER = REPO / "pipeline/runs/quick-20261029-095746/data/lgbm_rank"
+HW = "testgpu_sm86_68sms_10gb"
+ENV = {"hw_id": HW, "triton": "3.7.1", "cublaslt": 130101, "driver": "595.99.02", "kernel_src": "abc", "torch": "2.13.0"}
+
+FAKE = r"""#!/usr/bin/env bash
+RUN=""; STAGE=""; MODE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in --run-dir|--resume) RUN="$2"; shift ;; --only) STAGE="$2"; shift ;; --full) MODE=full ;; --quick) MODE=quick ;; --smoke) MODE=smoke ;; esac
+  shift
+done
+# like train_best.sh: hold pipeline/.lock for the whole run, refuse a busy GPU in preflight, print a lot through tee
+exec 9>"$LSCLI_HOME/src/pipeline/.lock"
+flock -n 9 || { echo "another pipeline run holds pipeline/.lock" >&2; exit 7; }
+sleep "${FAKE_HOLD_S:-0}"                                       # a stage that outlasts the watcher's polls
+if [[ "$STAGE" == preflight && -f "$FAKE_BUSY" ]]; then echo "GPU busy" >&2; exit 8; fi
+head -c 200000 /dev/zero | tr '\0' 'x' | fold -w 100 | tee /dev/null
+if [[ "$STAGE" == "$FAKE_FAIL_STAGE" ]]; then exit 1; fi
+mkdir -p "$RUN/stamps" "$RUN/data/$FAKE_HW" "$RUN/reports"
+[[ -f "$RUN/mode" ]] || echo "${MODE:-full}" > "$RUN/mode"
+echo "$FAKE_HW" > "$RUN/hw_id"
+echo "$STAGE" >> "$RUN/ran.txt"
+echo "$STAGE" > "$RUN/reports/last.txt"
+if [[ "$STAGE" == "$FAKE_SLOW_STAGE" && ! -f "$RUN/slow-once" ]]; then
+  touch "$RUN/slow-once"; echo '{"key": 1}' > "$RUN/data/$FAKE_HW/inflight.json"; sleep 30
+fi
+case "$STAGE" in
+  tune_sweep) mkdir -p "$RUN/data/$FAKE_HW/sweep_screen"; echo shape > "$RUN/data/$FAKE_HW/sweep_screen/a.json" ;;
+  lt_screen) mkdir -p "$RUN/data/$FAKE_HW/lt_screen"; date +%s%N > "$RUN/data/$FAKE_HW/lt_screen/a.json" ;;
+  package) mkdir -p "$RUN/models"; cp "$FAKE_RANKER.txt" "$RUN/models/lgbm_rank_v2.txt"; cp "$FAKE_RANKER.json" "$RUN/models/lgbm_rank_v2.json" ;;
+esac
+touch "$RUN/stamps/$STAGE.done"
+"""
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    monkeypatch.setenv("LSCLI_HOME", str(tmp_path / "home"))
+    cfg = tmp_path / "c.toml"
+    cfg.write_text('[idle]\nwindow = ""\ngpu_idle_minutes = 0\nrequire_ac = false\nbackoff_minutes = 1\n')
+    monkeypatch.setenv("LSCLI_CONFIG", str(cfg))
+    script = tmp_path / "train_best.sh"
+    script.write_text(FAKE)
+    monkeypatch.setenv("LSCLI_TRAIN_SCRIPT", str(script))
+    monkeypatch.setenv("FAKE_HW", HW)
+    monkeypatch.setenv("FAKE_RANKER", str(RANKER))
+    monkeypatch.setenv("FAKE_BUSY", str(tmp_path / "busy"))
+    paths = Paths().ensure()
+    (paths.src / "pipeline").mkdir(parents=True)
+    (paths.src / "pipeline" / ".lock").touch()
+    return paths
+
+
+def _daemon(home, snapshot=None, env=None, local_now=None):
+    from lscli.daemon import Daemon
+    kw = {"local_now": local_now} if local_now else {}
+    d = Daemon(home, None, snapshot=snapshot or (lambda: gate.GpuSnapshot([], 0, True, {})), battery=lambda: False, **kw)
+    d.identity, d.hw_id, d.daemon_env = {"uuid": "GPU-x"}, HW, dict(env or ENV)
+    d._refresh_daemon_env = lambda: None             # the test controls the daemon's environment
+    d.load_models()
+    return d
+
+
+# ---------------------------------------------------------------------------------------------- pure functions
+def test_stage_sets():
+    first = training.stages_for({"first"}, with_bundle=False)
+    assert first[0] == "preflight" and first[-2:] == ["package", "summary"] and "bundle" not in first
+    assert "bundle" in training.stages_for({"first"}, with_bundle=True)
+    lt = training.stages_for({"cublaslt"}, False)
+    assert lt == ["env", "lt_screen", "lt_fit", "tune_stage2_cold", "tune_stage2_graph", "router_fit", "package", "summary"]
+    tri = training.stages_for({"triton"}, False)
+    assert {"env", "check", "heldout_sweep", "selectors"} <= set(tri) and "lt_screen" not in tri
+    assert "preflight" not in training.CPU_STAGES                          # train_best's preflight wants an idle GPU
+    assert set(training.stages_for({"triton", "cublaslt"}, False)) == set(tri) | set(lt)
+    assert {"selectors", "train_v1"}.isdisjoint(training.CPU_STAGES)        # both run the online search on the GPU
+
+
+def test_changes():
+    assert training.changes(None, ENV) == {"first"}
+    assert training.changes(ENV, ENV) == set()
+    assert training.changes(ENV, {**ENV, "driver": "600"}) == set()           # driver only: winners re-searched instead
+    assert training.changes(ENV, {**ENV, "cublaslt": 1}) == {"cublaslt"}
+    assert training.changes(ENV, {**ENV, "kernel_src": "z", "cublaslt": 1}) == {"triton", "cublaslt"}
+
+
+def test_seed_links_frozen_outputs_copies_the_rest_and_drops_rerun_stages(tmp_path):
+    prev = tmp_path / "1"
+    data = prev / "data" / HW
+    (data / "sweep_screen").mkdir(parents=True)
+    (data / "lt_screen").mkdir()
+    (prev / "stamps").mkdir()
+    (prev / "reports").mkdir()
+    (prev / "logs").mkdir()
+    (prev / "hw_id").write_text(HW)
+    (data / "sweep_screen" / "s.json").write_text("tri")
+    (data / "sweep_screen" / "big.json").write_bytes(b"x" * training.LINK_MIN_BYTES)
+    (data / "lt_screen" / "l.json").write_text("old lt")
+    (data / "lt_rank.txt").write_text("old model")
+    (prev / "reports" / "r.md").write_text("report")
+    (prev / "logs" / "x.log").write_text("log")
+    for st in ("tune_sweep", "lt_screen", "lt_fit"):
+        (prev / "stamps" / f"{st}.done").touch()
+    new = tmp_path / "2"
+    training.seed(prev, new, ["lt_screen", "lt_fit"])
+    nd = new / "data" / HW
+    assert (nd / "sweep_screen" / "big.json").stat().st_ino == (data / "sweep_screen" / "big.json").stat().st_ino
+    assert (nd / "sweep_screen" / "s.json").stat().st_ino != (data / "sweep_screen" / "s.json").stat().st_ino  # small: copied
+    assert not (nd / "lt_screen").exists() and not (nd / "lt_rank.txt").exists()
+    assert sorted(p.name for p in (new / "stamps").iterdir()) == ["tune_sweep.done"]
+    assert (new / "reports" / "r.md").stat().st_ino != (prev / "reports" / "r.md").stat().st_ino   # copied
+    assert not (new / "logs").exists()
+    (new / "reports" / "r.md").write_text("changed")
+    assert (prev / "reports" / "r.md").read_text() == "report"                # the old run is untouched
+
+
+def test_activate_swaps_in_a_model_set(home, tmp_path):
+    run = tmp_path / "run"
+    (run / "models").mkdir(parents=True)
+    for stem in ("lgbm_rank_v2", "lt_rank"):
+        for ext in (".txt", ".json"):
+            (run / "models" / f"{stem}{ext}").write_text(stem)
+    d = training.activate(home, HW, run, ENV)
+    doc = json.loads((d / "MODELS.json").read_text())
+    assert doc["source"] == "native" and doc["trained_env"] == ENV and set(doc["models"]) == {"triton", "lt_rank"}
+    (run / "models" / "lt_rank.txt").unlink()
+    training.activate(home, HW, run, {**ENV, "cublaslt": 2})
+    doc = json.loads((d / "MODELS.json").read_text())
+    assert set(doc["models"]) == {"triton"} and not (d / "lt_rank.txt").exists() and doc["trained_env"]["cublaslt"] == 2
+    assert not list(home.models.glob(".*"))                                    # no temp / old directories left
+
+
+# ---------------------------------------------------------------------------------------------- daemon-driven training
+needs_ranker = pytest.mark.skipif(not Path(str(RANKER) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
+
+
+def _run_until(d, cond, n=40):
+    for _ in range(n):
+        d.tick()
+        if cond():
+            return True
+    return False
+
+
+@needs_ranker
+def test_first_training_then_retraining_after_a_cublaslt_change(home):
+    d = _daemon(home)
+    assert d.models is None
+    assert _run_until(d, lambda: d.models is not None and d.models.source == "native")
+    run1 = home.train / HW / "1"
+    assert run1.joinpath("ran.txt").read_text().split() == training.stages_for({"first"}, False)
+    doc = json.loads((home.models / HW / "MODELS.json").read_text())
+    assert doc["trained_env"]["cublaslt"] == ENV["cublaslt"] and doc["models"]["triton"]["stem"] == "lgbm_rank_v2"
+    assert json.loads(home.client.read_text())["env_extra"]["models"]["source"] == "native"
+    lt_before = (run1 / "data" / HW / "lt_screen" / "a.json").read_text()
+    # nothing changed: no training
+    d.last_train_check = 0
+    d.tick()
+    assert training.Training(home, HW).state["status"] == "done"
+    # cuBLASLt changed: a seeded run 2 re-runs only the cuBLASLt stages, from empty outputs
+    d.daemon_env["cublaslt"] = 999
+    d.last_train_check = 0
+    old_ids = d.models.ids()
+    assert _run_until(d, lambda: training.Training(home, HW).state.get("status") == "done"
+                      and training.Training(home, HW).state.get("run") == 2)
+    run2 = home.train / HW / "2"
+    ran2 = run2.joinpath("ran.txt").read_text().split()
+    assert ran2[len(training.stages_for({"first"}, False)):] == training.stages_for({"cublaslt"}, False)
+    assert run1.joinpath("ran.txt").read_text().split() == training.stages_for({"first"}, False)   # run 1 untouched
+    assert (run2 / "data" / HW / "lt_screen" / "a.json").read_text() != lt_before
+    assert (run1 / "data" / HW / "lt_screen" / "a.json").read_text() == lt_before
+    assert json.loads((home.models / HW / "MODELS.json").read_text())["trained_env"]["cublaslt"] == 999
+    assert d.models.ids()["source"] == "native"
+    for _ in range(3):                                   # done: no further training starts by itself
+        d.tick()
+    assert training.Training(home, HW).state["run"] == 2
+
+
+def test_smoke_has_the_stages_train_best_lists():
+    """The daemon's stage list is train_best's, minus `install` and the `validate_*` stages it always skips
+    (`--skip-install --skip-validation`); the list is the same in every mode."""
+    out = subprocess.run(["bash", str(REPO / "pipeline/train_best.sh"), "--smoke", "--list-stages"], capture_output=True,
+                         text=True, check=True).stdout.split()
+    assert [s for s in out if s != "install" and not s.startswith("validate_")] == list(training.STAGES)
+
+
+@needs_ranker
+def test_a_smoke_run_is_never_activated_and_a_mode_change_starts_a_fresh_run(home):
+    """smoke: every stage runs, nothing is activated, and the finished run is not repeated. Changing train.mode then
+    starts an unseeded run in the new mode, which is activated as usual."""
+    d = _daemon(home)
+    d.cfg["train"]["mode"] = "smoke"
+    tr = lambda: training.Training(home, HW)                                     # noqa: E731
+    assert _run_until(d, lambda: tr().state.get("status") == "done")
+    run1 = home.train / HW / "1"
+    assert run1.joinpath("mode").read_text().strip() == "smoke"                  # train_best got --smoke
+    assert run1.joinpath("ran.txt").read_text().split() == training.stages_for({"first"}, False)
+    assert not (home.models / HW).exists() and d.models is None                  # nothing activated
+    s = tr().summary()
+    assert s["mode"] == "smoke" and s["activated"] is False
+    assert cli._training_line(s).startswith("training: done (smoke: models not activated")
+    for _ in range(3):                                                           # not repeated
+        d.last_train_check = 0
+        d.tick()
+    assert tr().state["run"] == 1
+    d.cfg["train"]["mode"] = "full"                                              # the user switches to a real run
+    d.last_train_check = 0
+    assert _run_until(d, lambda: d.models is not None and d.models.source == "native")
+    run2 = home.train / HW / "2"
+    assert tr().state["run"] == 2 and tr().state["reason"] == "train.mode changed: smoke -> full"
+    assert run2.joinpath("mode").read_text().strip() == "full"
+    assert run2.joinpath("ran.txt").read_text().split() == training.stages_for({"first"}, False)   # unseeded
+    assert tr().summary()["activated"] is True
+
+
+@needs_ranker
+def test_cpu_stages_run_while_the_gpu_is_busy_and_gpu_stages_wait(home):
+    training.Training(home, HW).begin({"first"}, ["train_v2", "lt_screen"], ENV, "test")
+    d = _daemon(home, snapshot=lambda: gate.GpuSnapshot([4242], 90, True, {4242: "user"}))
+    d.tick()                                             # train_v2 is CPU-only: runs despite the user's job
+    assert training.Training(home, HW).done() == {"train_v2"}
+    for _ in range(3):
+        d.tick()
+    assert training.Training(home, HW).done() == {"train_v2"}        # lt_screen is a GPU stage: waits
+    assert json.loads(home.state.read_text())["state"] == "waiting"
+
+
+def test_a_quick_stage_failure_does_not_restart_the_idle_clock(home, monkeypatch):
+    """The quick-failure check after a stage (preempted or broken?) runs after the job's processes exit, when NVML can
+    still report their utilization: it must not count as a busy GPU."""
+    monkeypatch.setenv("FAKE_FAIL_STAGE", "check")
+    training.Training(home, HW).begin({"first"}, ["check"], ENV, "test")
+    box = {}
+    d = box["d"] = _daemon(home, snapshot=lambda: gate.GpuSnapshot([], 90 if box["d"].job_info else 0, True, {}))
+    d.cfg["idle"]["gpu_idle_minutes"] = 10
+    d.gate.busy_until = d.clock() - 3600
+    assert d.tick().stage == "check"
+    assert d.counters["failed"] == 1 and d.counters["preempted"] == 0     # a broken stage, not a preemption
+    assert d.gate.busy_until < d.clock() - 3000
+
+
+@needs_ranker
+def test_preflight_waits_for_an_idle_gpu(home, tmp_path):
+    d = _daemon(home, snapshot=lambda: gate.GpuSnapshot([4242], 90, True, {4242: "user"}))
+    for _ in range(3):
+        d.tick()
+    assert training.Training(home, HW).done() == set() and d.counters["failed"] == 0
+
+
+@needs_ranker
+def test_our_own_train_best_lock_does_not_preempt_it_but_a_manual_run_blocks_training(home, monkeypatch):
+    import subprocess
+    monkeypatch.setenv("FAKE_HOLD_S", "2.5")             # the watcher polls each second while the stage holds the lock
+    lock = home.src / "pipeline" / ".lock"
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "4"])          # someone runs train_best.sh by hand
+    time.sleep(0.3)
+    d = _daemon(home)
+    d.tick()
+    assert any("pipeline/.lock" in r for r in d.reasons) and training.Training(home, HW).done() == set()
+    holder.wait()
+    d.tick()                                             # our own run holds the same lock all through the stage
+    assert training.Training(home, HW).done() == {"preflight"} and d.counters["preempted"] == 0
+
+
+@needs_ranker
+def test_train_start_ignores_the_window_and_is_cleared_when_done(home):
+    import datetime as dt
+    from lscli import config as cfgmod, control
+    (Path(os.environ["LSCLI_CONFIG"])).write_text('[idle]\nwindow = "01:00-02:00"\ngpu_idle_minutes = 0\nrequire_ac = false\n')
+    d = _daemon(home, local_now=lambda: dt.datetime(2026, 11, 8, 12, 0))
+    d.tick()
+    assert training.Training(home, HW).done() == set() and any("outside window" in r for r in d.reasons)
+    control.train_now(home)
+    assert _run_until(d, lambda: d.models is not None and d.models.source == "native")
+    assert not control.read_control(home).get("train_now")
+
+
+@needs_ranker
+def test_a_stage_that_fails_twice_stops_the_training(home, monkeypatch):
+    from lscli import control
+    monkeypatch.setenv("FAKE_FAIL_STAGE", "check")
+    control.train_now(home)
+    d = _daemon(home)
+    for _ in range(6):
+        d.tick()
+    tr = training.Training(home, HW)
+    assert tr.state["status"] == "failed" and tr.state["failures"] == {"check": 2} and "check" not in tr.done()
+    assert d.counters["failed"] == 2 and not control.read_control(home).get("train_now")
+    d.tick()
+    assert training.Training(home, HW).state["run"] == 1             # no automatic restart after a failure
+    assert training.Training(home, HW).state["status"] == "failed"   # the `train start` made before it failed is spent
+
+
+@needs_ranker
+def test_train_start_continues_a_failed_run_in_the_same_directory(home, monkeypatch, capsys):
+    """After the cause is fixed, `lscli train start` goes on from the failed stage: the finished stages (days of sweeps on
+    a real GPU) are kept, not re-run, and the run activates its models as usual."""
+    from lscli import cli, control
+    monkeypatch.setenv("FAKE_FAIL_STAGE", "train_v2")
+    d = _daemon(home)
+    assert _run_until(d, lambda: training.Training(home, HW).state.get("status") == "failed")
+    run = home.train / HW / "1"
+    before = (run / "ran.txt").read_text().split()
+    assert before[-1] == "tail_sweep" and "train_v2" not in before
+    write_json(home.state, {"hw_id": HW, "pid": 1})
+    capsys.readouterr()
+    assert cli.main(["train", "start"]) == 0
+    assert "continuing failed training run 1 at stage train_v2" in capsys.readouterr().out
+    assert training.Training(home, HW).state["status"] == "failed"   # the daemon un-fails it, not the CLI
+    monkeypatch.delenv("FAKE_FAIL_STAGE")                               # "the cause is fixed"
+    assert _run_until(d, lambda: d.models is not None and d.models.source == "native")
+    tr = training.Training(home, HW)
+    assert tr.state["run"] == 1 and tr.state["status"] == "done" and tr.state["failures"] == {}
+    assert tr.state["continued"][0]["failures"] == {"train_v2": 2}
+    after = (run / "ran.txt").read_text().split()
+    assert after[:len(before)] == before and after[len(before)] == "train_v2" and after.count("tune_sweep") == 1
+    assert not (home.train / HW / "2").exists() and "continue" not in control.read_control(home)
+
+
+@needs_ranker
+def test_a_train_start_made_while_the_failing_stage_ran_does_not_continue_it(home, monkeypatch):
+    """The daemon reads control.json between jobs, so a `train start` issued during a stage's last attempt is only seen
+    after that attempt failed. It was not a request to continue a failed run."""
+    from lscli import control
+    monkeypatch.setenv("FAKE_FAIL_STAGE", "check")
+    d = _daemon(home)
+    orig = d.run_training_stage
+
+    def start_during(stage):                                      # the user runs `train start` while the stage runs
+        if stage == "check" and training.Training(home, HW).state.get("failures", {}).get("check") == 1:
+            control.train_now(home)
+        return orig(stage)
+    d.run_training_stage = start_during
+    assert _run_until(d, lambda: training.Training(home, HW).state.get("status") == "failed")
+    for _ in range(3):
+        d.tick()
+    tr = training.Training(home, HW)
+    assert tr.state["status"] == "failed" and tr.state["failures"] == {"check": 2} and "continued" not in tr.state
+    assert "continue" not in control.read_control(home)                # consumed, not left for later
+
+
+@needs_ranker
+def test_a_pending_retrain_wins_over_continuing(home, monkeypatch):
+    from lscli import control
+    monkeypatch.setenv("FAKE_FAIL_STAGE", "check")
+    d = _daemon(home)
+    assert _run_until(d, lambda: training.Training(home, HW).state.get("status") == "failed")
+    monkeypatch.delenv("FAKE_FAIL_STAGE")
+    control.train_now(home)
+    control.retrain(home, None)
+    d.tick()
+    tr = training.Training(home, HW)
+    assert tr.state["run"] == 2 and tr.state["status"] == "running" and "continued" not in tr.state
+    assert "continue" not in control.read_control(home)
+
+
+@needs_ranker
+def test_a_preempted_stage_is_killed_resumed_and_its_inflight_marker_removed(home, monkeypatch):
+    monkeypatch.setenv("FAKE_SLOW_STAGE", "tune_sweep")
+    d = None
+
+    def snapshot():
+        slow = d is not None and (d.job_info or {}).get("stage") == "tune_sweep" and \
+            time.monotonic() - started[0] > 1.0
+        return gate.GpuSnapshot([4242] if slow else [], 0, True, {4242: "user"})
+    started = [0.0]
+    d = _daemon(home, snapshot=snapshot)
+    orig = d.run_training_stage
+
+    def timed(stage):
+        started[0] = time.monotonic()
+        return orig(stage)
+    d.run_training_stage = timed
+    assert _run_until(d, lambda: d.counters["preempted"] == 1, n=10)
+    run = home.train / HW / "1"
+    assert "tune_sweep" not in training.Training(home, HW).done()
+    assert not (run / "data" / HW / "inflight.json").exists()        # our kill is not a crash of that candidate
+    assert d.backoff_until is not None
+    d.backoff_until = None
+    assert _run_until(d, lambda: "tune_sweep" in training.Training(home, HW).done(), n=5)
+
+
+def test_train_cli(home, capsys):
+    from lscli import cli
+    assert cli.main(["train", "status"]) == cli.EXIT_NO_DAEMON
+    assert cli.main(["train", "retrain", "--stages", "lt_fit,bogus"]) == cli.EXIT_USAGE
+    assert cli.main(["train", "retrain", "--stages", "lt_screen,lt_fit"]) == 0
+    assert json.loads(home.control.read_text())["retrain"]["stages"] == ["lt_screen", "lt_fit"]
+    assert cli.main(["train", "start"]) == 0 and json.loads(home.control.read_text())["train_now"] is True
+    write_json(home.state, {"hw_id": HW, "pid": 1})
+    capsys.readouterr()
+    assert cli.main(["--json", "train", "status"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["status"] == "none" and doc["trained_env"] is None
+
+
+def test_status_training_line_follows_the_run_status():
+    """`lscli status` builds its training line from `status`: `stage` is None whenever no stage is running."""
+    from lscli.cli import _training_line
+    base = {"run": 2, "done": 5, "total": 17, "failures": {}}
+    assert _training_line({"status": "none", "run": None, "stage": None, "done": 0, "total": 0}) == "training: none"
+    assert _training_line({**base, "status": "running", "stage": "tune_sweep"}) == \
+        "training: running stage tune_sweep (run 2, 5/17 stages)"
+    assert _training_line({**base, "status": "done", "stage": None, "done": 17}) == "training: done (run 2, 17/17 stages)"
+    line = _training_line({**base, "status": "failed", "stage": None, "failures": {"train_v2": 2}})
+    assert line.startswith("training: failed at train_v2 (run 2, 5/17 stages") and "None" not in line
+    line = _training_line({**base, "status": "failed", "stage": None, "done": 17})     # the activation failed
+    assert line.startswith("training: failed (run 2, 17/17 stages") and "?" not in line
+    assert _training_line({**base, "status": "running", "stage": None, "done": 17}) == \
+        "training: running (run 2, 17/17 stages)"                                     # stages done, not activated yet
+
+
+@needs_ranker
+def test_requested_retraining_of_some_stages(home):
+    from lscli import control
+    d = _daemon(home)
+    assert _run_until(d, lambda: d.models is not None and d.models.source == "native")
+    control.retrain(home, ["package", "lt_fit"])                       # any order: run in train_best order
+    assert _run_until(d, lambda: training.Training(home, HW).state.get("run") == 2
+                      and training.Training(home, HW).state.get("status") == "done", n=10)
+    ran = (home.train / HW / "2" / "ran.txt").read_text().split()
+    assert ran[-2:] == ["lt_fit", "package"] and "retrain" not in control.read_control(home)
+    for _ in range(3):                                   # the request was consumed once: no retraining loop
+        d.tick()
+    assert training.Training(home, HW).state["run"] == 2
+    doc = json.loads((home.models / HW / "MODELS.json").read_text())
+    assert doc["models"]["triton"]["id"].startswith("lgbm_rank_v2:") and "lt_fit" in doc["stages"]
+
+
+def test_a_lost_state_file_never_reuses_a_run_directory(home):
+    (home.train / HW / "1").mkdir(parents=True)
+    (home.train / HW / "1" / "precious").write_text("30 h of sweeps")
+    training.Training(home, HW).begin({"first"}, ["preflight"], ENV, "test")
+    assert (home.train / HW / "1" / "precious").exists() and training.Training(home, HW).state["run"] == 2
+
+
+@pytest.mark.parametrize("resolves", [True, False])
+def test_train_best_re_resolves_an_empty_hw_id_left_by_a_killed_stage(tmp_path, resolves):
+    """The real pipeline/train_best.sh (stand-in `python` on PATH): a stage killed between creating and writing hw_id
+    (a daemon preemption) left it empty, and every later --resume died with "could not determine the hardware id"."""
+    import subprocess
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "python").write_text("#!/bin/sh\necho fakehw_sm00\n" if resolves else "#!/bin/sh\nexit 1\n")
+    (bin_ / "python").chmod(0o755)
+    (bin_ / "nvidia-smi").write_text("#!/bin/sh\n")                      # no compute process: the pytest process itself
+    (bin_ / "nvidia-smi").chmod(0o755)                                   # may hold a CUDA context from earlier tests
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "mode").write_text("quick\n")
+    (run / "hw_id").write_text("")
+    r = subprocess.run(["bash", str(REPO / "pipeline" / "train_best.sh"), "--resume", str(run), "--skip-install",
+                        "--skip-validation", "--only", "env", "--clock-lock", "none", "--allow-unlocked"],
+                       cwd=REPO, env={**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}"},
+                       capture_output=True, text=True, timeout=120)
+    if resolves:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert (run / "hw_id").read_text() == "fakehw_sm00\n" and (run / "stamps" / "env.done").exists()
+    else:
+        assert r.returncode != 0 and "could not determine the hardware id" in r.stdout + r.stderr
+        assert (run / "hw_id").read_text() == ""                       # never written empty by this run
+    assert (run / "mode").read_text() == "quick\n" and not list(run.glob("*.tmp.*"))
+
+
+# ---------------------------------------------------------------------------------------------- the real train_best
+HW_3080 = "rtx3080_sm86_68sms_10gb"
+DATA_3080 = Path(os.environ.get("LSCLI_TEST_DATA_3080", str(REPO / "data" / HW_3080)))
+TAIL_INPUTS = ("env.json", "lgbm_rank.txt", "lgbm_rank.json", "learned_search.json", "lgbm_rank_cv_scores.npz",
+               "sweep_screen", "sweep_screen_tail", "sweep_screen_heldout", "lt_screen",
+               "results_lock1755_tune477.jsonl", "results_lock1755_tune477_graph.jsonl")
+TAIL = ("train_v2", "lt_fit", "router_fit", "package", "summary")
+
+
+@pytest.mark.skipif(os.environ.get("LSCLI_SLOW_TESTS") != "1", reason="slow (~7 min of CPU): set LSCLI_SLOW_TESTS=1")
+@pytest.mark.skipif(not all((DATA_3080 / f).exists() for f in TAIL_INPUTS),
+                    reason=f"needs the 3080's GPU-stage outputs in {DATA_3080} (LSCLI_TEST_DATA_3080)")
+def test_the_real_train_best_finishes_a_training_under_the_daemon_and_its_models_are_activated(home, monkeypatch):
+    """The review's missing evidence (#11): the REAL pipeline/train_best.sh, run by the daemon one stage per job, taking
+    its own pipeline/.lock, through to activated models. The GPU stages are pre-stamped and their outputs are a copy of
+    this machine's 3080 run; the daemon runs the CPU stages (train_v2, lt_fit, router_fit, package, summary) while the
+    GPU is busy, so no GPU stage can start and the real fits run (~7 min)."""
+    import shutil
+    monkeypatch.delenv("LSCLI_TRAIN_SCRIPT")                                  # the daemon's default: src/pipeline/
+    shutil.rmtree(home.src)
+    home.src.symlink_to(REPO)                                                # src/ = this checkout (lscli + harness)
+    env = json.loads((DATA_3080 / "env.json").read_text())
+    denv = {"hw_id": HW_3080, "triton": env.get("triton", "3.7.1"), "cublaslt": 130101, "driver": "595.99.02",
+            "kernel_src": "x", "torch": "2.13.0"}
+    d = _daemon(home, snapshot=lambda: gate.GpuSnapshot([4242], 0, True, {4242: "someone else"}), env=denv)
+    d.hw_id = HW_3080
+    d.load_models()                                                          # none yet for this GPU
+    d.cfg["train"]["mode"] = "quick"
+    tr = training.Training(home, HW_3080)
+    tr.begin({"first"}, training.stages_for({"first"}, False), denv, "test: the real tail", mode="quick")
+    run = tr.run_dir
+    data = run / "data" / HW_3080
+    data.mkdir(parents=True)
+    for f in TAIL_INPUTS:
+        (shutil.copytree if (DATA_3080 / f).is_dir() else shutil.copy2)(DATA_3080 / f, data / f)
+    (run / "mode").write_text("quick\n")
+    (run / "hw_id").write_text(HW_3080 + "\n")
+    (run / "stamps").mkdir()
+    for s in tr.state["stages"]:
+        if s not in TAIL:
+            (run / "stamps" / f"{s}.done").write_text("pre-stamped by the test\n")
+    lock = REPO / "pipeline" / ".lock"
+    lock.touch()
+    done = lambda: training.Training(home, HW_3080).state.get("status") == "done"   # noqa: E731
+    assert _run_until(d, done, n=len(TAIL) + 2)
+    st = training.Training(home, HW_3080)
+    assert st.state["activated"] is True and st.summary()["done"] == st.summary()["total"]
+    assert {s for s in TAIL} <= st.done() and d.counters["preempted"] == 0 and not st.state.get("failures")
+    jobs_logs = sorted(p.name for p in (home.logs / "jobs").glob("*-train-*.log"))
+    assert [n.split("-train-")[1][:-4] for n in jobs_logs] == list(TAIL)        # one daemon job per stage, in order
+    for s in TAIL:
+        assert (run / "logs" / f"{s}.log").exists()                           # written by train_best itself
+    for stem in ("lgbm_rank_v2", "lt_rank", "router"):
+        assert (data / f"{stem}.txt").exists() and (run / "models" / f"{stem}.txt").exists()
+    assert json.loads((data / "lt_rank.json").read_text())["hw_id"] == HW_3080 and (run / "SUMMARY.md").exists()
+    doc = json.loads((home.models / HW_3080 / "MODELS.json").read_text())
+    assert doc["source"] == "native" and set(doc["models"]) == {"triton", "lt_rank", "router"}
+    assert doc["models"]["triton"]["stem"] == "lgbm_rank_v2" and doc["run"] == str(run)
+    assert d.models is not None and d.models.source == "native"
+    assert json.loads(home.client.read_text())["env_extra"]["models"]["source"] == "native"
+    assert not gate.lock_held(lock)                                           # train_best's lock went with it
+    for _ in range(2):                                                        # done: nothing else starts
+        d.last_train_check = 0
+        d.tick()
+    assert training.Training(home, HW_3080).state["run"] == 1

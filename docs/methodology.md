@@ -84,6 +84,39 @@ Caveats:
 - These numbers hold only under the standard conditions. A driver update, a different lock, or unlocked clocks means re-running the noise study
   before comparing results.
 
+## Noise floor with the SM clock unlocked (2026-11-13)
+
+Same protocol (`python -m tune --clock-lock none noise --rounds 3 --repeats 50 --n-allocs 3`), same driver 595.99.02, desktop idle, no
+`nvidia-smi -lgc`. Under load the SM clock runs at 1575-1965 MHz (p50 ≈ 1860) and 82-92% of rows are power-capped (locked: 14-19%). Three
+complete sessions, the third after a reboot (34 min after boot, not 2 min as for `…6985`):
+
+| session | when | p95 range across rounds (≥ 50 µs), cold / hot | p99 (≈ worst of 42 kernels), cold / hot |
+|---|---|---|---|
+| `noise-20261113-185827-22be` | 11-13 18:58 | 3.2% / 2.5% | 4.2% / 4.6% |
+| `noise-20261113-190809-53f0` | 11-13 19:08, right after the first | 1.9% / 1.6% | 2.8% / 2.5% |
+| `noise-20261113-205714-0ab2` | 11-13 20:57, after a reboot | 6.1% / 4.5% | 7.8% / 6.7% |
+
+Across the three sessions, at ≥ 50 µs, the range of the session medians is p50 0.42%, **p95 1.35%**, p99 2.3%, max 2.9% (cold) and p50 0.60%,
+**p95 1.90%**, p99 2.7%, max 3.0% (hot); for the kernel ratio p95 1.49% / 1.96%. The session speed shift is ≤ 0.12%. Unlocked kernels run
+4.4% faster than locked at the median (time ratio 0.956).
+
+**Tie margins unlocked (same rule as above: p95 rounded up):**
+- **ε = 2% for kernels ≥ 50 µs still holds** for comparisons between sessions (cross-session p95 1.90% vs 1.78% locked; bootstrap intervals over
+  shapes [0.86, 2.95] vs [0.82, 2.94], not distinguishable).
+- **ε = 5% under 50 µs per launch is unchanged** (cross-session p95 4.2% cold / 5.3% hot; locked 5.3% / 2.4%). By the rule both conditions read 6%.
+- **A single measurement is about twice as noisy.** The rounds of one session disagree more (p95 4.25% / 3.83% vs 1.65% / 1.67% locked), and one
+  full-protocol measurement (one benchmark row) is off the cross-session median by p95 1.84% / 2.01% (p99 4.1% / 3.8%), vs 1.08% / 1.04% locked.
+  The cross-session figure stays at 2% only because each session contributes the median of 3 rounds. On unlocked data a 2% margin is all noise,
+  and a 2-4% win between two single rows is not a reliable win.
+- **The online search's short timing** (10 cold samples, one placement, `tune/online.py`), emulated from the raw samples: a kernel-vs-kernel
+  comparison at ≥ 50 µs is off by p95 **3.5%** (p99 6.1%) vs 2.7% (6.9%) locked. **Use ~4% as the near-tie margin of a deployed, unlocked
+  selector** (3% locked).
+
+The extra spread sits in particular rounds (the first round of each session, at 95-100% power-capped, and the last round of the post-reboot
+session), is per kernel rather than a common drift (it does not cancel in the kernel ratio), and is not explained by the median clock of the round.
+Tables, definitions and the bootstrap: `reports/noise_compare_unlocked.md`, `python -m analysis.noise_compare` (docstring); write-up
+`reports/week1.md` 2026-11-13. Graph-amortized timing is not covered.
+
 ## µs-scale kernels
 
 CUDA event timestamps have 32 ns resolution. Still, per-launch medians of kernels under ~20 µs cluster on a ~1.02 µs grid

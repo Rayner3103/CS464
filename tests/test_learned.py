@@ -344,3 +344,30 @@ def test_rank_v2_native_gpu_with_smaller_limits_marks_unsupported_pool_configs_n
     sc = rk.scores(2048, 2048, 2048)                      # used to raise KeyError: 'bm128_bn128_bk32_w4_s5_g16_sk1'
     assert np.isinf(sc[0]) and np.isfinite(sc[1])
     assert rk.rank(2048, 2048, 2048, 2, order="plain") == [small]
+
+
+def test_rank_v2_takes_a_regression_objective_when_v1_chose_lambdarank(tmp_path):
+    # A 2060 training's v1 grid search chose lambdarank; v2 copied it and LightGBM refused the fit ("Should set group
+    # for ranking task"). v2 is a regression: it takes the best regression entry of v1's own search instead.
+    from analysis.learned import v2_hp
+    v1 = {"objective": "lambdarank", "num_leaves": 63, "n_estimators": 1500}
+    hp, src = v2_hp(tmp_path, {"objective": "regression", "num_leaves": 127, "n_estimators": 800}, log=lambda *_: None)
+    assert hp == {"objective": "regression", "num_leaves": 127, "n_estimators": 800} and "v1 CV-chosen" in src
+    hp, src = v2_hp(tmp_path, v1, log=lambda *_: None)          # no search cache: v1's numbers, regression objective
+    assert hp == {**v1, "objective": "regression"} and "set to regression" in src
+    grid = [{"hp": v1, "mean": 0.040}, {"hp": {"objective": "lambdarank", "num_leaves": 127, "n_estimators": 800}, "mean": 0.041},
+            {"hp": {"objective": "regression", "num_leaves": 255, "n_estimators": 800}, "mean": 0.046},
+            {"hp": {"objective": "regression", "num_leaves": 63, "n_estimators": 1500}, "mean": 0.048}]
+    (tmp_path / "learned_search.json").write_text(json.dumps({"tag": "t", "search": {"lgbm_rank": {"grid": grid}}}))
+    hp, src = v2_hp(tmp_path, v1, log=lambda *_: None, v1_tag="t")   # grid is stored best first
+    assert hp == {"objective": "regression", "num_leaves": 255, "n_estimators": 800} and "learned_search.json" in src
+    hp, src = v2_hp(tmp_path, v1, log=lambda *_: None, v1_tag="other")  # a search of another screen is not used
+    assert hp == {**v1, "objective": "regression"} and "set to regression" in src
+    (tmp_path / "learned_search.json").write_text("{not json")
+    assert v2_hp(tmp_path, v1, log=lambda *_: None)[0] == {**v1, "objective": "regression"}
+
+
+def test_rank_v2_refuses_a_ranking_objective():
+    from analysis.learned import fit_rank_v2
+    with pytest.raises(ValueError, match="v2_hp"):
+        fit_rank_v2({"objective": "lambdarank", "num_leaves": 4, "n_estimators": 5}, *([None] * 10))

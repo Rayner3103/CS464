@@ -4,6 +4,60 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-11-13: noise floor of the RTX 3080 with the SM clock unlocked — ε = 2% (≥ 50 µs) and 5% (< 50 µs) still hold across sessions; a single measurement is about twice as noisy, and the selector's short online timing needs ~4%
+
+**Question.** What tie margin applies when this GPU runs **without** `nvidia-smi -lgc 1755,1755`, as a deployed selector would on a user's desktop? The 2% / 5% margins (methodology, G1) were measured locked.
+
+**What ran.** Three `python -m tune --clock-lock none noise --rounds 3 --repeats 50 --n-allocs 3` sessions (the locked protocol; 30 noise shapes × torch.matmul and `bm128_bn128_bk32_w4_s4_g8_sk1` × cold / hot), desktop idle, driver 595.99.02 (same as the locked sessions), torch 2.13.0+cu130, Triton 3.7.1, harness `d1fb939` (master), clean:
+- `noise-20261113-185827-22be` and `noise-20261113-190809-53f0`, back to back;
+- `noise-20261113-205714-0ab2` **after a reboot**, but 34 min after boot (the locked `…6985` ran 2 min after one), and the reboot also moved the host kernel 7.0.0-42 → 7.0.0-43. So this covers the across-boot component, not "straight after a cold boot".
+- 360 rows each, all complete, every row `valid` (the noise study times two fixed kernels). SM clock 1575-1965 MHz (p50 1860-1875) vs 1575-1755 locked; **power-capped (throttle 0x4) on 92% / 91% / 82% of rows** vs 14-19% locked. Logs `data/<hw>/logs/noise-unlocked-s{1,2,3-postreboot}-20261113.log`.
+- The clock-lock probe of sessions 2 and 3 printed `declared 'none' disagrees with the probe (likely_locked, idle 1755 MHz, load max 1755 MHz)`. It is a false positive: the probe ran on a card still warm from the previous job (session 2) or from boot activity, and the same sessions' rows reach 1905 / 1965 MHz. The probe's "idle clock still high" test is not reliable right after a GPU job.
+- Analysis: new module `analysis/noise_compare.py` (CPU only), which reproduces the locked numbers of the methodology exactly (cross-session p95 1.75% / 1.78%, per-session p95s 1.3-1.8%). Generated tables: `reports/noise_compare_unlocked.md`, `reports/noise_compare_unlocked_summary.json`. Locked reference = the three sessions of the methodology table (`…642a`, `…lock1755`, `…6985`).
+
+**Main result** (≥ 50 µs: 42-44 (shape, kernel) groups and 18-19 kernel pairs per mode; p95 with a 95% bootstrap interval over shapes):
+
+| statistic (≥ 50 µs) | locked, cold / hot | unlocked, cold / hot |
+|---|---|---|
+| **cross-session range of session medians, p95** (the G1 / ε statistic) | 1.75% [0.73, 2.48] / 1.78% [0.82, 2.94] | 1.35% [0.67, 2.93] / 1.90% [0.86, 2.95] |
+| same, p99 / max | 2.26 / 2.54% · 2.56 / 2.99% | 2.30 / 2.93% · 2.65 / 2.95% |
+| cross-session range of the kernel ratio, p95 | 2.05% / 2.11% | 1.49% / 1.96% |
+| within one session, range across the 3 rounds, p95 (p99) | 1.65% (3.66%) / 1.67% (3.56%) | **4.25% (7.05%) / 3.83% (5.04%)** |
+| within one session, range of the kernel ratio across rounds, p95 | 1.96% / 2.21% | 3.67% / 2.90% |
+| one full-protocol measurement vs the cross-session median, p95 (p99) | 1.08% [0.64, 1.38] (2.77%) / 1.04% (2.39%) | **1.84% [1.29, 2.93] (4.11%) / 2.01% (3.77%)** |
+| same, kernel ratio, p95 (p99) | 1.23% (2.51%) / 1.16% (2.69%) | 1.69% (3.32%) / 1.88% (3.16%) |
+| online short timing (10 cold samples, one placement), kernel ratio vs the cross-session ratio, p95 (p99) | 2.70% [1.66, 3.31] (6.91%) | **3.48% [2.67, 4.85] (6.09%)** |
+| session speed shift (geomean vs the group) | -0.06 to +0.03% | -0.12 to +0.08% |
+| time vs locked (median ratio, same kernel) | 1 | 0.956 (p95 1.002, max 1.018) |
+
+| margin (rule of the locked ε: p95 rounded up to a whole percent, worse of cold / hot) | locked | unlocked |
+|---|---|---|
+| **≥ 50 µs, cross-session (ε)** | 2% (1.78%) | **2% (1.90%)** |
+| ≥ 50 µs, cross-session kernel ratio | 3% (2.11%) | 2% (1.96%) |
+| ≥ 50 µs, one measurement vs the reference | 2% (1.08%) | 3% (2.01%; cold 1.84%) |
+| **< 50 µs per launch, cross-session** | 6% (5.30%, cold) | **6% (5.30%, hot; cold 4.18%)** |
+| **online short timing ≥ 50 µs, cold, kernel ratio** | 3% (2.70%) | **4% (3.48%)** |
+
+**Reading.**
+- **The 2% tie margin at ≥ 50 µs holds unlocked** by the same statistic and rule that set it (cross-session p95 1.90% vs 1.78%; the intervals overlap almost completely, so the two are not distinguishable at n = 42). The cross-session tail is also the same (p99 2.3-2.7%, worst kernel 2.9-3.0% in both). The session-to-session speed shift stays ≤ 0.12%: unlocked sessions agree with each other as well as locked ones do.
+- **< 50 µs: the 5% convention is unchanged by unlocking**, and by the rule it reads 6% in both conditions (locked 5.30% cold was already above 5%). What changes is which mode is noisy: unlocked, cold per-launch improves (5.3 → 4.2%) and hot per-launch worsens (2.4 → 5.3%; worst `7x7x2039` torch hot, 10.7%). n = 16-18 kernels here, so these are about the 1st-2nd worst kernel; the selector ranks these shapes by graph timing, which this study does not cover.
+- **What unlocking does cost is the noise of one measurement.** Inside a session the rounds disagree about 2.5x as much (p95 4.25% vs 1.65%; up to 8% for one kernel), and one full-protocol measurement (3 placements x 50 samples, i.e. one benchmark row) is off the cross-session median by p95 1.8-2.0% (p99 3.8-4.1%) against 1.0-1.1% locked: the interval [1.29, 2.93] does not overlap the locked one [0.64, 1.38]. The cross-session statistic stays at 2% because each session's value is the median of 3 rounds, which removes a bad round. **So a 2% margin on unlocked data uses the whole margin for noise.** A difference of 2-4% between two single unlocked rows is not a reliable win (it was 2-3% locked).
+- **Where it comes from: specific rounds, not a uniform drift.** Per round (≥ 50 µs, `noise_compare_unlocked.md`): the first round of every unlocked session has a per-kernel spread p95 of 1.3-2.9% at 95-100% power-capped (locked rounds: 0.3-1.2%), and round 2 of the post-reboot session reaches 4.1% (+0.8% mean shift). The mean shifts are ≤ 0.8%, and the spread does not cancel in the kernel ratio (within-session ratio range 3.7% vs 2.0%), so it is per kernel, presumably the boost clock moving under the power cap while each kernel is timed. The SM clock p50 differs by only 15-45 MHz between rounds, and the noisiest round is the least capped (71%), so the per-row cap flag does not explain it.
+- **Deployment (the shipped selector's short timing).** The online search times each candidate with 10 cold samples on one placement (`tune/online.py`); emulated from the raw samples (each placement's first 10; the study warms up 25 ms instead of 2 ms, so this is slightly optimistic), the error of a kernel-vs-kernel comparison at ≥ 50 µs is p95 **3.5%** (locked 2.7%), p99 6.1% (locked 6.9%). In a deployed unlocked search, candidates within ~4% of each other are effectively tied and the winner cache stores one of them arbitrarily (AGENTS §10 already says near-ties are arbitrary; this sizes "near"). A wrong order between two such candidates costs about that much, ≤ ~4% at p95.
+- **For the 3090 (2026-11-09).** Its single unlocked session read range p95 4.3% / 3.9% at ≥ 50 µs, which is the **within-session** statistic. The unlocked 3080 gives almost the same within-session number (4.25% / 3.83%) and still a 2% cross-session floor. The caveat written then ("the real 3090 floor can only be larger") does not hold in general: the cross-session statistic compares medians of 3 rounds, so it can be smaller than the within-session range. This is a 3080 measurement and says nothing certain about the 3090, but it makes a 3090 cross-session floor near 2-3% plausible, not > 5%; only a second 3090 session (next step 1 of 11-09) settles it.
+
+**Gates.** None changed (G1 is defined under the standard, locked conditions). Unlocked 3080: G1 at ≥ 50 µs would also pass at ε = 2% by the cross-session p95 (1.90%), with the caveat that its interval reaches 2.95% and a single row's p95 is 1.8-2.0%.
+
+**Caveats.** 30 shapes, 2 kernels: a p95 over 42 groups is about the 3rd-worst kernel, over 18 pairs about the worst. The third session ran 34 min after the reboot and on a newer host kernel; a session straight after a cold boot (the worst locked session) was not repeated unlocked. Desktop idle; normal desktop use was not tested. Graph-amortized timing is not covered (AGENTS §9 item 4). The online emulation uses the noise study's two kernels, not a real candidate pool.
+
+**Next steps.** (1) For the deployed selector: treat online picks within 4% as ties (relevant to anything that compares a stored winner with a re-search), or raise `SHORT_REPS` / time 2 placements if that matters; neither was tested here. (2) An unlocked session ~2 min after a cold boot, and one with normal desktop use, if the deployment margin needs to cover those. (3) The second 3090 session (now expected to land near the 3080's unlocked numbers). (4) The graph-mode noise study.
+
+Reproduce (CPU only; the GPU part is the three `noise` commands above, ~9.5 min each, GPU idle):
+```bash
+python -m analysis.noise_compare --group locked=642a,lock1755,6985 --group unlocked=22be,53f0,0ab2 \
+  --json reports/noise_compare_unlocked_summary.json      # prints reports/noise_compare_unlocked.md (minus its 3-line header)
+```
+
 ## Update 2026-11-10: 3090 follow-ups on existing data — a `cross_gpu` scorer bug (ranker picks dropped) corrected, the 5% re-score, the router's held-out replay, and the bundle's coverage of the 3090 pools
 
 CPU only, on the local checkout; no GPU job and nothing re-measured. Inputs: `pipeline/runs/rtx3090/train_best-full-slurm/data/rtx3090_sm86_82sms_24gb/` (the 3090 run directory: it has the models and the tune files, `data/rtx3090_sm86_82sms_24gb/` has only the zero-shot files). Code: `analysis/cross_gpu.py`, `tests/test_cross_gpu.py` (this commit).
