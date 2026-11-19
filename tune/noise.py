@@ -37,6 +37,7 @@ def run_noise(shapes: list[dict], out_dir: Path, *, backends=("torch", "triton:b
     path = out_dir / "noise.jsonl"
     tdtype = DTYPES[dtype]
     t0 = time.perf_counter()
+    used_ptrs: dict[tuple, set[int]] = {}
     with RecordWriter(path) as w:
         for rnd in range(rounds):
             order = list(shapes)
@@ -47,7 +48,9 @@ def run_noise(shapes: list[dict], out_dir: Path, *, backends=("torch", "triton:b
                 timed = {(c.config_key, cm): [] for c in cands for cm in cache_modes}
                 for alloc in range(n_allocs):
                     # Fresh placement each round as well, so rounds sample different physical layouts.
-                    a, b, pad = placed_inputs(M, N, K, tdtype, placement=rnd * n_allocs + alloc)
+                    used = used_ptrs.setdefault((M, N, K), set())  # no placement reuses an address (HAR-7)
+                    a, b, pad = placed_inputs(M, N, K, tdtype, placement=rnd * n_allocs + alloc, avoid=used)
+                    used |= {a.data_ptr(), b.data_ptr()}
                     for c in cands:
                         fn = c.backend.make_runner(a, b)
                         for cm in cache_modes:

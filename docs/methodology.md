@@ -16,7 +16,7 @@ Plan sections 3.1–3.4 cover the rationale.
 | Per-launch vs amortized | `batch=1` gives per-launch device time. That includes about 1–2 µs of event overhead, which matters only for kernels under ~20 µs. `batch=N, use_graph=True` captures N launches into a CUDA graph and reports time/N (amortized). Use it for µs-scale kernels. |
 | L2 flush (cold mode) | Before every sample, `zero_()` a 64 MiB buffer (≥8× L2), outside the timed region. Cold mode forbids `batch>1`, because launches 2..N would run hot. |
 | Hot mode | No flush. Operands stay L2-resident across samples. |
-| Input placement | **Every measurement pools raw samples over 3 fresh input allocations** (`--n-allocs 3`, the default). Each allocation is shifted by a seeded 1–64 MiB pad. Values are identical across placements, only physical addresses differ. See "Allocation noise" below. |
+| Input placement | **Every measurement pools raw samples over 3 fresh input allocations** (`--n-allocs 3`, the default). Placement 0 is a plain allocation; placements 1 and 2 copy each operand into a fresh buffer at a seeded 1–64 MiB offset (drawn per operand, placement and shape), and an address already used by an earlier placement of the shape is drawn again, so all 3 addresses differ for both operands. Values are identical across placements, only addresses differ. See "Allocation noise" below. **Sessions before 2026-11-20 used a 1–64 MiB pad allocated before the inputs instead; it did not move operands ≤ 1 MiB (PyTorch's small-block pool, 1 of 3 addresses distinct) and moved larger ones to 2 of 3 distinct addresses (deep check HAR-7).** |
 | CPU | The process is pinned to one core (`os.sched_setaffinity`), so the launch thread does not migrate. |
 
 ### Sanity checks (unit-tested in `tests/test_timing.py`)
@@ -155,7 +155,7 @@ The code is in `tune/correctness.py`.
 - **Pass criterion.** `|C − ref| ≤ rtol·|ref| + atol_frac·√K` elementwise. fp16 uses rtol = atol_frac = 1e-2; bf16 uses 3e-2. This passes fp32-accumulate kernels and fails garbage tiles. In the unit tests it also fails fp16 accumulation over long K.
 - **Unwritten elements.** The output buffer is pre-filled with NaN, so a kernel that skips a row or tile fails.
 - **Errors.** Compile errors, OOM and launch errors are caught and recorded as `valid=false` with a `failure_reason`. Invalid configs are never timed.
-- **Crashes.** If a config faults the CUDA context, the process dies. The runner's `inflight.json` marker makes the next run record that candidate as `crashed_previous_run` and skip it.
+- **Crashes.** A fault that poisons the CUDA context (illegal address, misaligned access, device-side assert, ...) is sticky: every later call in the process fails. When `validate()` reports one, the runner records that candidate (every cache mode) as `context_poisoned: <error>` and exits with code 3; re-run the same command to resume (the rest of the shape is redone in a fresh process). If the process dies instead (a fault while timing, a kill), the `inflight.json` marker, which lists every cache mode of the candidate in flight, makes the next run record them as `crashed_previous_run` and skip them. The sweep's screen subprocess and the online search (`ContextPoisoned`) stop the same way.
 - **Edge suite.** `suites/v1/edge.json` has 169 shapes: M/N/K ∈ {1, 2, 3, primes, 2^k±1}, K < BLOCK_K, and K up to 16384 with M = N = 1.
 
 ## Known limitations of this phase

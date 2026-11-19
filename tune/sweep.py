@@ -209,9 +209,8 @@ EXIT_POISONED = 3  # the screen process recorded a context-killing config itself
 
 
 def _context_poisoned(reason: str | None) -> bool:
-    r = (reason or "").lower()
-    return any(x in r for x in ("illegal", "misaligned", "unspecified launch failure", "device-side assert",
-                                "an illegal instruction"))
+    from tune.correctness import context_poisoned  # shared with the runner and the online search
+    return context_poisoned(reason)
 
 
 def screen_shape(M: int, N: int, K: int, partial: Path, skip: set[str], dtype: str = "fp16"):
