@@ -198,8 +198,32 @@ rankers do not transfer and cuBLASLt carries the search. See [`reports/cross_gpu
 
 ### 6.1 Run the tests
 
-`python -m pytest -q` on an idle GPU. CPU-only subsets exist for analysis code (e.g.
-`python -m pytest -q tests/test_zero_shot.py tests/test_cross_gpu.py`).
+`python -m pytest -q` from the repo root on an idle GPU (~380 tests, ~3.5 min on the 3080). CPU-only subsets exist
+for analysis code (e.g. `python -m pytest -q tests/test_zero_shot.py tests/test_cross_gpu.py`).
+
+Who runs it: you, after a code change, and `pipeline/run.sh` as its `tests` stage before it measures anything
+(`--skip-tests` turns that off). Nothing an lscli user runs calls it: not the installer, the daemon, `train_best.sh`
+or `lscli doctor`, and the repo has no CI.
+
+* **Skips.** Tests marked `requires_cuda` skip on a machine with no CUDA GPU. The lscli daemon and training tests
+  need a real Triton ranker file: they take the zero-shot set an lscli install has
+  (`$LSCLI_HOME/models/zero_shot`, default `~/.local/share/lscli`), else unpack `install/zero_shot.tar.xz` from the
+  clone into a pytest temp dir (`tests/conftest.py`, `shipped_ranker`). They skip only if neither exists.
+* **The slow test** (`test_the_real_train_best_finishes_a_training_under_the_daemon_and_its_models_are_activated`)
+  is off by default. It runs the real `pipeline/train_best.sh` under the daemon through its CPU stages (rank v2,
+  cuBLASLt ranker, router, package, summary) to activated models, with the GPU stages pre-stamped from this
+  machine's 3080 run: ~7 min of CPU, no GPU. It needs the 3080's GPU-stage outputs in
+  `data/rtx3080_sm86_68sms_10gb/` (gitignored, ~370 MB; point `LSCLI_TEST_DATA_3080` at a copy). Run it after
+  changing `lscli/daemon.py`, `gate.py`, `training.py`, `models.py` or `pipeline/train_best.sh`:
+  `LSCLI_SLOW_TESTS=1 python -m pytest -q tests/test_lscli_training.py -k real_train_best`.
+* **The checkout's `pipeline/.lock`.** That test and `test_train_best_re_resolves_an_empty_hw_id_left_by_a_killed_stage`
+  run the checkout's own `train_best.sh`, which flocks `pipeline/.lock`. Their `repo_lock` fixture skips them while a
+  real `train_best.sh` run holds the lock, and afterwards (passed, failed or interrupted) kills anything the test
+  started that still holds it and removes the file if the test created it. A `kill -9` of pytest itself skips that
+  clean-up; `flock -n pipeline/.lock true` then tells you whether something still holds it.
+* **On a machine with lscli installed**, pause the daemon first, or one of its jobs can overlap the GPU tests:
+  `lscli pause`, wait until `lscli status` shows no job, run the suite, then `lscli resume`. From the install's own
+  clone: `cd ~/.local/share/lscli/src && ../venv/bin/python -m pytest -q` (the lscli venv has pytest).
 
 ### 6.2 Reproduce the study
 
