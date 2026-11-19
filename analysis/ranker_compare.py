@@ -26,6 +26,12 @@ PICK_FAMILIES = ("tri", "lth", "ltd", "ltk", "ltr")
 FAMILY = {"triton_nn_v1": "tri", "cublaslt": "lth", "cublaslt_deep": "ltd", "cublaslt_knn": "ltk", "cublaslt_rank": "ltr", "torch_matmul": "torch"}
 
 
+def is_cublaslt(family) -> np.ndarray:
+    """True where a chosen config's family is any cuBLASLt source: the heuristic (`cublaslt`) and the proposals (`cublaslt_rank`,
+    `cublaslt_knn`; same rule as `analysis.cross_gpu.joint_summary`). Counting only `== "cublaslt"` missed the proposals."""
+    return np.char.startswith(np.asarray(family, dtype=str), "cublaslt")
+
+
 def load_stage2(data: Path, files: list[str], mode: str) -> dict:
     """{shape: {family: {config_key: median_us}}} for the valid rows of `files` with this cache mode."""
     d = collections.defaultdict(lambda: collections.defaultdict(dict))
@@ -100,7 +106,7 @@ def score(online: Path, ref: dict, cold: dict) -> dict:
         out[name] = {}
         for g, (m, eps) in groups.items():
             e = {"n": int(m.sum()), "eps": eps, "cost_s": float(np.mean(np.array(ct[name]["cost"])[m])),
-                 "pct_lt": float(100 * np.mean(np.array(ct[name]["family"])[m] == "cublaslt"))}
+                 "pct_lt": float(100 * np.mean(is_cublaslt(ct[name]["family"])[m]))}
             for ref_name in ("b2", "b3", "b3p"):
                 q = (t / R[ref_name])[m]
                 e[ref_name] = {**stats(q), "faster": int((q < 1 / eps).sum()), "slower": int((q > eps).sum())}
