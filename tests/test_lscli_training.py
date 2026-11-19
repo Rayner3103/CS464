@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,6 @@ from lscli.files import write_json
 from lscli.paths import Paths
 
 REPO = Path(__file__).resolve().parent.parent
-RANKER = REPO / "pipeline/runs/quick-20261029-095746/data/lgbm_rank"
 HW = "testgpu_sm86_68sms_10gb"
 ENV = {"hw_id": HW, "triton": "3.7.1", "cublaslt": 130101, "driver": "595.99.02", "kernel_src": "abc", "torch": "2.13.0"}
 
@@ -60,7 +60,6 @@ def home(tmp_path, monkeypatch):
     script.write_text(FAKE)
     monkeypatch.setenv("LSCLI_TRAIN_SCRIPT", str(script))
     monkeypatch.setenv("FAKE_HW", HW)
-    monkeypatch.setenv("FAKE_RANKER", str(RANKER))
     monkeypatch.setenv("FAKE_BUSY", str(tmp_path / "busy"))
     paths = Paths().ensure()
     (paths.src / "pipeline").mkdir(parents=True)
@@ -147,7 +146,14 @@ def test_activate_swaps_in_a_model_set(home, tmp_path):
 
 
 # ---------------------------------------------------------------------------------------------- daemon-driven training
-needs_ranker = pytest.mark.skipif(not Path(str(RANKER) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
+@pytest.fixture
+def ranker(shipped_ranker, monkeypatch):
+    """The stand-in train_best's `package` stage copies a real ranker into models/ (conftest.shipped_ranker)."""
+    monkeypatch.setenv("FAKE_RANKER", str(shipped_ranker))
+    return shipped_ranker
+
+
+needs_ranker = pytest.mark.usefixtures("ranker")
 
 
 def _run_until(d, cond, n=40):
@@ -450,8 +456,65 @@ def test_a_lost_state_file_never_reuses_a_run_directory(home):
     assert (home.train / HW / "1" / "precious").exists() and training.Training(home, HW).state["run"] == 2
 
 
+# ---------------------------------------------------------------------------------------------- the checkout's lock
+REPO_LOCK = REPO / "pipeline" / ".lock"
+LOCK_MARKER = "LSCLI_TEST_LOCK_OWNER"
+
+
+def _lock_holders(path: Path, marker: str) -> list[int]:
+    """Processes this test started that still have `path` open: every child of train_best.sh inherits its flocked fd 9,
+    and every process the test starts inherits LOCK_MARKER=<marker> (read from /proc/<pid>/environ, so a real
+    train_best.sh run is never matched)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return []
+    tag, out = f"{LOCK_MARKER}={marker}".encode(), []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit() or int(d.name) == os.getpid():
+            continue
+        try:
+            if tag not in (d / "environ").read_bytes().split(b"\0"):
+                continue
+            if any((s.st_dev, s.st_ino) == (st.st_dev, st.st_ino) for s in (fd.stat() for fd in (d / "fd").iterdir())):
+                out.append(int(d.name))
+        except OSError:                                                   # gone, or not ours to read
+            continue
+    return out
+
+
+@pytest.fixture
+def repo_lock(monkeypatch):
+    """The checkout's pipeline/.lock, for a test that runs the real pipeline/train_best.sh (it flocks that file for its
+    whole run). Skips while a train_best.sh run holds it: the test would die on the lock, or a run started meanwhile
+    would. Afterwards (passed, failed or interrupted) it kills whatever the test started that still holds the file, so
+    the flock is always released, and removes the file if the test created it."""
+    if gate.lock_held(REPO_LOCK):
+        pytest.skip("a train_best.sh run holds pipeline/.lock; this test runs train_best.sh from this checkout too")
+    marker = uuid.uuid4().hex
+    monkeypatch.setenv(LOCK_MARKER, marker)
+    existed = REPO_LOCK.exists()
+    yield REPO_LOCK
+    from lscli.jobs import _alive
+    killed: set[int] = set()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:                 # wait for each to exit: a dying process leaves /proc/<pid>/fd
+        killed |= set(_lock_holders(REPO_LOCK, marker))  # unreadable before the kernel drops its flock
+        alive = {p for p in killed if _alive(p)}
+        if not alive:
+            break
+        for pid in alive:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        time.sleep(0.05)
+    if not existed and not gate.lock_held(REPO_LOCK):
+        REPO_LOCK.unlink(missing_ok=True)
+
+
 @pytest.mark.parametrize("resolves", [True, False])
-def test_train_best_re_resolves_an_empty_hw_id_left_by_a_killed_stage(tmp_path, resolves):
+def test_train_best_re_resolves_an_empty_hw_id_left_by_a_killed_stage(tmp_path, resolves, repo_lock):
     """The real pipeline/train_best.sh (stand-in `python` on PATH): a stage killed between creating and writing hw_id
     (a daemon preemption) left it empty, and every later --resume died with "could not determine the hardware id"."""
     import subprocess
@@ -490,7 +553,7 @@ TAIL = ("train_v2", "lt_fit", "router_fit", "package", "summary")
 @pytest.mark.skipif(os.environ.get("LSCLI_SLOW_TESTS") != "1", reason="slow (~7 min of CPU): set LSCLI_SLOW_TESTS=1")
 @pytest.mark.skipif(not all((DATA_3080 / f).exists() for f in TAIL_INPUTS),
                     reason=f"needs the 3080's GPU-stage outputs in {DATA_3080} (LSCLI_TEST_DATA_3080)")
-def test_the_real_train_best_finishes_a_training_under_the_daemon_and_its_models_are_activated(home, monkeypatch):
+def test_the_real_train_best_finishes_a_training_under_the_daemon_and_its_models_are_activated(home, monkeypatch, repo_lock):
     """The review's missing evidence (#11): the REAL pipeline/train_best.sh, run by the daemon one stage per job, taking
     its own pipeline/.lock, through to activated models. The GPU stages are pre-stamped and their outputs are a copy of
     this machine's 3080 run; the daemon runs the CPU stages (train_v2, lt_fit, router_fit, package, summary) while the
@@ -519,7 +582,7 @@ def test_the_real_train_best_finishes_a_training_under_the_daemon_and_its_models
     for s in tr.state["stages"]:
         if s not in TAIL:
             (run / "stamps" / f"{s}.done").write_text("pre-stamped by the test\n")
-    lock = REPO / "pipeline" / ".lock"
+    lock = repo_lock                                                         # released and cleaned up by the fixture
     lock.touch()
     done = lambda: training.Training(home, HW_3080).state.get("status") == "done"   # noqa: E731
     assert _run_until(d, done, n=len(TAIL) + 2)

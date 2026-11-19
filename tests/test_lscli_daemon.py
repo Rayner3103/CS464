@@ -20,7 +20,6 @@ from lscli.paths import Paths
 from tests.conftest import requires_cuda
 
 REPO = Path(__file__).resolve().parent.parent
-RANKER_2060 = REPO / "pipeline/runs/quick-20261029-095746/data/lgbm_rank"
 SNAP = REPO / "reports/snapshot/lock1755"
 
 
@@ -327,10 +326,10 @@ def test_model_sets_prefer_native_and_refuse_foreign_architectures(home):
 
 
 # ---------------------------------------------------------------------------------------------- end to end (GPU)
-def _setup_models(home, hw_id):
+def _setup_models(home, hw_id, ranker):
     d = home.models / hw_id
     d.mkdir(parents=True)
-    for name, src in (("tri", RANKER_2060), ("lt", SNAP / "lt_rank"), ("rt", SNAP / "router")):
+    for name, src in (("tri", ranker), ("lt", SNAP / "lt_rank"), ("rt", SNAP / "router")):
         for ext in (".txt", ".json"):
             os.symlink(str(src) + ext, d / f"{name}{ext}")
     # test-only: label the 3080 cuBLASLt ranker / router with this GPU so the proposer and router paths run
@@ -346,13 +345,12 @@ def _daemon(home, snapshot):
 
 
 @requires_cuda
-@pytest.mark.skipif(not Path(str(RANKER_2060) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
-def test_miss_is_searched_by_the_daemon_and_then_dispatched(home):
+def test_miss_is_searched_by_the_daemon_and_then_dispatched(home, shipped_ranker):
     envs.register(home, sys.executable)
     eid = envs.env_id(sys.executable)
     hw = json.loads(subprocess.run([sys.executable, "-m", "lscli.worker", "env"], cwd=REPO, capture_output=True,
                                    text=True).stdout.splitlines()[-1])["env"]["hw_id"]
-    _setup_models(home, hw)
+    _setup_models(home, hw, shipped_ranker)
     queue.request(home, 1024, 1024, 1024, "fp16", eid, "miss")
     d = _daemon(home, lambda: gate.GpuSnapshot([], 0, True, {}))
     task = d.tick()
@@ -439,15 +437,14 @@ def test_the_final_check_after_a_search_does_not_restart_the_idle_clock(home, mo
 
 
 @requires_cuda
-@pytest.mark.skipif(not Path(str(RANKER_2060) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
-def test_back_to_back_searches_keep_the_gate_open(home):
+def test_back_to_back_searches_keep_the_gate_open(home, shipped_ranker):
     """The search's own GPU utilization, still reported when it ends, must not count as a busy GPU: the next search
     starts on the next tick instead of after another gpu_idle_minutes."""
     envs.register(home, sys.executable)
     eid = envs.env_id(sys.executable)
     hw = json.loads(subprocess.run([sys.executable, "-m", "lscli.worker", "env"], cwd=REPO, capture_output=True,
                                    text=True).stdout.splitlines()[-1])["env"]["hw_id"]
-    _setup_models(home, hw)
+    _setup_models(home, hw, shipped_ranker)
     for m in (512, 768):
         queue.request(home, m, m, m, "fp16", eid, "miss")
     box = {}
@@ -474,13 +471,12 @@ def test_sigterm_ends_a_running_job_without_backoff(home, tmp_path):
 
 
 @requires_cuda
-@pytest.mark.skipif(not Path(str(RANKER_2060) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
-def test_a_foreign_process_preempts_the_search_and_nothing_is_written(home):
+def test_a_foreign_process_preempts_the_search_and_nothing_is_written(home, shipped_ranker):
     envs.register(home, sys.executable)
     eid = envs.env_id(sys.executable)
     hw = json.loads(subprocess.run([sys.executable, "-m", "lscli.worker", "env"], cwd=REPO, capture_output=True,
                                    text=True).stdout.splitlines()[-1])["env"]["hw_id"]
-    _setup_models(home, hw)
+    _setup_models(home, hw, shipped_ranker)
     queue.request(home, 2048, 2048, 2048, "fp16", eid, "manual")
     d = None
 
@@ -496,14 +492,13 @@ def test_a_foreign_process_preempts_the_search_and_nothing_is_written(home):
 
 
 @requires_cuda
-@pytest.mark.skipif(not Path(str(RANKER_2060) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
-def test_a_process_that_appears_as_the_worker_finishes_voids_the_result(home, monkeypatch):
+def test_a_process_that_appears_as_the_worker_finishes_voids_the_result(home, shipped_ranker, monkeypatch):
     """The last <= 1 s of timing is not covered by a watch poll: the daemon checks once more before writing."""
     envs.register(home, sys.executable)
     eid = envs.env_id(sys.executable)
     hw = json.loads(subprocess.run([sys.executable, "-m", "lscli.worker", "env"], cwd=REPO, capture_output=True,
                                    text=True).stdout.splitlines()[-1])["env"]["hw_id"]
-    _setup_models(home, hw)
+    _setup_models(home, hw, shipped_ranker)
     queue.request(home, 1024, 1024, 1024, "fp16", eid, "miss")
     late = []
     orig = jobs.converse
@@ -521,14 +516,13 @@ def test_a_process_that_appears_as_the_worker_finishes_voids_the_result(home, mo
 
 # ---------------------------------------------------------------------------------------------- clock hold
 @requires_cuda
-@pytest.mark.skipif(not Path(str(RANKER_2060) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
-def test_a_hold_that_lands_as_the_worker_finishes_voids_the_result(home, monkeypatch):
+def test_a_hold_that_lands_as_the_worker_finishes_voids_the_result(home, shipped_ranker, monkeypatch):
     """The user is about to lock another clock: a winner timed under the daemon's policy must not be written."""
     envs.register(home, sys.executable)
     eid = envs.env_id(sys.executable)
     hw = json.loads(subprocess.run([sys.executable, "-m", "lscli.worker", "env"], cwd=REPO, capture_output=True,
                                    text=True).stdout.splitlines()[-1])["env"]["hw_id"]
-    _setup_models(home, hw)
+    _setup_models(home, hw, shipped_ranker)
     queue.request(home, 1024, 1024, 1024, "fp16", eid, "miss")
     orig = jobs.converse
 
