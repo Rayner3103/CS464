@@ -16,7 +16,6 @@ from lscli.files import write_json
 from lscli.paths import Paths
 
 REPO = Path(__file__).resolve().parent.parent
-RANKER = REPO / "pipeline/runs/quick-20261029-095746/data/lgbm_rank"
 HW = "testgpu_sm86_68sms_10gb"
 ENV = {"hw_id": HW, "triton": "3.7.1", "cublaslt": 130101, "driver": "595.99.02", "kernel_src": "abc", "torch": "2.13.0"}
 
@@ -60,7 +59,6 @@ def home(tmp_path, monkeypatch):
     script.write_text(FAKE)
     monkeypatch.setenv("LSCLI_TRAIN_SCRIPT", str(script))
     monkeypatch.setenv("FAKE_HW", HW)
-    monkeypatch.setenv("FAKE_RANKER", str(RANKER))
     monkeypatch.setenv("FAKE_BUSY", str(tmp_path / "busy"))
     paths = Paths().ensure()
     (paths.src / "pipeline").mkdir(parents=True)
@@ -147,7 +145,14 @@ def test_activate_swaps_in_a_model_set(home, tmp_path):
 
 
 # ---------------------------------------------------------------------------------------------- daemon-driven training
-needs_ranker = pytest.mark.skipif(not Path(str(RANKER) + ".txt").exists(), reason="needs the 2060 quick-run ranker")
+@pytest.fixture
+def ranker(shipped_ranker, monkeypatch):
+    """The stand-in train_best's `package` stage copies a real ranker into models/ (conftest.shipped_ranker)."""
+    monkeypatch.setenv("FAKE_RANKER", str(shipped_ranker))
+    return shipped_ranker
+
+
+needs_ranker = pytest.mark.usefixtures("ranker")
 
 
 def _run_until(d, cond, n=40):
