@@ -449,3 +449,98 @@ def test_enable_env_refuses_a_checkout_reachable_from_the_callers_cwd_or_pythonp
     (neutral / "analysis").mkdir()                                        # a data folder, not a package: only a note
     assert cli.main(["enable-env", str(py), "--no-deps"]) == 0 and (site_dir / "lscli.pth").exists()
     assert "analysis/ without __init__.py" in capsys.readouterr().err
+
+
+def _scripted_ops(fn) -> set:
+    return {n.kind() for n in torch.jit.script(fn).graph.nodes()}
+
+
+def _mm3(a, b):
+    return torch.matmul(a, b) + torch.mm(a, b) + (a @ b) + a.matmul(b) + a.mm(b)
+
+
+def test_torchscript_compiles_through_the_patch_to_plain_aten_ops(home):
+    """LSC-1: TorchScript maps torch functions by identity; the wrappers are registered as the original aten ops, so
+    scripted code calls torch directly (the graph holds aten::matmul / aten::mm / aten::linear, no Python call)."""
+    assert client.enable()
+    a, b = torch.randn(8, 8), torch.randn(8, 8)
+    kinds = _scripted_ops(_mm3)
+    assert {"aten::matmul", "aten::mm"} <= kinds and "prim::PythonOp" not in kinds
+    torch.testing.assert_close(torch.jit.script(_mm3)(a, b), 3 * client._ORIG["matmul"](a, b)
+                               + 2 * client._ORIG["mm"](a, b))
+    lin = torch.nn.Linear(8, 4)
+    sl = torch.jit.script(lin)
+    assert "aten::linear" in {n.kind() for n in sl.graph.nodes()}
+    torch.testing.assert_close(sl(a), lin(a))
+
+
+def test_patched_functions_pickle_by_name(home):
+    """LSC-1: pickle resolves by __module__ + __qualname__; the wrappers carry the public names they replace."""
+    import pickle
+    import torch.nn.functional as F
+    assert client.enable()
+    for fn in (torch.matmul, torch.mm, torch.Tensor.matmul, torch.Tensor.mm, torch.Tensor.__matmul__, F.linear):
+        assert pickle.loads(pickle.dumps(fn)) is fn
+    blob = pickle.dumps(torch.matmul), pickle.dumps(torch.Tensor.matmul), pickle.dumps(F.linear)
+    client.disable()                                     # an unpatched process gets torch's own functions back
+    assert [pickle.loads(x) for x in blob] == [torch.matmul, torch.Tensor.matmul, F.linear]
+    assert torch.matmul is client._ORIG["matmul"] and F.linear is client._ORIG["linear"]
+    code = ("import pickle, sys, torch; fns = pickle.loads(sys.stdin.buffer.read()); "
+            "import torch.nn.functional as F; assert fns == [torch.matmul, torch.Tensor.matmul, F.linear], fns")
+    subprocess.run([sys.executable, "-c", code], input=pickle.dumps([pickle.loads(x) for x in blob]), check=True,
+                   env={**os.environ, "CUDA_VISIBLE_DEVICES": ""}, timeout=120)
+
+
+def test_enable_disable_enable_keeps_torchscript_and_the_builtin_table_clean(home):
+    from torch.jit import _builtins
+    table = _builtins._get_builtin_table()
+    before = dict(table)
+    for _ in range(2):
+        assert client.enable()
+        ids = {id(f) for f in (torch.matmul, torch.mm, torch.Tensor.matmul, torch.Tensor.mm, torch.Tensor.__matmul__,
+                               torch.nn.functional.linear)}
+        assert all(table.get(i) for i in ids)
+        assert {"aten::matmul", "aten::mm"} <= _scripted_ops(_mm3)
+        client.disable()
+        assert _builtins._builtin_table == before and not client._JIT_IDS
+        assert {"aten::matmul", "aten::mm"} <= _scripted_ops(_mm3)
+    assert not any(getattr(f, "__module__", None) == "lscli.client" for f, _ in _builtins._builtin_ops)
+
+
+def test_a_failing_torchscript_registration_does_not_stop_enable(home, monkeypatch):
+    from torch.jit import _builtins
+    monkeypatch.setattr(_builtins, "_register_builtin", lambda *a: (_ for _ in ()).throw(AttributeError("gone")))
+    monkeypatch.setattr(client._jit_warn, "_warned", False, raising=False)
+    with pytest.warns(UserWarning, match="TorchScript"):
+        assert client.enable()
+    a = torch.randn(4, 4)
+    torch.testing.assert_close(torch.matmul(a, a), client._ORIG["matmul"](a, a))
+
+
+def _trace_and_flush(device, dtype):
+    assert client.enable()
+    lin = torch.nn.Linear(64, 32, device=device, dtype=dtype).requires_grad_(False)
+
+    def f(x, w):
+        return torch.matmul(x, w) + (x @ w) + torch.mm(x, w) + lin(x).sum()
+
+    x, w = torch.randn(64, 64, device=device, dtype=dtype), torch.randn(64, 64, device=device, dtype=dtype)
+    traced = torch.jit.trace(f, (x, w), check_trace=False)
+    torch.testing.assert_close(traced(x, w), f(x, w), rtol=1e-2, atol=1e-1)
+    calls = client._STATE.log.calls
+    assert all(type(v) is int for k in calls for v in k[:3])
+    client._STATE.flush()                                # must not raise (it did at exit, with tensor keys)
+    client.disable()
+    return calls
+
+
+def test_jit_trace_works_through_the_patch(home):
+    _trace_and_flush("cpu", torch.float32)
+
+
+@requires_cuda
+def test_jit_trace_calls_are_not_counted_and_flush_works(home):
+    """LSC-21: under torch.jit.trace sizes are 0-dim tensors; such calls go to torch uncounted, so `flush` cannot
+    meet a tensor-valued key at exit. Only the eager call of `f` is counted."""
+    calls = _trace_and_flush("cuda", torch.float16)
+    assert sum(n for k, n in calls.items() if k[4] == "NN") <= 3
