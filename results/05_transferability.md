@@ -76,7 +76,7 @@ On the 3080 two timings within **2%** count as a tie. The 3090's single noise se
 
 Whether the models cross to a different tensor-core generation (Ada, Hopper) is untested.
 
-## 5.6 Honest limits
+## 5.6 Limitations
 
 - 27 shared shapes: percentiles are the worst one or two shapes, and many differences between variants are inside their intervals.
 - The 3090 numbers come from an **unlocked** clock and a different driver (590.48 vs 595.99); the 3080 and 2060 were locked at 1755 MHz. Compare regrets and ratios, never absolute times, across cards.
