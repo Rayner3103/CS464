@@ -433,14 +433,20 @@ program first runs them.
 * M, N and K are in [1, 16384];
 * both are contiguous with 16-byte-aligned data pointers;
 * `out=` is not given;
-* the call is not inside `torch.compile` tracing (compiled code uses torch's op), CUDA-graph capture, `torch.autocast`
+* the call is not inside `torch.compile` or `torch.jit.trace` tracing (compiled / traced code uses torch's op; a call
+  under `torch.jit.trace` is not counted either), CUDA-graph capture, `torch.autocast`
   (torch's cast semantics apply), a `torch.func` transform (`grad`, `vmap`, `jvp`) or forward-mode AD.
 
 The kernel runs inside an `autograd.Function` only when an operand requires grad. Its backward calls the **original**
 (unpatched) `torch.matmul`.
 
 Every other call goes to the original torch function untouched. `F.linear` is wrapped only to count its shape
-(`layout: "NT"`).
+(`layout: "NT"`). The wrappers are registered with TorchScript as the original aten ops (`aten::matmul`, `aten::mm`,
+`aten::linear`), so `torch.jit.script` of code that calls them compiles to plain torch ops, and they carry the public
+names they replace (`torch.matmul`, `torch.Tensor.matmul`, `torch.nn.functional.linear`, ...), so pickling one stores
+that name and unpickling gives whatever the name holds there (torch's own function in an unpatched process). The
+TorchScript registration uses private torch API (`torch.jit._builtins._register_builtin`); if it fails, `enable()`
+warns once and still patches, and only scripting of matmul code fails while enabled. `disable()` removes it.
 
 ### 5.3 Per-call behaviour
 

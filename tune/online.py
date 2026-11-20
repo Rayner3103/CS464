@@ -34,7 +34,7 @@ from typing import Callable, Iterable
 
 import torch
 
-from tune.correctness import placed_inputs, reference, validate
+from tune.correctness import ContextPoisoned, context_poisoned, placed_inputs, reference, validate
 from tune.env import provenance, write_env
 from tune.records import RecordWriter
 from tune.winner_cache import PROPOSAL_FAMILIES   # cuBLASLt candidates that are not the heuristic's
@@ -266,6 +266,8 @@ def measure(M: int, N: int, K: int, dtype, lt_backends: list[tuple], triton, *, 
         for family, key, backend, extra_s in backends:
             t = time.perf_counter()
             chk = validate(backend, M, N, K, dtype, ref=ref, inputs=(a, b))  # first call: JIT compile + correctness
+            if context_poisoned(chk.failure_reason):  # sticky CUDA fault: nothing after it can be timed (HAR-1)
+                raise ContextPoisoned(f"{family}:{key}", chk.failure_reason)
             torch.cuda.synchronize()
             x = {"config_key": key, "valid": chk.valid, "failure_reason": chk.failure_reason,
                  "compile_s": time.perf_counter() - t + extra_s}

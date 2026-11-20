@@ -64,6 +64,7 @@ What we found and did:
 
 - The biggest noise source was **where the input data sits in GPU memory** (up to 3.7% on memory-bound shapes), not temperature or clock. Heat drift over 10 minutes was +0.01%.
 - Fix: time each shape on **3 different memory placements** and pool them. The unlucky-case noise fell from 5.4% to 2.6%, and the worst 1% from 12.5% to 6.3%.
+  *Correction (2026-11-20):* until then the placement code did not actually move inputs of 1 MiB or less (they reused the same memory every time) and moved larger ones to only 2 of the 3 placements. After the fix, a same-day comparison of the old and fixed versions (4 locked sessions) found no difference: the 2% tie margin and the measured times are unchanged, so earlier results stand ([`reports/week1.md`](../reports/week1.md), 2026-11-20).
 - Also: lock the clock, clear the GPU's cache before every timing ("cold L2"), and discard weak runs.
 - Result: **differences under 2% (jobs ≥ 50 µs) or 5% (shorter jobs) are called ties.** The 2% is the 95th percentile of the spread between three sessions on different days (1.75% cold, 1.78% hot, rounded up). For very short jobs (under about 50 µs) we rank by launching 50 copies in a CUDA graph and dividing, since single launches are only measured in steps of about 1 µs.
 

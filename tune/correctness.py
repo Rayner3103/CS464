@@ -40,20 +40,61 @@ def make_inputs(M: int, N: int, K: int, dtype=torch.float16, seed: int = 0, devi
     return a, b
 
 
-def placed_inputs(M: int, N: int, K: int, dtype=torch.float16, seed: int = 0, placement: int = 0,
-                  device: str = "cuda"):
-    """Same values as make_inputs, but at a different physical placement for each `placement` index.
+PLACEMENT_MAX_TRIES = 8
 
-    A seeded 1-64 MiB pad is allocated first so the caching allocator hands out different blocks.
-    Returns (a, b, pad); keep `pad` alive while a and b are in use.
+
+def placed_inputs(M: int, N: int, K: int, dtype=torch.float16, seed: int = 0, placement: int = 0,
+                  device: str = "cuda", avoid: set[int] | frozenset[int] = frozenset()):
+    """Same values as make_inputs, but at a different device address for each `placement` index.
+
+    Placement 0 is make_inputs as it is. Placement p > 0 copies each operand into a fresh buffer at an offset of a whole
+    number of MiB (1-64, drawn per operand from (seed, placement, shape)), so A and B land on other pages and at another
+    A-B distance. Offsets are multiples of 1 MiB, so the base pointers keep the allocator's alignment (the kernels'
+    16-byte specializations do not change). A view's address is still drawn again (up to PLACEMENT_MAX_TRIES times) when
+    it is in `avoid`: callers pass the addresses of the placements they already timed, because the buffer can reuse a
+    block a previous placement freed.
+
+    Why not a pad allocated before make_inputs (the protocol up to 2026-11-19, deep check HAR-7): operands <= 1 MiB come
+    from PyTorch's small-block pool, which a large pad never touches, so they got back the blocks the previous placement
+    had just freed (1 of 3 placements distinct), and a large pad could hand placement 2 placement 0's block (2 of 3).
+    Returns (a, b, None); the third value is kept for the callers' unpacking (the views hold their buffers).
     """
-    pad = None
-    if placement:
-        import random
-        mib = random.Random(seed * 7919 + placement).randint(1, 64)
-        pad = torch.empty(mib * 2**20, dtype=torch.uint8, device=device)
     a, b = make_inputs(M, N, K, dtype, seed, device)
-    return a, b, pad
+    if not placement:
+        return a, b, None
+    import random
+    rng = random.Random(f"placement:{seed}:{placement}:{M}x{N}x{K}")  # str seed: stable across processes
+    out = []
+    for t in (a, b):
+        for _ in range(PLACEMENT_MAX_TRIES):
+            shift = rng.randint(1, 64) * 2**20 // t.element_size()
+            v = torch.empty(shift + t.numel(), dtype=t.dtype, device=device)[shift:].view(t.shape)
+            if v.data_ptr() not in avoid:
+                break
+            del v
+        v.copy_(t)
+        out.append(v)
+    return out[0], out[1], None
+
+
+CONTEXT_POISON_MARKERS = ("illegal", "misaligned", "unspecified launch failure", "device-side assert",
+                          "an illegal instruction")
+
+
+def context_poisoned(reason: str | None) -> bool:
+    """True when a failure reason is a CUDA error that leaves the context unusable (sticky): every later CUDA call in
+    the process fails with it, so the process must stop instead of recording the next candidates as invalid."""
+    r = (reason or "").lower()
+    return any(x in r for x in CONTEXT_POISON_MARKERS)
+
+
+class ContextPoisoned(RuntimeError):
+    """A candidate faulted the CUDA context (see `context_poisoned`); `culprit` names it. Nothing else can run on the
+    GPU in this process."""
+
+    def __init__(self, culprit: str, reason: str):
+        super().__init__(f"{culprit} poisoned the CUDA context: {reason}")
+        self.culprit, self.reason = culprit, reason
 
 
 def reference(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -90,7 +131,8 @@ def validate(backend, M: int, N: int, K: int, dtype=torch.float16, seed: int = 0
              ref: torch.Tensor | None = None, inputs=None) -> CheckResult:
     """Run `backend.make_runner(a, b, out)` once into a NaN-filled buffer and compare to the fp32 reference.
 
-    Compile errors and CUDA faults are caught and reported as failures, never raised.
+    Compile errors and CUDA faults are caught and reported as failures, never raised. A fault that poisons the context
+    (`context_poisoned(result.failure_reason)`) must stop the caller: nothing after it in the process can run.
     """
     try:
         a, b = inputs if inputs is not None else make_inputs(M, N, K, dtype, seed)

@@ -60,3 +60,21 @@ def test_extended_oracle_sees_proposals():
     d[s]["ltr"] = {}
     d[s]["ltk"] = {}
     assert rc.references(d, {})[s]["orc_x"] == 900.0                       # no proposals timed: identical to orc
+
+
+def test_pct_lt_counts_every_cublaslt_family(tmp_path):
+    """Picks from the learned cuBLASLt ranker (`cublaslt_rank`) and the k-NN proposals (`cublaslt_knn`) are cuBLASLt picks too
+    (deep check ANA-1: `== "cublaslt"` counted only the heuristic's and under-reported the share)."""
+    shapes = [(4096, 4096, 4096 + 64 * i) for i in range(4)]
+    cold = []
+    for s in shapes:
+        cold += [_row(s, "triton_nn_v1", "t0", 1000.0), _row(s, "cublaslt", "h0_a", 1000.0), _row(s, "cublaslt_deep", "d0", 990.0),
+                 _row(s, "cublaslt_rank", "r0_a", 950.0), _row(s, "cublaslt_knn", "n0_a", 960.0)]
+    (tmp_path / "c.jsonl").write_text("\n".join(map(json.dumps, cold)))
+    (tmp_path / "h.jsonl").write_text("")
+    picks = [("t0", "triton"), ("h0_a", "cublaslt"), ("r0_a", "cublaslt_rank"), ("n0_a", "cublaslt_knn")]
+    (tmp_path / "v.jsonl").write_text("\n".join(json.dumps(_online(s, {k: p for k in (1, 3, 5)})) for s, p in zip(shapes, picks)))
+    _, summary = rc.build(tmp_path, tmp_path, {"v": "v.jsonl"}, "c.jsonl", "h.jsonl")
+    e = summary["scores"]["v"]["top-3 + LT16"]
+    assert e["all"]["pct_lt"] == 75.0 and e[">= 50 us"]["pct_lt"] == 75.0  # 3 of 4: heuristic, ranker and k-NN picks
+    assert rc.is_cublaslt(["triton", "cublaslt", "cublaslt_rank", "cublaslt_knn", "cublaslt_deep"]).tolist() == [False, True, True, True, True]

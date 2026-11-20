@@ -3,13 +3,16 @@
 `enable()` replaces `torch.matmul`, `torch.mm` and `Tensor.matmul` / `Tensor.mm` / `Tensor.__matmul__` with a
 dispatcher, and wraps `torch.nn.functional.linear` to count its (NT) shapes. `disable()` restores the originals (and a
 wrapper captured earlier, e.g. `from torch import matmul`, passes straight through once disabled). Anything not in
-scope goes to the original function untouched, with the caller's exact arguments.
+scope goes to the original function untouched, with the caller's exact arguments. The wrappers are registered with
+TorchScript as the original aten ops and named for pickle after the attribute they replace, so `torch.jit.script` and
+pickling of these functions behave as without the patch (see `_JIT`).
 
 Per call:
   1. route: only two positional 2-D CUDA operands of the same fp16 / bf16 dtype on the daemon's GPU, which must also be
      the current device; contiguous, 16-byte aligned, M, N, K <= 16384; plain tensors or nn.Parameter; not under
-     torch.compile tracing, CUDA-graph capture, autocast, torch.func transforms or forward-mode AD. Everything in this
-     step is inside a try: a failure here means torch, never an exception in the user's program;
+     torch.compile or torch.jit.trace tracing, CUDA-graph capture, autocast, torch.func transforms or forward-mode AD
+     (a call under torch.jit.trace is not counted either: its sizes are tensors). Everything in this step is inside a
+     try: a failure here means torch, never an exception in the user's program;
   2. count the shape (in memory; flushed to `profile/<pid>-<t0>.jsonl` every 30 s, at exit, and never twice after fork);
   3. decide once per shape (and again after the winner file changed): current entry -> the dispatch rule; soft-stale
      entry -> one correctness check per environment (`mark_verified`; skipped for shapes whose check would allocate more
@@ -271,7 +274,7 @@ class _Client:
 
     def _route(self, a, b):
         """The backend for this call, or None for torch. Raises only on unexpected errors (the caller uses torch)."""
-        if (torch.compiler.is_compiling() or type(a) not in _PLAIN or type(b) not in _PLAIN or a.ndim != 2
+        if (torch.compiler.is_compiling() or torch.jit.is_tracing() or type(a) not in _PLAIN or type(b) not in _PLAIN or a.ndim != 2
                 or b.ndim != 2 or not a.is_cuda or not b.is_cuda or a.dtype not in _DTYPES or b.dtype is not a.dtype):
             return None
         M, K = a.shape
@@ -346,7 +349,8 @@ class _Client:
             x = args[0] if args else kw.get("input")
             w = args[1] if len(args) > 1 else kw.get("weight")
             if isinstance(x, torch.Tensor) and isinstance(w, torch.Tensor) and x.is_cuda and x.dtype in _DTYPES \
-                    and w.ndim == 2 and x.ndim >= 1 and not torch.compiler.is_compiling():
+                    and w.ndim == 2 and x.ndim >= 1 and not torch.compiler.is_compiling() \
+                    and not torch.jit.is_tracing():
                 self.log.add(x.numel() // max(x.shape[-1], 1), w.shape[0], w.shape[1], _DTYPES[x.dtype], "NT")
                 if time.monotonic() - self._last_flush > FLUSH_S:
                     self.flush()
@@ -367,6 +371,62 @@ def _reset_after_fork() -> None:
 
 def enabled() -> bool:
     return _STATE is not None
+
+
+# TorchScript and pickle (spec 5.2: a call lscli does not handle goes to torch untouched). TorchScript maps a torch
+# function to its aten op by object identity (`torch.jit._builtins._find_builtin`, keyed by id()); an unknown wrapper is
+# unwrapped through `__wrapped__` to the C builtin, which it then fails to compile as Python. So each wrapper is
+# registered under its original's op: scripted code then calls the aten op directly, i.e. plain torch, never lscli.
+# `_register_builtin` is private torch API (present in the pinned 2.13.0): every use is guarded, a failure warns once and
+# only TorchScript of matmul code is lost, never `enable()`. Pickle finds a function by `__module__` + `__qualname__`, so
+# each wrapper is named after the public attribute it replaces: in a patched process pickling finds the wrapper there,
+# and unpickling in any process (patched or not) returns whatever that attribute holds, i.e. torch's own function.
+_JIT = {"matmul": "aten::matmul", "mm": "aten::mm", "t_matmul": "aten::matmul", "t_mm": "aten::mm",
+        "t_rmatmul": "aten::matmul", "linear": "aten::linear"}
+_PICKLE_NAMES = {"matmul": ("torch", "matmul"), "mm": ("torch", "mm"), "t_matmul": ("torch", "Tensor.matmul"),
+                 "t_mm": ("torch", "Tensor.mm"), "t_rmatmul": ("torch", "Tensor.__matmul__"),
+                 "linear": ("torch.nn.functional", "linear")}
+_JIT_IDS: list = []                                     # wrapper ids registered in torch's builtin table
+
+
+def _jit_warn(e: Exception) -> None:
+    if not getattr(_jit_warn, "_warned", False):
+        warnings.warn(f"lscli: could not register the patch with TorchScript ({type(e).__name__}: {e}); "
+                      "torch.jit.script of code calling matmul / mm / linear fails while lscli is enabled", stacklevel=3)
+        _jit_warn._warned = True
+
+
+def _jit_table():
+    """torch's builtin table, built now if it is not yet. Called BEFORE patching: the lazy build scans `dir(torch)` and
+    would otherwise record (and keep alive) the wrappers themselves."""
+    try:
+        from torch.jit import _builtins
+        return _builtins._get_builtin_table()
+    except Exception as e:
+        _jit_warn(e)
+        return None
+
+
+def _jit_register(wrappers: dict) -> None:
+    try:
+        from torch.jit import _builtins
+        for name, w in wrappers.items():
+            _builtins._register_builtin(w, _JIT[name])
+            _JIT_IDS.append(id(w))
+    except Exception as e:
+        _jit_warn(e)
+
+
+def _jit_unregister() -> None:
+    """Drop the wrappers' entries: the table holds ids only, and a freed wrapper's id may be reused by any object."""
+    try:
+        from torch.jit import _builtins
+        table = _builtins._builtin_table or {}
+        for i in _JIT_IDS:
+            table.pop(i, None)
+    except Exception:
+        pass
+    _JIT_IDS.clear()
 
 
 def enable(paths=None) -> bool:
@@ -396,7 +456,7 @@ def enable(paths=None) -> bool:
                 return orig(*args, **kw)
             return c.matmul(orig, args[0], args[1])
         f.__wrapped__ = orig
-        f.__name__, f.__qualname__, f.__doc__ = orig.__name__, getattr(orig, "__qualname__", orig.__name__), orig.__doc__
+        f.__name__, f.__doc__ = orig.__name__, orig.__doc__
         return f
 
     def linear(*args, **kw):
@@ -405,12 +465,16 @@ def enable(paths=None) -> bool:
         return _ORIG["linear"](*args, **kw)
     linear.__wrapped__ = _ORIG["linear"]
     linear.__name__, linear.__doc__ = "linear", _ORIG["linear"].__doc__
-    torch.matmul = _wrap(_ORIG["matmul"])
-    torch.mm = _wrap(_ORIG["mm"])
-    torch.Tensor.matmul = _wrap(_ORIG["t_matmul"])
-    torch.Tensor.mm = _wrap(_ORIG["t_mm"])
-    torch.Tensor.__matmul__ = _wrap(_ORIG["t_rmatmul"])
+    wrappers = {name: _wrap(_ORIG[name]) for name in ("matmul", "mm", "t_matmul", "t_mm", "t_rmatmul")}
+    wrappers["linear"] = linear
+    for name, w in wrappers.items():
+        w.__module__, w.__qualname__ = _PICKLE_NAMES[name]
+    _jit_table()
+    torch.matmul, torch.mm = wrappers["matmul"], wrappers["mm"]
+    torch.Tensor.matmul, torch.Tensor.mm = wrappers["t_matmul"], wrappers["t_mm"]
+    torch.Tensor.__matmul__ = wrappers["t_rmatmul"]
     F.linear = linear
+    _jit_register(wrappers)
     _STATE = c
     atexit.register(_atexit)
     if not getattr(enable, "_fork_hooked", False):
@@ -434,6 +498,7 @@ def disable() -> None:
     torch.matmul, torch.mm = _ORIG["matmul"], _ORIG["mm"]
     torch.Tensor.matmul, torch.Tensor.mm, torch.Tensor.__matmul__ = _ORIG["t_matmul"], _ORIG["t_mm"], _ORIG["t_rmatmul"]
     F.linear = _ORIG["linear"]
+    _jit_unregister()
     _STATE = None
     try:
         atexit.unregister(_atexit)

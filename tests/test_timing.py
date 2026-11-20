@@ -82,9 +82,22 @@ def test_pool_merges_samples():
 
 
 @requires_cuda
-def test_placed_inputs_same_values_different_address():
-    from tune.correctness import placed_inputs
-    a0, b0, p0 = placed_inputs(256, 128, 512, placement=0)
-    a1, b1, p1 = placed_inputs(256, 128, 512, placement=1)
-    assert torch.equal(a0, a1) and torch.equal(b0, b1)
-    assert a0.data_ptr() != a1.data_ptr() and p0 is None and p1 is not None
+@pytest.mark.parametrize("shape", [(64, 64, 64), (256, 128, 512), (512, 512, 512), (1024, 1024, 1024),
+                                   (4096, 4096, 4096), (8192, 64, 8192)])
+def test_placed_inputs_move_every_operand_like_the_runner(shape):
+    """Deep check HAR-7: the runner frees one placement before making the next. With the old pad, operands <= 1 MiB got
+    the freed small-pool blocks back (1 of 3 addresses distinct) and big ones could land on placement 0's block again."""
+    from tune.correctness import make_inputs, placed_inputs
+    M, N, K = shape
+    ref_a, ref_b = make_inputs(M, N, K)
+    a, b, pad = placed_inputs(M, N, K, placement=0)
+    used, seen_a, seen_b = {a.data_ptr(), b.data_ptr()}, [a.data_ptr()], [b.data_ptr()]
+    for p in (1, 2):
+        del a, b, pad                                      # the runner's exact sequence
+        a, b, pad = placed_inputs(M, N, K, placement=p, avoid=used)
+        assert torch.equal(a, ref_a) and torch.equal(b, ref_b) and a.is_contiguous() and b.is_contiguous()
+        assert a.data_ptr() % 512 == 0 and b.data_ptr() % 512 == 0   # allocator alignment kept (16-B kernels)
+        used |= {a.data_ptr(), b.data_ptr()}
+        seen_a.append(a.data_ptr())
+        seen_b.append(b.data_ptr())
+    assert len(set(seen_a)) == 3 and len(set(seen_b)) == 3, (seen_a, seen_b)

@@ -181,3 +181,24 @@ def test_backends_from_keys_drops_a_malformed_key(fakes):
     back = online.backends_from_keys([{"family": "triton", "key": KEYS[0]}, {"family": "triton", "key": "bm64_garbage"},
                                       {"family": "cublaslt_rank", "key": "r0_a9_t3_s1_sk1_r0_sw0_c0"}], 64, 64, 64)
     assert [(f, k) for f, k, _, _ in back] == [("triton", KEYS[0]), ("cublaslt_rank", "r0_a9_t3_s1_sk1_r0_sw0_c0")]
+
+
+def test_a_candidate_that_poisons_the_context_stops_the_search(fakes, monkeypatch, tmp_path):
+    """Deep check HAR-1: validate() reports a sticky CUDA fault as an invalid candidate; the search must stop there (every
+    later candidate would fail in the dead context) and store no winner."""
+    from tune.correctness import ContextPoisoned
+    from tune.winner_cache import WinnerCache
+    log, ranker = fakes
+    poison = "AcceleratorError: CUDA error: an illegal memory access was encountered"
+    def validate(b, *a, **k):
+        log.append(("validate", _key(b)))
+        return _R(valid=False, failure_reason=poison) if _key(b) == KEYS[1] else _R(valid=True, failure_reason=None)
+    monkeypatch.setattr(online, "validate", validate)
+    with pytest.raises(ContextPoisoned) as e:
+        online.search_shape(ranker, 64, 64, 64, 3, torch.float16, lt_n=4)
+    assert e.value.culprit == f"triton:{KEYS[1]}"
+    assert [k for op, k in log if op == "validate"] == KEYS[:2]     # nothing validated after the culprit
+    wc = WinnerCache(tmp_path / "w.jsonl", env={"hw_id": "gpu"})
+    with pytest.raises(ContextPoisoned):
+        online.select_kernel(ranker, 64, 64, 64, lt_n=4, lt_rank=0, lt_knn=0, cache=wc, use_bundle=False, router=False)
+    assert not (tmp_path / "w.jsonl").exists() or not (tmp_path / "w.jsonl").read_text().strip()

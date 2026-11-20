@@ -157,13 +157,17 @@ Runbook (standalone version with the prerequisites, scoring and pitfalls: [`docs
   median is primary and p10/p25/p75/p90/p99/min/max/IQR/RSE are stored. A device-side `_sleep` backlog makes events measure device
   time rather than Python launch latency (chunks ≤256 launches). Cold mode zeroes a 64 MiB buffer before every sample. Hot mode does no flush.
   Graph mode captures N launches in a CUDA graph and reports time/N, for µs kernels.
-- **Allocation pooling**: every measurement pools samples over 3 fresh input allocations shifted by seeded 1–64 MiB pads.
-  This was the dominant noise source (up to 3.7% on memory-bound shapes), not heat or clocks.
+- **Allocation pooling**: every measurement pools samples over 3 input placements: a plain allocation, then two copies at
+  seeded 1–64 MiB offsets in fresh buffers, with every address distinct per operand (`placed_inputs(..., avoid=)`).
+  This was the dominant noise source (up to 3.7% on memory-bound shapes), not heat or clocks. Sessions before 2026-11-20
+  used a pad that did not move operands ≤ 1 MiB (1 of 3 addresses distinct; 2 of 3 for larger ones; deep check HAR-7).
 - **Correctness gate** (`tune/correctness.py`): reference is fp32 cuBLAS on fp16-rounded inputs with TF32 off.
   The check is `|C−ref| ≤ rtol·|ref| + atol_frac·√K` (fp16 1e-2, bf16 3e-2), on a NaN-prefilled output. Compile, OOM and launch errors are recorded as
   `valid=false` + `failure_reason` and never timed.
-- **Crash safety**: `inflight.json` marks the candidate in flight. After a context-killing fault the next run records it
-  as `crashed_previous_run` and continues. Completed rows are skipped on resume. The sweep isolates each shape in a subprocess.
+- **Crash safety**: a context-poisoning fault reported by `validate()` is recorded as `context_poisoned: ...` for that
+  candidate and the runner exits with code 3 (re-run to resume; `tune.correctness.context_poisoned`, also used by the
+  sweep and, as `ContextPoisoned`, by the online search). `inflight.json` lists every cache mode of the candidate in
+  flight; if the process dies, the next run records them as `crashed_previous_run` and continues. Completed rows are skipped on resume. The sweep isolates each shape in a subprocess.
 - **Provenance**: every row carries `session_id`, `driver`, `harness_commit`, `harness_dirty`, `clock_lock_state`,
   `clock_lock_mhz`, `env_file`, plus clock/temp/power/throttle at measurement time. Vendor rows record the actual device kernel names.
 - **Records** (`tune/records.py`): append-only JSONL, fsync per row, schema in `FIELDS`, raw samples in `*.raw.jsonl`

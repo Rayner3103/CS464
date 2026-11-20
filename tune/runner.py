@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -16,11 +17,13 @@ from typing import Callable, Iterable
 
 import torch
 
-from tune.correctness import placed_inputs, reference, validate
+from tune.correctness import context_poisoned, placed_inputs, reference, validate
 from tune.env import provenance, write_env
 from tune.profile import cuda_kernel_names
 from tune.records import RecordWriter, alignment_flags, completed_keys, measurement_key
 from tune.timing import TimingConfig, benchmark, pool
+
+EXIT_POISONED = 3  # same code as a sweep screen process: a candidate faulted the CUDA context, re-run to resume
 
 DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16}
 # Vendor backends whose choice of device kernel is opaque: record the kernel names they actually launch.
@@ -170,10 +173,14 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
     with RecordWriter(results) as w:
         if inflight.exists():
             crashed = json.loads(inflight.read_text())
-            log(f"[runner] previous run died during {crashed['key']}; recording as invalid")
-            w.write({**crashed["row"], "valid": False, "failure_reason": "crashed_previous_run",
-                     "timestamp": time.time()})
-            done.add(tuple(crashed["key"]))
+            crashed_rows = crashed.get("rows") or [crashed["row"]]  # one row per cache mode (older files: one row)
+            log(f"[runner] previous run died during {crashed_rows[0].get('kernel_family')}:"
+                f"{crashed_rows[0].get('config_key')} at {crashed_rows[0].get('M')}x{crashed_rows[0].get('N')}x"
+                f"{crashed_rows[0].get('K')}; recording {len(crashed_rows)} row(s) as invalid")
+            for r in crashed_rows:
+                if measurement_key(r) not in done:
+                    w.write({**r, "valid": False, "failure_reason": "crashed_previous_run", "timestamp": time.time()})
+                    done.add(measurement_key(r))
             inflight.unlink()
 
         for i, s in enumerate(shapes):
@@ -212,11 +219,29 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
             validity: dict[tuple, tuple] = {}  # keyed by (family, config_key): "default" is shared across families
             timed: dict[int, list] = {}
             rows: dict[int, dict] = {}
+            def mark_inflight(cand_rows: list[dict]) -> None:
+                """Every row (cache mode) of the candidate about to run: if the process dies, resume blames them all."""
+                inflight.write_text(json.dumps({"rows": cand_rows}, default=str))
+
             for j, (c, cm, row) in enumerate(todo):
                 vkey = (c.family, c.config_key)
                 if vkey not in validity:
-                    inflight.write_text(json.dumps({"key": list(measurement_key(row)), "row": row}, default=str))
+                    cand_rows = [r for c2, _, r in todo if (c2.family, c2.config_key) == vkey]
+                    mark_inflight(cand_rows)
                     chk = validate(c.backend, M, N, K, tdtype, ref=ref, inputs=(a, b))
+                    if context_poisoned(chk.failure_reason):
+                        # validate() caught a sticky CUDA fault: every later call in this process would fail with it,
+                        # and the rows of the candidates after it would be recorded invalid for good (deep check HAR-1).
+                        # Record the culprit and stop; the rest of the shape is not written, so a re-run redoes it.
+                        for r in cand_rows:
+                            w.write({**r, "valid": False, "failure_reason": f"context_poisoned: {chk.failure_reason}",
+                                     "max_abs_err": chk.max_abs_err, "timestamp": time.time()})
+                        inflight.unlink()
+                        log(f"[runner] {c.family}:{c.config_key} poisoned the CUDA context at {M}x{N}x{K} "
+                            f"({chk.failure_reason}); recorded as invalid. Re-run the same command to resume.")
+                        sys.stdout.flush()
+                        sys.stderr.flush()
+                        os._exit(EXIT_POISONED)
                     kernels = None
                     if chk.valid and c.family in KERNEL_NAME_FAMILIES:
                         kernels = cuda_kernel_names(c.backend.make_runner(a, b))
@@ -228,13 +253,17 @@ def run(shapes: Iterable[dict], backend_specs: list[str], out_dir: Path, *, dtyp
                 if valid:
                     timed[j] = []
             del ref
+            used_ptrs = {a.data_ptr(), b.data_ptr()}  # placements must not reuse an address (deep check HAR-7)
             for alloc in range(n_allocs):
                 if alloc:
                     del a, b, pad
-                    a, b, pad = placed_inputs(M, N, K, tdtype, seed=0, placement=alloc)
+                    a, b, pad = placed_inputs(M, N, K, tdtype, seed=0, placement=alloc, avoid=used_ptrs)
+                    used_ptrs |= {a.data_ptr(), b.data_ptr()}
                 for j in list(timed):
                     c, cm, _ = todo[j]
-                    inflight.write_text(json.dumps({"key": list(measurement_key(rows[j])), "row": rows[j]}, default=str))
+                    vkey = (c.family, c.config_key)
+                    mark_inflight([rows[i] for i, (c2, _, _) in enumerate(todo)
+                                   if (c2.family, c2.config_key) == vkey and i in rows])
                     try:
                         cfg = TimingConfig(cache_mode=cm, **(timing_overrides or {}))
                         timed[j].append(benchmark(c.backend.make_runner(a, b), cfg))
