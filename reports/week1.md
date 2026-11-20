@@ -4,6 +4,54 @@
 **Scope:** milestone M0 and the plan §13 first-week checklist. All tables are generated in
 [`week1_results.md`](week1_results.md) (`python -m tune analyze`). The protocol is in [`../docs/methodology.md`](../docs/methodology.md).
 
+## Update 2026-11-20: input placements that really move small operands (deep check HAR-7) — same-day A/B: ε = 2% (≥ 50 µs) unchanged, no hidden placement noise
+
+**Question.** The deep check (`docs/review/deep-check-2026-11-19.md`, HAR-7) found that `placed_inputs` did not move operands ≤ 1 MiB: the 1–64 MiB pad lived in PyTorch's large-block pool, so small operands got the blocks the previous placement had just freed back (1 of 3 addresses distinct), and large ones could land on placement 0's block again (2 of 3). This affected the runner and the noise study (18 of the 30 noise shapes have an operand ≤ 1 MiB). Did the claim "3 placements pooled" hide placement noise on those shapes, i.e. does G1 / ε change once they really move?
+
+**Fix** (commit `908c269`): placements 1 and 2 copy each operand into a fresh buffer at a seeded 1–64 MiB offset (per shape, placement and operand) and redraw any address an earlier placement of the shape used; `tests/test_timing.py` checks 3 distinct addresses for both operands in the runner's free-then-place order, 64³ to 8192×64×8192. Same commit: the runner stops on a context-poisoning fault (HAR-1, no measurement impact; 0 such rows in any local file).
+
+**What ran.** Four `tune --clock-lock 1755 noise --rounds 3 --repeats 50 --n-allocs 3` sessions back to back, alternating the old protocol (a worktree of `origin/master` `6f05e68`) and the fixed one (`908c269`), both trees clean, driver 595.99.02, SM clock locked at 1755 (probe `likely_locked`), default backends (torch + `bm128_bn128_bk32_w4_s4_g8_sk1`), cold + hot: old `noise-20261120-122443-b45c`, `noise-20261120-124347-18c0`; new `noise-20261120-123416-d766`, `noise-20261120-125319-9854`. 360 rows each, 0 invalid, 14-18% of rows power-capped (0x4) in every session. Data: `data/<hw>/noise_ab_20261120/`; summary `reports/snapshot/lock1755/noise_ab_20261120_compare.json`.
+
+**Cross-session margins** (`analysis.noise_compare`, 2 sessions per arm):
+
+| margin | old protocol | fixed protocol |
+|---|---|---|
+| ε ≥ 50 µs, per kernel (p95) | 2% (1.14%) | 2% (1.05%) |
+| ε ≥ 50 µs, kernel ratio (p95) | 2% (1.55%) | 2% (1.78%) |
+| ε < 50 µs per-launch, cross-session (p95) | 9% (8.17%) | 9% (8.70%) |
+| ε < 50 µs per-launch, within session (p95) | 6% (5.85%) | 14% (13.50%) |
+| online short timing ≥ 50 µs cold, ratio (p95) | 2% (1.83%) [1.40, 3.39] | 3% (2.51%) [1.76, 3.26] |
+
+Times agree: fixed / old, same (shape, kernel, mode), p50 1.000, p95 1.006, p99 1.016, max 1.019 (n 120).
+
+**Within-session range of the 3 round medians, split where the bug acted** (p50 / p95 / max, %):
+
+| operands | regime | mode | old | fixed |
+|---|---|---|---|---|
+| one ≤ 1 MiB | ≥ 50 µs | cold | 0.52 / 3.23 / 4.63 (n 42) | 0.51 / 2.65 / 5.17 (n 42) |
+| one ≤ 1 MiB | ≥ 50 µs | hot | 0.53 / 3.49 / 4.21 (n 40) | 0.48 / 2.62 / 4.85 (n 40) |
+| one ≤ 1 MiB | < 50 µs | cold | 0.00 / 6.21 / 12.40 (n 30) | 0.00 / 13.67 / 22.66 (n 30) |
+| one ≤ 1 MiB | < 50 µs | hot | 0.00 / 2.53 / 3.13 (n 32) | 0.00 / 2.48 / 12.24 (n 32) |
+| both > 1 MiB | ≥ 50 µs | cold | 0.08 / 1.21 / 1.43 (n 46) | 0.08 / 0.90 / 1.31 (n 46) |
+| both > 1 MiB | ≥ 50 µs | hot | 0.05 / 1.04 / 1.40 (n 46) | 0.03 / 0.80 / 1.09 (n 46) |
+
+**Reading.**
+- **≥ 50 µs: no hidden placement noise.** Where the old protocol pooled one address (operands ≤ 1 MiB), really moving them leaves the spread as it was (p95 2.65% vs 3.23% cold); the cross-session ε stays 2% and times agree to < 2%. A likely reason (not tested): a ≤ 1 MiB operand spans few DRAM pages, so the page-mapping effect `analysis/alloc_variance.py` found on 8192×64×8192 has little to act on. **G1 and ε = 2% stand, and past ≥ 50 µs data needs no re-measurement**; only the protocol description was wrong (fixed in `docs/methodology.md` / AGENTS §5, with a note on pre-2026-11-20 sessions).
+- **< 50 µs per-launch: the jump is the timing grid, not placement.** Every large range in the fixed arm is a 4-9 µs torch kernel (14×2×1 at 4.10 µs: 22.7%, i.e. one ~1.02 µs grid step; 56×29×175 at 6.9 µs: 12.7%; 1×1024×1024 at 8.5 µs: 9.6%), and the old arm has the same kind at other shapes (1×1024×1024 12.4%, 14×2×1 7.8%). With n = 30 and steps of 12-25%, which kernel flips a step is chance. This is the known reason sub-50 µs kernels are ranked with graph-amortized timing (AGENTS §7).
+- **Pre-existing, not caused by the fix:** both arms read a *cross-session* per-launch p95 of ~8-9% under 50 µs, above the documented "ε = 5% per-launch" there (n = 30 per arm, today's two sessions 10 min apart). Not acted on; flagged for a decision (graph-timed noise study, open step 4).
+- The online short-timing ratio p95 reads 2.5% vs 1.8% (intervals overlap: [1.76, 3.26] vs [1.40, 3.39]); within the 3% locked figure of 2026-11-13.
+
+**Gates.** None changed. **Next steps.** A cross-session noise study of the graph-amortized mode (open step 4) would settle the sub-50 µs margin; not run.
+
+Reproduce:
+```bash
+D=data/rtx3080_sm86_68sms_10gb/noise_ab_20261120
+git worktree add --detach /tmp/master-wt 6f05e68      # old protocol
+for tree in /tmp/master-wt . /tmp/master-wt .; do
+  (cd $tree && python -m tune --clock-lock 1755 noise --rounds 3 --repeats 50 --n-allocs 3 --out $OLDPWD/$D); done
+python -m analysis.noise_compare --data $D --group old=122443-b45c,124347-18c0 --group new=123416-d766,125319-9854 --json $D/compare.json
+```
+
 ## Update 2026-11-20: correction — cuBLASLt pick share in ranker_compare (deep check ANA-1)
 
 CPU only, nothing re-measured. Source: `docs/review/deep-check-2026-11-19.md`, finding ANA-1.
